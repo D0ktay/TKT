@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Model dosyaları (tracker --download ile indirilir)
+models/
+
+# Büyük kayıtlar: ham noktalar ve video repoya girmez
+*.raw.jsonl
+*.mp4
+
+# Kişisel kalibrasyon ve işletim sistemi artıkları
+calibration.json
+.DS_Store
+Thumbs.db

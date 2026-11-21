@@ -1,0 +1,52 @@
+[project]
+name = "tkt"
+version = "0.0.1"
+description = "Kamera ile el jestlerinden touchpad: imleç, tık, scroll"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "opencv-python",
+    "mediapipe",
+    "numpy",
+    "pynput",
+    "pyobjc-framework-Quartz; sys_platform == 'darwin'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tkt"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib -m 'not camera'"
+markers = [
+    "camera: gerçek kamera ister; CI'da atlanır",
+]
+
+[tool.uv]
+# Geliştirme Mac'i Intel (x86_64). mediapipe'ın yeni sürümleri bu platforma wheel vermiyor;
+# uv tüm hedeflere uyan son sürümü seçer.
+required-environments = [
+    "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+# mediapipe'ın alt bağımlılığı; 0.2.3 Intel Mac için wheel vermiyor, kaynaktan derlenemiyor.
+constraint-dependencies = ["sentencepiece<0.2.3"]
