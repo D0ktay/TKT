@@ -86,9 +86,9 @@ def test_smooth_scroll(user32):
         backend.scroll(-10, 10)
     # 0.25 piksel = 0.75 birim; iki çağrıdan sonra eksen başına bir birim çıkar.
     backend.scroll(0.25, -0.25)
-    assert _mouse_events(user32) == [(0x1000, -30), (0x0800, 30)] * 4
+    assert _mouse_events(user32) == [(0x1000, 30), (0x0800, 30)] * 4
     backend.scroll(0.25, -0.25)
-    assert _mouse_events(user32)[8:] == [(0x1000, 1), (0x0800, -1)]
+    assert _mouse_events(user32)[8:] == [(0x1000, -1), (0x0800, -1)]
 
 
 def test_full_step_scroll_and_reset(user32):
@@ -100,7 +100,7 @@ def test_full_step_scroll_and_reset(user32):
     backend.scroll(30, -30)
     backend.release_all()
     backend.scroll(10, -10)
-    assert _mouse_events(user32) == [(0x1000, 120), (0x0800, -120)]
+    assert _mouse_events(user32) == [(0x1000, -120), (0x0800, -120)]
 
 
 @pytest.mark.parametrize(
@@ -130,3 +130,22 @@ def test_system_action_releases_prior_keys_if_press_fails(user32):
     backend.release_all()
     keys = [send.args[1].contents.data.ki for send in user32.SendInput.call_args_list]
     assert [(key.wVk, key.dwFlags) for key in keys] == [(0x5B, 1), (0x09, 0), (0x5B, 3)]
+
+
+def test_latency_excludes_accumulated_scroll(monkeypatch, user32):
+    from tkt.app import main as app
+
+    clock = SimpleNamespace(now=10.0)
+
+    def send(*_):
+        clock.now += 0.02
+        return 1
+
+    user32.SendInput.side_effect = send
+    monkeypatch.setattr(app, "monotonic", lambda: clock.now)
+    backend = windows.WindowsBackend(step_px=40, smooth=False)
+    timed = app._TimedBackend(backend)
+    timed.scroll(20, 0)
+    assert timed.sent_t is None
+    timed.scroll(20, 0)
+    assert timed.sent_t == pytest.approx(10.02)

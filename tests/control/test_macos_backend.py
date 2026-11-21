@@ -194,13 +194,15 @@ def test_scroll_accumulates_fractions_in_pixels(quartz):
     backend = MacBackend()
     backend.scroll(0, 0.6)
     assert quartz.posted == []
+    assert backend.events_sent == 0
     backend.scroll(0.5, 0.6)  # y: 1.2 -> 1, x: 0.5 -> 0
     (event,) = quartz.posted
     assert event.unit == quartz.kCGScrollEventUnitPixel
     assert event.count == 2
-    assert event.wheels == (1, 0)  # (dikey, yatay)
+    assert event.wheels == (1, 0)  # İçerik aşağı.
     backend.scroll(0.5, -2.2)  # y: 0.2 - 2.2 = -2.0 ; x: 1.0
-    assert quartz.posted[-1].wheels == (-2, 1)
+    assert quartz.posted[-1].wheels == (-2, 1)  # İçerik yukarı ve sağa.
+    assert backend.events_sent == 2
 
 
 def test_scroll_rejects_non_finite(quartz):
@@ -241,3 +243,26 @@ def test_release_all_releases_held_buttons_and_clears_scroll(quartz, clock):
     assert len(quartz.posted) == 4
     backend.move_rel(1, 0)
     assert quartz.posted[-1].kind == quartz.kCGEventMouseMoved
+
+
+def test_failed_mouse_up_stays_pressed_for_release_retry(monkeypatch, quartz):
+    backend = MacBackend()
+    backend.button("left", True)
+    backend.button("right", True)
+    post = quartz.CGEventPost
+
+    def fail_left_up(tap, event):
+        if event.kind == quartz.kCGEventLeftMouseUp:
+            raise OSError("Quartz mouse-up failed")
+        post(tap, event)
+
+    monkeypatch.setattr(quartz, "CGEventPost", fail_left_up)
+    with pytest.raises(ExceptionGroup, match="Fare tuşları bırakılamadı"):
+        backend.release_all()
+    monkeypatch.setattr(quartz, "CGEventPost", post)
+    backend.release_all()
+    backend.release_all()
+    assert [e.kind for e in quartz.posted[2:]] == [
+        quartz.kCGEventRightMouseUp,
+        quartz.kCGEventLeftMouseUp,
+    ]

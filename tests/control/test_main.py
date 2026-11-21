@@ -59,18 +59,17 @@ def test_offline_defaults_to_dry_and_releases_on_error(monkeypatch, args):
     source.close.assert_called_once_with()
 
 
-def test_watchdog_releases_once_during_a_blocking_read(monkeypatch):
-    released = Event()
+def test_watchdog_releases_once_during_a_blocking_read(monkeypatch, watchdog_clock):
     engine = Mock()
-    engine.release.side_effect = released.set
 
     def frames():
         yield make_frame()
-        assert released.wait(2)
+        watchdog_clock(0.03)
+        engine.release.assert_called_once()
 
     source = SimpleNamespace(info=None, frames=frames)
     monkeypatch.setattr(app, "GestureEngine", lambda *_: engine)
-    app._run(source, DryBackend(), {"general": {"lost_release_ms": 20}})
+    app._run(source, DryBackend(), {"general": {"lost_release_ms": 20, "confidence_min": 0.5}})
     engine.process.assert_called_once()
     engine.release.assert_called_once()
 
@@ -86,11 +85,15 @@ def test_live_defaults_to_pynput_and_hotkey_toggles_output(monkeypatch):
         release_all = backend.release_all
 
     class FakeHotKeys:
+        running = True
+
         def __init__(self, callbacks):
             self.toggle = callbacks[shortcut]
             listeners.append(self)
 
         start = Mock()
+        join = Mock()
+        is_alive = Mock(return_value=True)
         stop = Mock()
 
     listeners = []
@@ -193,6 +196,9 @@ def latency_run(monkeypatch, tmp_path):
         def __init__(self, cfg, backend, info):
             self.backend = backend
 
+        def release(self):
+            self.backend.release_all()
+
         def process(self, frame):
             clock.wall = (101.0, 102.0, 105.0, 105.5)[frame.frame_id]
             clock.perf += (0.001, 0.003, 0.002, 0.001)[frame.frame_id]
@@ -284,3 +290,179 @@ def test_mac_native_backend_selection(monkeypatch):
     calls.hotkeys.return_value.start.assert_called_once()
     engine.process.assert_called_once()
     calls.release_all.assert_called_once()
+
+
+@pytest.fixture
+def watchdog_clock(monkeypatch):
+    waiting = Event()
+
+    class ManualCondition(app.Condition):
+        def wait(self, timeout=None):
+            waiting.set()
+            return super().wait()
+
+    condition = ManualCondition()
+    clock = SimpleNamespace(now=10.0)
+    monkeypatch.setattr(app, "Condition", lambda: condition)
+    monkeypatch.setattr(app, "monotonic", lambda: clock.now)
+
+    def advance(delta):
+        assert waiting.wait(2)
+        with condition:
+            waiting.clear()
+            clock.now += delta
+            condition.notify()
+        assert waiting.wait(2)
+
+    return advance
+
+
+@pytest.fixture
+def hotkey_listener(monkeypatch):
+    listener = Mock(running=True)
+    listener.is_alive.return_value = True
+
+    def hotkeys(callbacks):
+        (listener.toggle,) = callbacks.values()
+        return listener
+
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", SimpleNamespace(GlobalHotKeys=hotkeys))
+
+    class FakeBackend(DryBackend):
+        pass
+
+    monkeypatch.setattr(app, "PynputBackend", FakeBackend)
+    return listener, FakeBackend()
+
+
+def test_watchdog_retries_release_and_handles_later_interruption(
+    monkeypatch, watchdog_clock, caplog, hotkey_listener
+):
+    listener, backend = hotkey_listener
+    original_release = backend.release_all
+    release = Mock(side_effect=[OSError("mouse-up failed"), None, None])
+    engine = Mock()
+
+    def release_buttons():
+        release()
+        original_release()
+
+    engine.release.side_effect = release_buttons
+    engine.process.side_effect = lambda _: backend.button("left", True)
+
+    def frames():
+        yield make_frame()
+        watchdog_clock(0.31)
+        assert [event.args for event in backend.events] == [("left", True), ("left", False)]
+        yield make_frame(frame_id=1)
+        engine.process.assert_called_once()
+        listener.toggle()
+        yield make_frame(frame_id=2)
+        watchdog_clock(0.31)
+        assert [event.args for event in backend.events] == [("left", True), ("left", False)] * 2
+
+    monkeypatch.setattr(app, "GestureEngine", lambda *_: engine)
+
+    app._run(SimpleNamespace(info=None, frames=frames), backend, load_control_config())
+    assert release.call_count == 3
+    assert "mouse-up failed" in caplog.text
+
+
+def test_panic_release_retries_are_bounded_and_gate_resume(monkeypatch, hotkey_listener, caplog):
+    listener, backend = hotkey_listener
+    engine = Mock()
+    engine.process.side_effect = lambda _: backend.button("left", True)
+    engine.release.side_effect = OSError("mouse-up failed")
+
+    def frames():
+        yield make_frame()
+        listener.toggle()
+        assert engine.release.call_count == 3
+        yield make_frame(frame_id=1)
+        listener.toggle()
+        assert engine.release.call_count == 6
+        yield make_frame(frame_id=2)
+        engine.process.assert_called_once()
+        assert [event.args for event in backend.events] == [("left", True)]
+
+        engine.release.side_effect = backend.release_all
+        listener.toggle()
+        yield make_frame(frame_id=3)
+
+    monkeypatch.setattr(app, "GestureEngine", lambda *_: engine)
+    app._run(SimpleNamespace(info=None, frames=frames), backend, load_control_config())
+    assert engine.process.call_count == 2
+    assert "mouse-up failed" in caplog.text
+
+
+def test_dead_hotkey_listener_aborts_startup(monkeypatch, hotkey_listener):
+    listener, backend = hotkey_listener
+    listener.join.side_effect = lambda *_args, **_kwargs: setattr(
+        listener.is_alive, "return_value", False
+    )
+    engine = Mock()
+    source = SimpleNamespace(info=None, frames=Mock(return_value=iter([make_frame()])))
+    monkeypatch.setattr(app, "GestureEngine", lambda *_: engine)
+    with pytest.raises(RuntimeError, match="Erişilebilirlik.*Girdi İzleme"):
+        app._run(source, backend, load_control_config())
+    source.frames.assert_not_called()
+    engine.process.assert_not_called()
+    listener.stop.assert_called_once()
+
+
+def test_hotkey_listener_death_releases_during_blocking_read(
+    monkeypatch, watchdog_clock, hotkey_listener
+):
+    listener, backend = hotkey_listener
+    engine = Mock()
+    engine.process.side_effect = lambda _: backend.button("left", True)
+    engine.release.side_effect = backend.release_all
+
+    def frames():
+        yield make_frame()
+        listener.is_alive.return_value = False
+        watchdog_clock(0.1)  # Kare kaybı zaman aşımından önce bırakılmalı.
+        assert [event.args for event in backend.events] == [("left", True), ("left", False)]
+        yield make_frame(frame_id=1)
+
+    monkeypatch.setattr(app, "GestureEngine", lambda *_: engine)
+    with pytest.raises(RuntimeError, match="acil durdurma dinleyicisi"):
+        app._run(SimpleNamespace(info=None, frames=frames), backend, load_control_config())
+    engine.process.assert_called_once()
+    engine.release.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "invalid_frame", [make_frame(present=False), make_frame(confidence=0.49)]
+)
+def test_watchdog_uses_last_valid_frame(monkeypatch, watchdog_clock, invalid_frame):
+    engine = Mock()
+
+    def frames():
+        yield make_frame(t=80, confidence=0.5)
+        watchdog_clock(0.07)
+        yield invalid_frame
+        watchdog_clock(0.22)
+        engine.release.assert_not_called()
+        watchdog_clock(0.02)
+        engine.release.assert_called_once()
+        yield invalid_frame
+        watchdog_clock(0.4)
+        engine.release.assert_called_once()
+
+    monkeypatch.setattr(app, "GestureEngine", lambda *_: engine)
+    app._run(SimpleNamespace(info=None, frames=frames), DryBackend(), load_control_config())
+    assert engine.process.call_count == 3
+
+
+def test_latency_marks_completed_events_and_accepts_legacy_none(monkeypatch):
+    clock = SimpleNamespace(now=10.0)
+
+    def move(*_):
+        clock.now += 0.02
+
+    backend = SimpleNamespace(move_rel=move)
+    monkeypatch.setattr(app, "monotonic", lambda: clock.now)
+    timed = app._TimedBackend(backend)
+    timed.move_rel(1, 0)
+    assert timed.sent_t == pytest.approx(10.02)

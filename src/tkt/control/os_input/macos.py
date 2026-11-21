@@ -63,11 +63,13 @@ class MacBackend:
         self._last_down: dict[str, tuple[float, float, float, int]] = {}
         self._click_state: dict[str, int] = {}
         self._scroll_x = self._scroll_y = 0.0
+        self.events_sent = 0
 
     # --- yardımcılar ---
 
     def _post(self, event: Any) -> None:
         self._q.CGEventPost(self._q.kCGHIDEventTap, event)
+        self.events_sent += 1
 
     def _location(self) -> tuple[float, float]:
         point = self._q.CGEventGetLocation(self._q.CGEventCreate(None))
@@ -134,21 +136,23 @@ class MacBackend:
         else:
             if name not in self._pressed:
                 return
-            self._pressed.pop(name)
             kind = up_type
         event = self._mouse_event(kind, button, x, y)
         q.CGEventSetIntegerValueField(event, q.kCGMouseEventClickState, self._click_state[name])
         self._post(event)
+        if not down:
+            self._pressed.pop(name)
 
     def scroll(self, dx: float, dy: float) -> None:
         if not (isfinite(dx) and isfinite(dy)):
             raise ValueError("scroll değerleri sonlu olmalı")
         x, y = self._scroll_x + dx, self._scroll_y + dy
         sx, sy = trunc(x), trunc(y)
-        self._scroll_x, self._scroll_y = x - sx, y - sy
         if sx or sy:
             q = self._q
+            # Quartz tekerlek eksenlerini dikey, yatay sırasıyla alır.
             self._post(q.CGEventCreateScrollWheelEvent(None, q.kCGScrollEventUnitPixel, 2, sy, sx))
+        self._scroll_x, self._scroll_y = x - sx, y - sy
 
     def system_action(self, name: str) -> None:
         try:

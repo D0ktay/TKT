@@ -2,7 +2,9 @@
 
 import argparse
 import csv
+import logging
 import sys
+from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from statistics import median, quantiles
@@ -22,6 +24,12 @@ from tkt.core.source import HandFrameSource
 from tkt.core.types import HandFrame
 
 _REPORT_INTERVAL = 5.0
+_RELEASE_ATTEMPTS = 3
+_LOG = logging.getLogger(__name__)
+_HOTKEY_ERROR = (
+    "TKT acil durdurma dinleyicisi çalışmıyor. "
+    "macOS'ta Erişilebilirlik ve Girdi İzleme izinlerini kontrol edin."
+)
 
 
 class _TimedBackend:
@@ -29,25 +37,25 @@ class _TimedBackend:
         self._backend = backend
         self.sent_t: float | None = None
 
-    def _mark_event(self) -> None:
-        if self.sent_t is None:
+    def _send(self, send: Callable[..., None], *args: object) -> None:
+        before = getattr(self._backend, "events_sent", None)
+        send(*args)
+        if self.sent_t is None and (
+            before is None or getattr(self._backend, "events_sent", None) != before
+        ):
             self.sent_t = monotonic()
 
     def move_rel(self, dx: int, dy: int) -> None:
-        self._mark_event()
-        self._backend.move_rel(dx, dy)
+        self._send(self._backend.move_rel, dx, dy)
 
     def button(self, name: str, down: bool) -> None:
-        self._mark_event()
-        self._backend.button(name, down)
+        self._send(self._backend.button, name, down)
 
     def scroll(self, dx: float, dy: float) -> None:
-        self._mark_event()
-        self._backend.scroll(dx, dy)
+        self._send(self._backend.scroll, dx, dy)
 
     def system_action(self, name: str) -> None:
-        self._mark_event()
-        self._backend.system_action(name)
+        self._send(self._backend.system_action, name)
 
     def release_all(self) -> None:
         self._backend.release_all()
@@ -144,6 +152,18 @@ def _open_source(args: argparse.Namespace) -> HandFrameSource:
     return SyntheticSource().rest(0.2).open(1).move(0.1, 0, 0.5).curl_all()
 
 
+def _release_with_retry(release: Callable[[], None]) -> int | None:
+    """Başarılı denemenin numarasını döndür. Tüm denemeler başarısızsa None döndür."""
+    for attempt in range(1, _RELEASE_ATTEMPTS + 1):
+        try:
+            release()
+        except Exception:
+            _LOG.exception("Girdi tuşları bırakılamadı (%d/%d)", attempt, _RELEASE_ATTEMPTS)
+        else:
+            return attempt
+    return None
+
+
 def _run(
     source: HandFrameSource,
     backend: InputBackend,
@@ -152,33 +172,61 @@ def _run(
 ) -> None:
     timed_backend = _TimedBackend(backend) if report is not None else None
     engine = GestureEngine(cfg, timed_backend or backend, source.info)
-    timeout = cfg["general"]["lost_release_ms"] / 1000
+    general = cfg["general"]
+    timeout = general["lost_release_ms"] / 1000
+    listener_interval = timeout / 4
     condition = Condition()
-    deadline = monotonic() + timeout
-    paused = stopped = False
+    deadline = None
+    paused = stopped = release_pending = listener_failed = False
+    listener = None
+
+    def release_inputs() -> None:
+        nonlocal deadline, paused, release_pending
+        deadline = None
+        attempt = _release_with_retry(engine.release)
+        release_pending = attempt is None
+        if attempt != 1:
+            paused = True
 
     def toggle_pause() -> None:
-        nonlocal deadline, paused
+        nonlocal paused
         with condition:
-            if stopped:
+            if stopped or listener_failed:
                 return
-            paused = not paused
             if paused:
-                deadline = None
-                engine.release()
+                if release_pending:
+                    release_inputs()
+                paused = release_pending
+            else:
+                paused = True
+                release_inputs()
             condition.notify()
 
+    def check_listener() -> None:
+        nonlocal listener_failed
+        if listener is not None and not listener_failed:
+            if not (listener.is_alive() and listener.running):
+                listener_failed = True
+                _LOG.error(_HOTKEY_ERROR)
+                release_inputs()
+
+    def expire_frames(now: float) -> None:
+        if deadline is not None and now >= deadline:
+            release_inputs()
+
     def watch_frames() -> None:
-        nonlocal deadline
         with condition:
             while not stopped:
+                check_listener()
                 now = monotonic()
-                if deadline is not None and now >= deadline:
-                    deadline = None
-                    engine.release()
+                expire_frames(now)
                 if report is not None and now >= report.deadline:
                     report.report(now)
                 wake_at = deadline
+                if listener is not None and not listener_failed:
+                    wake_at = now + listener_interval if wake_at is None else min(
+                        wake_at, now + listener_interval
+                    )
                 if report is not None:
                     wake_at = report.deadline if wake_at is None else min(wake_at, report.deadline)
                 if wake_at is None:
@@ -186,22 +234,35 @@ def _run(
                 else:
                     condition.wait(max(0.0, wake_at - monotonic()))
 
-    listener = None
     watchdog = Thread(target=watch_frames, name="tkt-frame-watchdog")
-    watchdog.start()
     try:
         if isinstance(backend, (PynputBackend, WindowsBackend, MacBackend)):
             from pynput.keyboard import GlobalHotKeys
 
-            listener = GlobalHotKeys({cfg["general"]["panic_hotkey"]: toggle_pause})
-            listener.start()
+            listener = GlobalHotKeys({general["panic_hotkey"]: toggle_pause})
+            # Quartz olay dinleyicisi kurulamazsa pynput sessizce çıkabilir.
+            try:
+                listener.start()
+                listener.join(timeout=listener_interval)
+            except Exception as exc:
+                raise RuntimeError(_HOTKEY_ERROR) from exc
+            if not (listener.is_alive() and listener.running):
+                raise RuntimeError(_HOTKEY_ERROR)
+        watchdog.start()
         for frame in source.frames():
             with condition:
+                check_listener()
+                if listener_failed:
+                    raise RuntimeError(_HOTKEY_ERROR)
+                now = monotonic()
+                expire_frames(now)
                 if isinstance(backend, DryBackend):
                     backend.set_time(frame.t)
                 if not paused:
-                    deadline = monotonic() + timeout
-                    condition.notify()
+                    # Kayıt ve sentetik kareler ayrı bir zaman ekseninde olabilir.
+                    if frame.present and frame.confidence >= general["confidence_min"]:
+                        deadline = now + timeout
+                        condition.notify()
                     if timed_backend is None or report is None:
                         engine.process(frame)
                     else:
@@ -214,6 +275,10 @@ def _run(
                     now = monotonic()
                     if now >= report.deadline:
                         report.report(now)
+        with condition:
+            check_listener()
+            if listener_failed:
+                raise RuntimeError(_HOTKEY_ERROR)
     finally:
         with condition:
             stopped = True
@@ -222,7 +287,8 @@ def _run(
             if listener is not None:
                 listener.stop()
         finally:
-            watchdog.join()
+            if watchdog.ident is not None:
+                watchdog.join()
             if report is not None:
                 report.report(monotonic(), final=True)
 
@@ -267,7 +333,8 @@ def main(argv: list[str] | None = None) -> None:
                     report = _LatencyReport(args.source == "live", output)
                 _run(source, backend, cfg, report)
         finally:
-            backend.release_all()
+            if _release_with_retry(backend.release_all) is None:
+                raise RuntimeError("Çıkışta girdi tuşları bırakılamadı")
     finally:
         source.close()
 

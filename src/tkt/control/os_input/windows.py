@@ -97,6 +97,7 @@ class WindowsBackend:
         self._wheel_remainder = {_MOUSEEVENTF_HWHEEL: 0.0, _MOUSEEVENTF_WHEEL: 0.0}
         self._pressed_buttons: dict[str, None] = {}
         self._pressed_keys: dict[int, None] = {}
+        self.events_sent = 0
 
     def move_rel(self, dx: int, dy: int) -> None:
         point = _Point()
@@ -110,10 +111,12 @@ class WindowsBackend:
         y = max(top, min(point.y + dy, top + height - 1))
         if not self._user32.SetCursorPos(x, y):
             raise OSError("SetCursorPos başarısız")
+        self.events_sent += 1
 
     def _send(self, event: _Input) -> None:
         if self._user32.SendInput(1, ctypes.pointer(event), ctypes.sizeof(_Input)) != 1:
             raise OSError("SendInput girdiyi gönderemedi")
+        self.events_sent += 1
 
     def _mouse(self, flags: int, data: int = 0) -> None:
         event = _MouseInput(mouseData=data, dwFlags=flags)
@@ -128,7 +131,7 @@ class WindowsBackend:
             self._pressed_buttons.pop(name, None)
 
     def scroll(self, dx: float, dy: float) -> None:
-        for flag, pixels in ((_MOUSEEVENTF_HWHEEL, dx), (_MOUSEEVENTF_WHEEL, dy)):
+        for flag, pixels in ((_MOUSEEVENTF_HWHEEL, -dx), (_MOUSEEVENTF_WHEEL, dy)):
             units = self._wheel_remainder[flag] + pixels / self._step_px * _WHEEL_DELTA
             sent = trunc(units / self._wheel_quantum) * self._wheel_quantum
             if sent:
