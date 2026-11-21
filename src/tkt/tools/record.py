@@ -61,6 +61,7 @@ PROMPT_TAIL_S = 2.0       # son bipten sonra kayıt devam eder
 PREVIEW_LEAD_S = 3.0      # pencere açıldıktan kayıt başlayana kadar hazırlık (kaydedilmez)
 PREVIEW_WINDOW = "TKT kayit"
 _PREVIEW_QUIT = (ord("q"), 27)
+_PREVIEW_START = ord(" ")
 _MAC_BEEP_SOUND = "/System/Library/Sounds/Tink.aiff"
 _WIN_BEEP_HZ = 880
 _WIN_BEEP_MS = 150
@@ -345,7 +346,8 @@ def record(source: Any, out: str | Path, note: str = "", duration: float | None 
 class PreviewSource:
     """`frames_raw()` akışını kayda geçirirken her kareyi pencerede gösterir.
 
-    Önce `lead` saniye hazırlık evresi vardır: kareler gösterilir ama kayda verilmez.
+    `wait_key` ise önce boşluk tuşu beklenir (kareler gösterilir, kayda verilmez).
+    Sonra `lead` saniye hazırlık evresi vardır: kareler gösterilir ama kayda verilmez.
     Sonra kareler kayda verilir ve ekranda kalan süre yazar. Pencerede `q`/ESC `stop`'u
     ayarlar. `show(name, img)` ve `poll_key()` testte değiştirilebilir; çizim
     `debug_view.draw_overlay` ile yapılır. macOS'ta ana thread'de çalışmalıdır.
@@ -353,6 +355,7 @@ class PreviewSource:
 
     def __init__(self, source: Any, title: str, duration: float | None,
                  stop: threading.Event, lead: float = PREVIEW_LEAD_S,
+                 wait_key: bool = False,
                  show: Callable[[str, np.ndarray], None] | None = None,
                  poll_key: Callable[[], int] | None = None) -> None:
         import cv2
@@ -363,11 +366,12 @@ class PreviewSource:
         self._duration = duration
         self._stop = stop
         self._lead = lead
+        self._waiting = wait_key
         self._own_window = show is None
         self._show = show or cv2.imshow
         self._poll_key = poll_key or (lambda: cv2.waitKey(1) & 0xFF)
 
-    def _display(self, frame: Any, hand: RawHand | None, image: np.ndarray, text: str) -> None:
+    def _display(self, frame: Any, hand: RawHand | None, image: np.ndarray, text: str) -> int:
         from tkt.vision import debug_view as dv
 
         src = self._source
@@ -376,8 +380,10 @@ class PreviewSource:
         out = dv.draw_overlay(image, frame, hand if frame.present else None, stats,
                               dv.CalibState(None, 0.0, 0.0, 0, text))
         self._show(PREVIEW_WINDOW, out)
-        if self._poll_key() in _PREVIEW_QUIT:
+        key = self._poll_key()
+        if key in _PREVIEW_QUIT:
             self._stop.set()
+        return key
 
     def frames_raw(self) -> Iterator[tuple[Any, RawHand | None, np.ndarray]]:
         stream = self._source.frames_raw()
@@ -385,6 +391,14 @@ class PreviewSource:
         t_rec: float | None = None
         try:
             for frame, hand, image in stream:
+                if self._waiting:
+                    key = self._display(frame, hand, image,
+                                        f"HAZIR: {self._title} - baslamak icin BOSLUK")
+                    if self._stop.is_set():
+                        return
+                    if key == _PREVIEW_START:
+                        self._waiting = False
+                    continue
                 if t_lead is None:
                     t_lead = frame.t
                 left = self._lead - (frame.t - t_lead)
@@ -547,6 +561,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ham kayıttan güncel features ve lift ile HandFrame kaydı üret")
     p.add_argument("--preview", action="store_true",
                    help=f"kaydı pencerede göster; önce {PREVIEW_LEAD_S:g} sn hazırlık, q durdurur")
+    p.add_argument("--wait-space", action="store_true",
+                   help="önizlemede kayıt boşluk tuşuna basınca başlar (--preview'i açar)")
     p.add_argument("--config", default="config/vision.toml")
     return p
 
@@ -570,9 +586,10 @@ def main(argv: list[str] | None = None) -> None:
     source = open_live_source(args.config)
     stop = threading.Event()
     rec_source: Any = source
-    if args.preview:
+    if args.preview or args.wait_space:
         title = args.note or Path(args.out).stem
-        rec_source = PreviewSource(source, title, args.duration, stop)
+        rec_source = PreviewSource(source, title, args.duration, stop,
+                                   wait_key=args.wait_space)
     if args.duration is None and sys.stdin is not None and sys.stdin.isatty():
         _watch_stdin_for_quit(stop)
         print("Kayıt başladı; durdurmak için q + Enter veya Ctrl+C.", file=sys.stderr)
