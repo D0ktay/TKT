@@ -391,7 +391,7 @@ def test_from_raw_continues_without_lift_when_estimator_not_implemented(tmp_path
     import tkt.vision.lift as lift_mod
 
     class NotReady:
-        def __init__(self, calib, cfg):
+        def __init__(self, calib, cfg, *, aspect=1.0):
             raise NotImplementedError
 
     monkeypatch.setattr(lift_mod, "LiftEstimator", NotReady)
@@ -409,7 +409,7 @@ def test_from_raw_uses_lift_when_tap_ref_and_estimator_available(tmp_path, monke
     resets = []
 
     class Fake:
-        def __init__(self, calib, cfg):
+        def __init__(self, calib, cfg, *, aspect=1.0):
             pass
 
         def update(self, hand, t, curls):
@@ -455,3 +455,174 @@ def test_cli_main_records_with_live_source(tmp_path, monkeypatch, capsys):
     assert closed == [True]
     assert read_header(out).note == "x"
     assert "4 kare" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ hata taraması düzeltmeleri
+
+
+def test_from_raw_rejects_same_input_and_output(tmp_path):
+    raw, samples = make_raw(tmp_path)
+    before = raw.read_bytes()
+    cfg = write_config(tmp_path, tmp_path / "yok.json")
+    with pytest.raises(rec.OutputIsInputError):
+        rec.rebuild_from_raw(raw, raw, cfg)
+    with pytest.raises(rec.OutputIsInputError):     # aynı dosyaya farklı yazım
+        rec.rebuild_from_raw(raw, tmp_path / "." / "ad.raw.jsonl", cfg)
+    assert raw.read_bytes() == before
+
+
+def test_from_raw_rejects_hard_link_and_symlink_output(tmp_path):
+    import os
+
+    raw, _ = make_raw(tmp_path)
+    before = raw.read_bytes()
+    cfg = write_config(tmp_path, tmp_path / "yok.json")
+    link = tmp_path / "hard.jsonl"
+    os.link(raw, link)
+    with pytest.raises(rec.OutputIsInputError):
+        rec.rebuild_from_raw(raw, link, cfg)
+    sym = tmp_path / "sym.jsonl"
+    try:
+        sym.symlink_to(raw)
+    except (OSError, NotImplementedError):
+        sym = None
+    if sym is not None:
+        with pytest.raises(rec.OutputIsInputError):
+            rec.rebuild_from_raw(raw, sym, cfg)
+    assert raw.read_bytes() == before
+
+
+def test_cli_from_raw_same_file_is_clean_error(tmp_path, capsys):
+    raw, _ = make_raw(tmp_path)
+    before = raw.read_bytes()
+    with pytest.raises(SystemExit):
+        rec.main(["--from-raw", str(raw), "--out", str(raw),
+                  "--config", str(write_config(tmp_path, tmp_path / "yok.json"))])
+    assert raw.read_bytes() == before
+    assert "aynı dosya" in capsys.readouterr().err
+
+
+def test_from_raw_failure_keeps_old_output_and_leaves_no_temp(tmp_path):
+    raw, _ = make_raw(tmp_path)
+    with raw.open("a", encoding="utf-8") as fh:
+        fh.write("bozuk satır\n")
+    out = tmp_path / "ad.jsonl"
+    out.write_text("eski içerik\n", encoding="utf-8")
+    cfg = write_config(tmp_path, tmp_path / "yok.json")
+    with pytest.raises(rec.RecordFormatError):
+        rec.rebuild_from_raw(raw, out, cfg)
+    assert out.read_text(encoding="utf-8") == "eski içerik\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        ["ad.raw.jsonl", "ad.jsonl", "vision.toml"])
+
+
+def _interrupt_after(monkeypatch, cls, n):
+    """`cls.write` n'inci çağrıdan sonra (satır yazıldıktan hemen sonra) KeyboardInterrupt atar."""
+    orig = cls.write
+    calls = []
+
+    def write(self, *a, **kw):
+        orig(self, *a, **kw)
+        calls.append(1)
+        if len(calls) == n:
+            self.close()
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cls, "write", write)
+
+
+@pytest.mark.parametrize(("cls_name", "common"), [("RecordingWriter", 3), ("RawWriter", 2)])
+def test_record_interrupt_keeps_both_files_consistent(tmp_path, monkeypatch, cls_name, common):
+    _interrupt_after(monkeypatch, getattr(rec, cls_name), 3)
+    out = tmp_path / "a.jsonl"
+    n = record(FakeSource(10), out, raw=True)
+    frames = list(iter_frames(out))
+    raws = read_raw(tmp_path / "a.raw.jsonl")[1]
+    ids = list(range(1, common + 1))
+    assert n == len(frames) == len(raws) == common
+    assert [f.frame_id for f in frames] == [r.frame_id for r in raws] == ids
+
+
+def test_record_removes_stale_prompts_sidecar_without_prompt(tmp_path, capsys):
+    out = tmp_path / "a.jsonl"
+    write_prompts(prompts_path(out), [Prompt(1.0, "tap1")])
+    record(FakeSource(3), out)
+    assert not prompts_path(out).exists()
+    assert "prompts" in capsys.readouterr().err
+
+
+def test_record_replaces_stale_prompts_sidecar_with_prompt(tmp_path):
+    clock = FakeClock()
+    out = tmp_path / "a.jsonl"
+    write_prompts(prompts_path(out), [Prompt(1.0, "tap1")] * 5)
+    record(ClockedSource(clock), out, prompt=2, clock=clock, beep=lambda: None)
+    assert len(read_prompts(prompts_path(out))) == 2
+
+
+class SteppedSource:
+    """Her karede sahte saati `steps[i]` kadar ilerleten sahte kaynak."""
+
+    def __init__(self, clock, steps):
+        self.info = INFO
+        self._clock = clock
+        self._steps = steps
+
+    def frames_raw(self):
+        for i, step in enumerate(self._steps, start=1):
+            self._clock.now += step
+            yield frame(i), hand(i), np.zeros((4, 4, 3), np.uint8)
+
+
+def test_record_prompt_late_beeps_are_not_bunched(tmp_path):
+    clock = FakeClock()
+    out = tmp_path / "g.jsonl"
+    # ilk bip 103.5'te; sonraki kare 8 sn sonra (111.5); ardından 0,5 sn adımlar
+    steps = [0.5, 3.0, 8.0] + [0.5] * 12
+    record(SteppedSource(clock, steps), out, prompt=3, clock=clock, beep=lambda: None)
+    ts = [p.t for p in read_prompts(prompts_path(out))]
+    assert ts[0] == pytest.approx(103.5)
+    assert ts[1] == pytest.approx(111.5)           # gecikmiş bip, boşluktan sonraki ilk kare
+    assert ts[2] - ts[1] == pytest.approx(rec.PROMPT_INTERVAL_S, abs=0.5)
+    assert ts[2] - ts[1] >= rec.PROMPT_INTERVAL_S  # üst üste (20 ms arayla) değil
+
+
+def test_from_raw_passes_aspect_from_raw_header(tmp_path, monkeypatch):
+    import tkt.vision.lift as lift_mod
+
+    seen = {}
+
+    class Fake:
+        def __init__(self, calib, cfg, *, aspect=1.0):
+            seen["aspect"] = aspect
+
+        def update(self, hand, t, curls):
+            return {f: 0.1 for f in FINGERS}
+
+        def reset(self):
+            pass
+
+    monkeypatch.setattr(lift_mod, "LiftEstimator", Fake)
+    raw, _ = make_raw(tmp_path)        # başlık: width=512, height=640
+    cfg = write_config(tmp_path, tap_calib(tmp_path))
+    rec.rebuild_from_raw(raw, tmp_path / "ad.jsonl", cfg)
+    assert seen["aspect"] == pytest.approx(512 / 640)
+
+
+def test_from_raw_real_estimator_gets_aspect(tmp_path, monkeypatch):
+    import tkt.vision.lift as lift_mod
+
+    made = []
+    real = lift_mod.LiftEstimator
+
+    def spy(*a, **kw):
+        made.append(real(*a, **kw))
+        return made[-1]
+
+    monkeypatch.setattr(lift_mod, "LiftEstimator", spy)
+    raw, _ = make_raw(tmp_path)
+    cfg = write_config(tmp_path, tap_calib(tmp_path))
+    cfg.write_text(cfg.read_text(encoding="utf-8").replace(
+        "w_angle = 1.0\n", "w_angle = 1.0\nw_length = 1.0\nbaseline_s = 1.0\n"
+        "curl_rate_suppress = 3.0\n"), encoding="utf-8")
+    rec.rebuild_from_raw(raw, tmp_path / "ad.jsonl", cfg)
+    assert made and made[0].aspect == pytest.approx(512 / 640)
