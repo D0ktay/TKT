@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -84,10 +85,126 @@ def save(calib: HandCalibration, path: Path) -> None:
     os.replace(tmp, p)
 
 
+def _median(values: list[float]) -> float:
+    return float(statistics.median(values))
+
+
 def fit_hand(open_s: list[RawHand], fist_s: list[RawHand],
              thumb_closed_s: list[RawHand]) -> HandCalibration:
-    """Açık el, yumruk ve kapalı başparmak örneklerinin medyanından kalibrasyon."""
-    raise NotImplementedError
+    """Açık el, yumruk ve kapalı başparmak örneklerinin medyanından kalibrasyon.
+
+    - `open_ref[f]`: açık el örneklerinde `curl_raw` medyanı; `fist_ref[f]`: yumrukta.
+    - `thumb_open`: açık el örneklerinde `thumb_raw` medyanı; `thumb_closed`: başparmak
+      kapalı örneklerinde.
+
+    Medyan, tek tük bozuk karelerin sonucu kaydırmasını önler. Boş liste veya yumruk
+    değeri açık elden büyük olmayan parmak (ya da açık başparmak değeri kapalıdan büyük
+    değilse) `ValueError` yükseltir. `tap_ref` None, `angle_sign` 1.0 kalır.
+    """
+    # features bu modülden HandCalibration'ı import eder; döngüyü önlemek için burada.
+    from tkt.vision.features import FINGER_JOINTS, curl_raw, thumb_raw
+
+    for name, samples in (("open_s", open_s), ("fist_s", fist_s),
+                          ("thumb_closed_s", thumb_closed_s)):
+        if not samples:
+            raise ValueError(f"fit_hand: {name} boş")
+
+    open_ref: dict[str, float] = {}
+    fist_ref: dict[str, float] = {}
+    for finger in FINGER_JOINTS:
+        o = _median([curl_raw(h, finger) for h in open_s])
+        f = _median([curl_raw(h, finger) for h in fist_s])
+        if not f > o:
+            raise ValueError(
+                f"fit_hand: {finger} için yumruk ({f:.3f}) açık elden ({o:.3f}) büyük değil"
+            )
+        open_ref[finger] = o
+        fist_ref[finger] = f
+
+    thumb_open = _median([thumb_raw(h) for h in open_s])
+    thumb_closed = _median([thumb_raw(h) for h in thumb_closed_s])
+    if not thumb_open > thumb_closed:
+        raise ValueError(
+            f"fit_hand: açık başparmak ({thumb_open:.3f}) kapalıdan ({thumb_closed:.3f}) "
+            "büyük değil"
+        )
+
+    return HandCalibration(
+        open_ref=open_ref,
+        fist_ref=fist_ref,
+        thumb_closed=thumb_closed,
+        thumb_open=thumb_open,
+        tap_ref=None,
+    )
+
+
+# Kalibrasyon adımları sırayla: açık el, yumruk, başparmak kapalı.
+STEPS: tuple[str, ...] = ("open", "fist", "thumb_closed")
+# Her adımın varsayılan süresi (saniye).
+STEP_SECONDS = 2.0
+
+
+class CalibrationSession:
+    """Kalibrasyon adımlarını zamana göre yürütür ve örnekleri toplar (kamera/GUI yok).
+
+    Zaman ilk `add` çağrısındaki `t` ile başlar. Her adım `step_s` saniye sürer; bir
+    örnek, zamanına düşen adıma yazılır. `None` (el yok) örnekler atlanır ama zaman
+    yine ilerler. Tüm adımlar bitince `done` olur ve sonraki örnekler yok sayılır.
+    """
+
+    def __init__(self, step_s: float = STEP_SECONDS) -> None:
+        if not step_s > 0:
+            raise ValueError("step_s pozitif olmalı")
+        self.step_s = float(step_s)
+        self.samples: dict[str, list[RawHand]] = {s: [] for s in STEPS}
+        self._t0: float | None = None
+        self._elapsed = 0.0
+
+    @property
+    def _index(self) -> int:
+        return min(len(STEPS), int(self._elapsed // self.step_s))
+
+    @property
+    def done(self) -> bool:
+        return self._index >= len(STEPS)
+
+    @property
+    def current_step(self) -> str | None:
+        """Geçerli adımın adı; bittiyse None."""
+        i = self._index
+        return None if i >= len(STEPS) else STEPS[i]
+
+    @property
+    def progress(self) -> float:
+        """Geçerli adımın ilerlemesi (0–1); bittiyse 1."""
+        if self.done:
+            return 1.0
+        return (self._elapsed - self._index * self.step_s) / self.step_s
+
+    @property
+    def total_progress(self) -> float:
+        """Tüm oturumun ilerlemesi (0–1)."""
+        return min(1.0, self._elapsed / (self.step_s * len(STEPS)))
+
+    def add(self, hand: RawHand | None, t: float) -> None:
+        """`t` anındaki örneği geçerli adıma ekler; `hand` None ise yalnızca zaman ilerler."""
+        if self.done:
+            return
+        if self._t0 is None:
+            self._t0 = float(t)
+        # Geri giden zaman damgası ilerlemeyi geri almaz.
+        self._elapsed = max(self._elapsed, float(t) - self._t0)
+        step = self.current_step
+        if step is None or hand is None:
+            return
+        self.samples[step].append(hand)
+
+    def result(self) -> HandCalibration:
+        """Toplanan örneklerden `fit_hand`. Oturum bitmediyse veya veri bozuksa `ValueError`."""
+        if not self.done:
+            raise ValueError("kalibrasyon oturumu bitmedi")
+        return fit_hand(self.samples["open"], self.samples["fist"],
+                        self.samples["thumb_closed"])
 
 
 def fit_taps(calib: HandCalibration, samples: list[tuple[float, RawHand]]) -> HandCalibration:
