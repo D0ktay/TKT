@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from tkt.vision.tracker import RawHand
@@ -207,6 +207,88 @@ class CalibrationSession:
                         self.samples["thumb_closed"])
 
 
+# fit_taps: örnekler arasında bundan uzun boşluk yeni bir bip penceresi başlatır (sn).
+TAP_GAP_S = 0.25
+# Pencerenin ilk bu kadar saniyesi taban çizgisidir (bipten sonra tepki ~150 ms'den önce).
+TAP_BASE_S = 0.1
+# Bir parmağın penceredeki tepesi, o penceredeki en büyük parmak tepesinin en az bu oranıysa
+# "bu parmak kalktı" sayılır (ikili tapta işaret ve orta, tek tapta yalnızca işaret).
+TAP_PEAK_REL = 0.5
+# Parmak pencerelerin en az bu oranında kalkmışsa kendi tap_ref'i bulunur; yoksa bulunan
+# parmakların medyanıyla doldurulur.
+TAP_MIN_FOUND = 0.25
+
+
+def _tap_windows(samples: list[tuple[float, RawHand]]) -> list[list[tuple[float, RawHand]]]:
+    ordered = sorted(samples, key=lambda s: s[0])
+    windows: list[list[tuple[float, RawHand]]] = []
+    for t, hand in ordered:
+        if not windows or t - windows[-1][-1][0] > TAP_GAP_S:
+            windows.append([])
+        windows[-1].append((t, hand))
+    return windows
+
+
 def fit_taps(calib: HandCalibration, samples: list[tuple[float, RawHand]]) -> HandCalibration:
-    """Tap örneklerinden `tap_ref` ve `angle_sign` (Faz 2)."""
-    raise NotImplementedError
+    """Tap örneklerinden `tap_ref` ve `angle_sign` (Faz 2).
+
+    `samples`: bip pencerelerinden (bip anından ~1,5 sn) toplanmış `(t, el)` kareleri.
+    Pencereler zaman boşluğundan (`TAP_GAP_S`) ayrılır; her pencerenin ilk `TAP_BASE_S`
+    saniyesinin medyanı o pencerenin taban çizgisidir.
+
+    - `angle_sign`: her pencerede açı değişimi en büyük olan parmağın, en büyük değişim
+      anındaki işareti; pencerelerin çoğunluğu. Eşitlikte `calib.angle_sign` korunur.
+    - `tap_ref[f]`: `lift_raw` (lift.FIT_WEIGHTS ağırlıklarıyla, `angle_sign` uygulanmış)
+      pencere tepelerinin medyanı; yalnızca parmağın kalktığı pencerelerden (`TAP_PEAK_REL`).
+      Kalkışı bulunamayan parmaklar (ör. tek tapta orta, her zaman yüzük ve serçe) bulunan
+      parmakların medyanıyla doldurulur.
+
+    Örnek yoksa veya hiçbir parmakta pozitif tepe yoksa `ValueError`.
+    """
+    # lift bu modülden HandCalibration'ı import eder; döngüyü önlemek için burada.
+    from tkt.vision.lift import FIT_WEIGHTS, raw_signals
+
+    windows = _tap_windows(samples)
+    if not windows:
+        raise ValueError("fit_taps: örnek yok")
+
+    # Her pencere: parmak → (açı farkı dizisi, boy farkı dizisi), taban çizgisine göre.
+    deltas: list[dict[str, tuple[list[float], list[float]]]] = []
+    for win in windows:
+        sig = [raw_signals(h) for _t, h in win]
+        t0 = win[0][0]
+        n_base = max(1, sum(1 for t, _h in win if t - t0 < TAP_BASE_S))
+        d: dict[str, tuple[list[float], list[float]]] = {}
+        for f in sig[0]:
+            a0 = _median([s[f][0] for s in sig[:n_base]])
+            l0 = _median([s[f][1] for s in sig[:n_base]])
+            d[f] = ([s[f][0] - a0 for s in sig], [l0 - s[f][1] for s in sig])
+        deltas.append(d)
+
+    votes = 0
+    for d in deltas:
+        best = max((da for da, _dl in d.values()), key=lambda xs: max(abs(x) for x in xs))
+        peak = max(best, key=abs)
+        if abs(peak) > 0:
+            votes += 1 if peak > 0 else -1
+    angle_sign = calib.angle_sign if votes == 0 else (1.0 if votes > 0 else -1.0)
+
+    wa, wl = FIT_WEIGHTS["w_angle"], FIT_WEIGHTS["w_length"]
+    found: dict[str, list[float]] = {f: [] for f in deltas[0]}
+    for d in deltas:
+        peaks = {f: max(wa * angle_sign * a + wl * ln for a, ln in zip(da, dl, strict=True))
+                 for f, (da, dl) in d.items()}
+        top = max(peaks.values())
+        if not top > 0:
+            continue
+        for f, p in peaks.items():
+            if p >= TAP_PEAK_REL * top:
+                found[f].append(p)
+
+    n = len(deltas)
+    tap_ref = {f: _median(v) for f, v in found.items() if v and len(v) >= TAP_MIN_FOUND * n}
+    if not tap_ref:
+        raise ValueError("fit_taps: hiçbir parmakta kalkış tepesi bulunamadı")
+    fill = _median(list(tap_ref.values()))
+    tap_ref = {f: tap_ref.get(f, fill) for f in found}
+    return replace(calib, tap_ref=tap_ref, angle_sign=angle_sign)
