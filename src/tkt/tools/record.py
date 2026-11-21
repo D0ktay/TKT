@@ -4,7 +4,9 @@
     python -m tkt.tools.record --out ad.jsonl --prompt 50 --kind tap1 --raw --video
     python -m tkt.tools.record --from-raw ad.raw.jsonl --out ad.jsonl
 
-V1-1 kapsamı: `--out --note --duration --raw --video`. `--prompt` ve `--from-raw` V1-2'dedir.
+`--prompt N --kind tap1|tap2`: kayıt sırasında bip verir; her bipin zamanı `HandFrame.t` ile aynı
+saatte (`time.monotonic`) `ad.prompts.json` dosyasına yazılır (`core/io.write_prompts`).
+`--from-raw`: ham kayıttan güncel `features` ve (varsa) `lift` ile HandFrame kaydını yeniden üretir.
 
 Ham kayıt (`ad.raw.jsonl`):
     1. satır: `core/io.info_to_header` alanları + {"raw": true}
@@ -18,9 +20,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 import threading
-from collections.abc import Iterable, Iterator
+import time
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
@@ -29,11 +34,14 @@ from typing import IO, Any
 import numpy as np
 
 from tkt.core.io import (
+    Prompt,
     RecordFormatError,
     RecordingWriter,
     SchemaError,
     header_to_info,
     info_to_header,
+    prompts_path,
+    write_prompts,
 )
 from tkt.core.types import SourceInfo
 from tkt.vision.tracker import RawHand
@@ -42,6 +50,14 @@ N_POINTS = 21
 _T_DIGITS = 6
 _IMG_DIGITS = 5
 _WORLD_DIGITS = 6
+
+# Bip zamanlaması (config anahtarı değil, modül sabiti).
+PROMPT_LEAD_S = 3.0       # kayıt başladıktan ilk bipe kadar hazırlık
+PROMPT_INTERVAL_S = 2.0   # bipler arası
+PROMPT_TAIL_S = 2.0       # son bipten sonra kayıt devam eder
+_MAC_BEEP_SOUND = "/System/Library/Sounds/Tink.aiff"
+_WIN_BEEP_HZ = 880
+_WIN_BEEP_MS = 150
 
 
 # --------------------------------------------------------------------------- ham kayıt
@@ -182,18 +198,75 @@ def sibling_paths(out: str | Path) -> tuple[Path, Path, Path]:
     return p, p.with_name(name + ".raw.jsonl"), p.with_name(name + ".mp4")
 
 
+# --------------------------------------------------------------------------- bip
+
+
+_mac_procs: list[subprocess.Popen[bytes]] = []
+
+
+def _beep_terminal() -> None:
+    sys.stderr.write("\a")
+    sys.stderr.flush()
+
+
+def _beep_mac() -> None:
+    # Biten süreçleri topla (zombi kalmasın), sonra bloklamadan yenisini başlat.
+    _mac_procs[:] = [p for p in _mac_procs if p.poll() is None]
+    try:
+        _mac_procs.append(subprocess.Popen(
+            ["afplay", _MAC_BEEP_SOUND],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    except OSError:
+        _beep_terminal()
+
+
+def _beep_windows() -> None:
+    import winsound
+
+    def run() -> None:
+        try:
+            winsound.Beep(_WIN_BEEP_HZ, _WIN_BEEP_MS)
+        except RuntimeError:
+            winsound.MessageBeep()
+
+    threading.Thread(target=run, name="tkt-record-beep", daemon=True).start()
+
+
+def play_beep() -> None:
+    """Platforma göre bloklamadan bip çalar."""
+    if sys.platform == "darwin":
+        _beep_mac()
+    elif sys.platform == "win32":
+        _beep_windows()
+    else:
+        _beep_terminal()
+
+
 # --------------------------------------------------------------------------- kayıt
 
 
 def record(source: Any, out: str | Path, note: str = "", duration: float | None = None,
            raw: bool = False, video: bool = False,
-           stop: threading.Event | None = None) -> int:
+           stop: threading.Event | None = None,
+           prompt: int | None = None, kind: str = "tap1",
+           clock: Callable[[], float] = time.monotonic,
+           beep: Callable[[], None] = play_beep) -> int:
     """`source.frames_raw()` akışını kaydeder; yazılan kare sayısını döndürür.
 
     `source`: `info` ve `frames_raw()` olan nesne (LiveSource). Süre, kare `t`
     değerlerinden ölçülür. Ctrl+C veya `stop` ayarlanınca temiz kapanır.
+
+    `prompt=N`: ilk kareden `PROMPT_LEAD_S` sonra, `PROMPT_INTERVAL_S` arayla N kez `beep()`
+    çağrılır; her çağrının zamanı `clock()` ile (kare `t`'siyle aynı saat) alınır ve kayıt
+    bitince `prompts_path(out)` dosyasına yazılır. `duration` yoksa son bipten
+    `PROMPT_TAIL_S` sonra kayıt durur. Bip zamanları kare akışı sırasında denetlenir.
     """
     import cv2
+
+    if prompt is not None and prompt < 1:
+        raise ValueError("--prompt en az 1 olmalı")
+    if kind not in ("tap1", "tap2"):
+        raise ValueError(f"bilinmeyen bip türü: {kind!r}")
 
     out_path, raw_path, video_path = sibling_paths(out)
     info = replace(source.info, note=note)
@@ -201,6 +274,8 @@ def record(source: Any, out: str | Path, note: str = "", duration: float | None 
     count = 0
     t_start: float | None = None
     vwriter = None
+    prompts: list[Prompt] = []
+    clock_start: float | None = None
 
     writer = RecordingWriter(out_path, info)
     rwriter = RawWriter(raw_path, info) if raw else None
@@ -223,6 +298,17 @@ def record(source: Any, out: str | Path, note: str = "", duration: float | None 
                 vwriter.write(image)
             if stop.is_set() or (duration is not None and frame.t - t_start >= duration):
                 break
+            if prompt is not None:
+                now = clock()
+                if clock_start is None:
+                    clock_start = now
+                if len(prompts) < prompt:
+                    due = clock_start + PROMPT_LEAD_S + len(prompts) * PROMPT_INTERVAL_S
+                    if now >= due:
+                        beep()
+                        prompts.append(Prompt(t=now, kind=kind))
+                elif duration is None and now - prompts[-1].t >= PROMPT_TAIL_S:
+                    break
     except KeyboardInterrupt:
         pass
     finally:
@@ -232,6 +318,60 @@ def record(source: Any, out: str | Path, note: str = "", duration: float | None 
             rwriter.close()
         if vwriter is not None:
             vwriter.release()
+        if prompt is not None:
+            write_prompts(prompts_path(out_path), prompts)
+    return count
+
+
+# --------------------------------------------------------------------------- ham kayıttan üretim
+
+
+def rebuild_from_raw(raw_path: str | Path, out: str | Path,
+                     config_path: str | Path = "config/vision.toml") -> int:
+    """Ham kayıttan güncel `features.build_frame` ve `lift` ile HandFrame kaydı üretir.
+
+    Kalibrasyon config'teki `hand.calibration` yolundan okunur (yoksa `DEFAULT`). `tap_ref`
+    varsa ve `LiftEstimator` kurulabiliyorsa `lift` hesaplanır; yoksa `lift` None kalır.
+    Ham kaydın `prompts` yan dosyası varsa `out`'un yan dosyasına kopyalanır. Yazılan kare
+    sayısını döndürür.
+    """
+    from tkt.vision import features, hand_calib
+    from tkt.vision.lift import LiftEstimator
+    from tkt.vision.live_source import load_vision_config
+
+    cfg = load_vision_config(config_path)
+    calib_path = Path(cfg["hand"]["calibration"]).expanduser()
+    calib = hand_calib.load(calib_path) or hand_calib.DEFAULT
+
+    lift = None
+    if calib.tap_ref is not None:
+        try:
+            lift = LiftEstimator(calib, cfg["lift"])
+        except NotImplementedError:
+            print("uyarı: LiftEstimator henüz uygulanmamış; lift olmadan devam ediliyor",
+                  file=sys.stderr)
+
+    info = read_raw_header(raw_path)
+    prev_size: float | None = None
+    count = 0
+    with RecordingWriter(out, info) as writer:
+        for s in iter_raw(raw_path):
+            if s.hand is None and lift is not None:
+                lift.reset()
+            frame = features.build_frame(
+                s.hand, s.t, s.frame_id, calib, info, lift=None, prev_hand_size=prev_size)
+            if s.hand is not None and lift is not None and frame.present:
+                curls = {name: f.curl for name, f in frame.fingers.items()}
+                frame = features.build_frame(
+                    s.hand, s.t, s.frame_id, calib, info,
+                    lift=lift.update(s.hand, s.t, curls), prev_hand_size=prev_size)
+            prev_size = frame.hand_size if frame.present else None
+            writer.write(frame)
+            count += 1
+
+    src_prompts, dst_prompts = prompts_path(raw_path), prompts_path(out)
+    if src_prompts.exists() and src_prompts.resolve() != dst_prompts.resolve():
+        shutil.copyfile(src_prompts, dst_prompts)
     return count
 
 
@@ -255,20 +395,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--raw", action="store_true", help="21 noktayı ad.raw.jsonl'e de yaz")
     p.add_argument("--video", action="store_true", help="görüntüyü ad.mp4'e de yaz")
     p.add_argument("--prompt", type=int, default=None, metavar="N",
-                   help="2 sn arayla N bip ver, zamanları ad.prompts.json'a yaz (V1-2)")
+                   help="2 sn arayla N bip ver, zamanları ad.prompts.json'a yaz")
     p.add_argument("--kind", choices=("tap1", "tap2"), default="tap1", help="bip türü")
     p.add_argument("--from-raw", default=None, metavar="RAW",
-                   help="ham kayıttan güncel features ve lift ile HandFrame kaydı üret (V1-2)")
+                   help="ham kayıttan güncel features ve lift ile HandFrame kaydı üret")
     p.add_argument("--config", default="config/vision.toml")
     return p
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if args.prompt is not None:
-        raise NotImplementedError("--prompt henüz yok (görev V1-2)")
     if args.from_raw is not None:
-        raise NotImplementedError("--from-raw henüz yok (görev V1-2)")
+        if args.prompt is not None:
+            build_parser().error("--from-raw ile --prompt birlikte kullanılamaz")
+        n = rebuild_from_raw(args.from_raw, args.out, args.config)
+        print(f"{n} kare yazıldı: {args.out}")
+        return
+    if args.prompt is not None and args.prompt < 1:
+        build_parser().error("--prompt en az 1 olmalı")
 
     from tkt.vision.live_source import open_live_source
 
@@ -278,7 +422,8 @@ def main(argv: list[str] | None = None) -> None:
         _watch_stdin_for_quit(stop)
         print("Kayıt başladı; durdurmak için q + Enter veya Ctrl+C.", file=sys.stderr)
     try:
-        n = record(source, args.out, args.note, args.duration, args.raw, args.video, stop)
+        n = record(source, args.out, args.note, args.duration, args.raw, args.video, stop,
+                   prompt=args.prompt, kind=args.kind)
     finally:
         source.close()
     print(f"{n} kare yazıldı: {args.out}")
