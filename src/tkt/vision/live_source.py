@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
+import threading
 import time
 import tomllib
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +44,9 @@ class LiveSource:
         self._tracker = tracker
         self._calib = calib
         self._lift = lift
+        # `set_calibration` lift'i yeniden kurarken bunu kullanır; open_live_source doldurur.
+        self.lift_cfg: Mapping | None = None
+        self._calib_lock = threading.Lock()
         self._closed = False
         self._proc_times: deque[float] = deque()
         self.last_process_ms: float = 0.0   # son karenin takip + özellik süresi
@@ -73,6 +77,22 @@ class LiveSource:
             return 0.0
         return (len(times) - 1) / (times[-1] - times[0])
 
+    # ------------------------------------------------------------------ kalibrasyon
+
+    def set_calibration(self, calib: HandCalibration) -> None:
+        """Sonraki karelerden itibaren yeni kalibrasyonu kullanır (başka thread'den çağrılabilir).
+
+        Lift varsa ve `calib.tap_ref` doluysa LiftEstimator yeni kalibrasyonla yeniden kurulur;
+        `tap_ref` yoksa lift kapanır (None). Config'ten kurulmuş kaynakta (`lift_cfg` dolu)
+        ilk kalibrasyonda lift yoksa da `tap_ref` gelince kurulur.
+        """
+        lift = None
+        if calib.tap_ref is not None and (self._lift is not None or self.lift_cfg is not None):
+            lift = LiftEstimator(calib, self.lift_cfg if self.lift_cfg is not None else {})
+        with self._calib_lock:
+            self._calib = calib
+            self._lift = lift
+
     # ------------------------------------------------------------------ akış
 
     def frames(self) -> Iterator[HandFrame]:
@@ -91,17 +111,19 @@ class LiveSource:
                 return
 
             t0 = time.perf_counter()
+            with self._calib_lock:      # kare boyunca aynı kalibrasyon + lift çifti
+                calib, lift_est = self._calib, self._lift
             hand = self._tracker.process(cap.image, cap.t)
-            if hand is None and self._lift is not None:
-                self._lift.reset()
+            if hand is None and lift_est is not None:
+                lift_est.reset()
             frame = features.build_frame(
-                hand, cap.t, cap.frame_id, self._calib, self.info,
+                hand, cap.t, cap.frame_id, calib, self.info,
                 lift=None, prev_hand_size=prev_size)
-            if hand is not None and self._lift is not None and frame.present:
+            if hand is not None and lift_est is not None and frame.present:
                 curls = {name: f.curl for name, f in frame.fingers.items()}
                 frame = features.build_frame(
-                    hand, cap.t, cap.frame_id, self._calib, self.info,
-                    lift=self._lift.update(hand, cap.t, curls), prev_hand_size=prev_size)
+                    hand, cap.t, cap.frame_id, calib, self.info,
+                    lift=lift_est.update(hand, cap.t, curls), prev_hand_size=prev_size)
             done = time.perf_counter()
             self.last_process_ms = (done - t0) * 1000.0
             self._proc_times.append(time.monotonic())
@@ -144,7 +166,9 @@ def open_live_source(config_path: str | Path = "config/vision.toml") -> LiveSour
     lift = LiftEstimator(calib, cfg["lift"]) if calib.tap_ref is not None else None
 
     try:
-        return LiveSource(camera, tracker, calib, hand_cfg["side"], lift)
+        source = LiveSource(camera, tracker, calib, hand_cfg["side"], lift)
+        source.lift_cfg = cfg["lift"]
+        return source
     except BaseException:
         camera.close()
         tracker.close()
