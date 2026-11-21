@@ -275,6 +275,25 @@ def test_screen_accumulates_events_in_order_and_expires_visuals():
     assert not np.array_equal(previous, replay.draw_screen(state, 3.1))
 
 
+def test_screen_moves_and_trails_start_at_clamped_cursor():
+    backend = DryBackend()
+    backend.set_time(1)
+    backend.move_rel(1000, -1000)
+    backend.set_time(1.1)
+    backend.move_rel(-100, 100)
+    backend.button("left", True)
+
+    start = (100, 100)
+    corner = (replay._PANEL_WIDTH - 19, 78)
+    end = (corner[0] - 100, 178)
+    state = replay.ScreenState(cursor=start)
+    state.update(backend.events, 1.1)
+
+    assert state.cursor == end
+    assert list(state.trail) == [(1, start, corner, False), (1.1, corner, end, False)]
+    assert list(state.rings) == [(1.1, end, "left")]
+
+
 @pytest.mark.parametrize("demo", ["pointer", "click", "scroll", "tap", "swipe"])
 def test_synthetic_demos_exercise_the_engine(demo):
     cfg = load_control_config()
