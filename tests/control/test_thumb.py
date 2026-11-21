@@ -4,7 +4,10 @@ import pytest
 from tests.control.test_gestures import backend_events, lock_pointer, pose
 from tests.control.test_gestures import rig as rig
 
-from tkt.control.gestures import Mode
+from tkt.app.config import load_control_config
+from tkt.control.gestures import GestureEngine, Mode
+from tkt.control.os_input.dry_backend import DryBackend
+from tkt.control.sources import SyntheticSource
 
 
 @pytest.mark.parametrize("click_count", [1, 2])
@@ -23,10 +26,14 @@ def test_thumb_close_and_open_produce_separate_left_clicks(rig, click_count):
         engine.process(pose(start + 0.09375, "index", thumb_out=0.75))
         assert not engine.left_down
 
-    assert backend_events(backend) == [
-        ("button", "left", True),
-        ("button", "left", False),
-    ] * click_count
+    assert (
+        backend_events(backend)
+        == [
+            ("button", "left", True),
+            ("button", "left", False),
+        ]
+        * click_count
+    )
 
 
 def test_short_thumb_changes_are_debounced_and_threshold_band_preserves_state(rig):
@@ -106,8 +113,8 @@ def test_scroll_thumb_right_click_requires_still_palm(rig, moving):
     engine.process(pose(0.125, "index", "middle"))
     palm = (0.525, 0.6) if moving else (0.505, 0.6)
     engine.process(pose(0.15625, "index", "middle", palm=palm))
-    engine.process(pose(0.21875, "index", "middle", thumb_out=0, index_pos=(0.7, 0.4)))
-    engine.process(pose(0.25, "index", "middle", thumb_out=0, index_pos=(0.7, 0.4)))
+    engine.process(pose(0.21875, "index", "middle", thumb_out=0))
+    engine.process(pose(0.25, "index", "middle", thumb_out=0))
     engine.process(pose(0.5, "index", "middle", thumb_out=0))
 
     if moving:
@@ -150,3 +157,37 @@ def test_held_button_is_released_when_gesture_ends(rig, end):
         assert scroll.stop.call_count == 2
     else:
         assert backend_events(backend) == [("button", "left", True), ("button", "left", False)]
+
+
+def test_scroll_thumb_does_not_click_while_tips_move_with_still_palm():
+    backend = DryBackend()
+    engine = GestureEngine(load_control_config(), backend, SyntheticSource().info)
+    engine.process(pose(0, "index", "middle"))
+    engine.process(pose(0.125, "index", "middle"))
+    for t, y, thumb in [(0.1875, 0.4, 1), (0.21875, 0.45, 0), (0.25, 0.5, 0)]:
+        tip = (0.5, y)
+        engine.process(
+            pose(t, "index", "middle", thumb_out=thumb, index_pos=tip, positions={"middle": tip})
+        )
+
+    assert len(backend.events) == 2
+    assert all(event.kind == "scroll" for event in backend.events)
+
+
+def test_tap_lift_does_not_undo_or_freeze_active_thumb_drag():
+    config = load_control_config()
+    config["general"]["click_method"] = "both"
+    backend = DryBackend()
+    engine = GestureEngine(config, backend, SyntheticSource().info)
+    lock_pointer(engine, lift=0)
+
+    for t, x in [(0.15625, 0.5), (0.1875, 0.5), (0.21875, 0.55), (0.25, 0.6)]:
+        engine.process(pose(t, "index", thumb_out=0, lift=0, index_pos=(x, 0.4)))
+    assert engine.left_down
+    assert [event.kind for event in backend.events] == ["button", "move"]
+
+    engine.process(pose(0.28125, "index", thumb_out=0, lift=0.8, index_pos=(0.65, 0.4)))
+    engine.process(pose(0.3125, "index", thumb_out=0, lift=0.8, index_pos=(0.7, 0.4)))
+    assert engine.left_down
+    assert [event.kind for event in backend.events] == ["button", "move", "move", "move"]
+    assert all(event.args[0] > 0 for event in backend.events[1:])

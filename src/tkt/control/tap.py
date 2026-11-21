@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from math import hypot
 from typing import Any
 
-from tkt.core.types import HandFrame
+from tkt.core.types import HandFrame, SourceInfo
 
 
 @dataclass(frozen=True)
@@ -38,42 +38,55 @@ class TapDetector:
         self._max_palm_move = tap["max_palm_move"]
         self._cooldown_s = tap["cooldown_ms"] / 1000
         self._curl_open = cfg["mode"]["curl_open"]
+        # Kaynak bilgisi verilmezse normalize koordinatların önceki ölçeğini koru.
+        self._width = self._height = 1
         self.reset()
+
+    def set_info(self, info: SourceInfo) -> None:
+        """Avuç hareketini ölçmek için kaynak görüntüsünün boyutlarını al."""
+        self._width, self._height = info.width, info.height
+
+    def cancel_until_landing(self, watched: tuple[str, ...]) -> None:
+        """Tap girişimini iptal et ve izlenen parmaklar inene kadar bekle."""
+        self._clear_attempt()
+        self._watched = watched
+        self._await_landing = True
 
     def update(self, frame: HandFrame, watched: tuple[str, ...]) -> TapUpdate:
         """İzlenen parmaklar için tap durumunu güncelle."""
         if not frame.present or not watched:
             return TapUpdate(False, bool(self._fingers), None)
+        if self._watched != watched:
+            self._clear_attempt()
+            self._watched = watched
+            self._await_landing = False
+
         lifts: dict[str, float] = {}
         for name in watched:
             lift = frame.fingers[name].lift
             if lift is None:
-                return TapUpdate(False, bool(self._fingers), None)
+                self.cancel_until_landing(watched)
+                return TapUpdate(False, False, None)
             lifts[name] = lift
 
-        if self._watched != watched:
-            self._clear_attempt()
-            self._watched = watched
-            self._cooling_lift = False
-
         lifting = any(lift > self._lift_start for lift in lifts.values())
-        if frame.t < self._cooldown_until or self._cooling_lift:
-            # Cooldown sırasında başlayan kalkışı yarıda devralma.
+        if frame.t < self._cooldown_until or self._await_landing:
+            # Kesintiye uğrayan veya cooldown sırasında başlayan kalkışı devralma.
             if lifting:
-                self._cooling_lift = True
+                self._await_landing = True
             elif all(lift < self._lift_start for lift in lifts.values()):
-                self._cooling_lift = False
+                self._await_landing = False
             return TapUpdate(False, False, None)
 
         started = not self._fingers and lifting
         if started:
             self._palm_origin = frame.palm
-            self._palm_limit = self._max_palm_move * frame.hand_size
+            self._palm_limit = self._max_palm_move * (frame.hand_size * self._width)
         elif not self._fingers:
             return TapUpdate(False, False, None)
 
-        dx = frame.palm[0] - self._palm_origin[0]
-        dy = frame.palm[1] - self._palm_origin[1]
+        dx = (frame.palm[0] - self._palm_origin[0]) * self._width
+        dy = (frame.palm[1] - self._palm_origin[1]) * self._height
         if hypot(dx, dy) >= self._palm_limit:
             self._cancelled = True
         for name, lift in lifts.items():
@@ -106,7 +119,7 @@ class TapDetector:
         self._clear_attempt()
         self._watched: tuple[str, ...] = ()
         self._cooldown_until = float("-inf")
-        self._cooling_lift = False
+        self._await_landing = False
 
     def _clear_attempt(self) -> None:
         self._fingers: dict[str, _FingerTap] = {}

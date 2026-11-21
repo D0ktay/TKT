@@ -24,8 +24,16 @@ class PointerMotion:
         self._filter = OneEuro(cfg["min_cutoff"], cfg["beta"], **filter_options)
         self._gain_min = cfg["gain_min"]
         self._gain_range = cfg["gain_max"] - self._gain_min
+        if not isfinite(self._gain_min) or not isfinite(self._gain_range) or self._gain_range < 0:
+            raise ValueError("gain_max ve gain_min sonlu olmalı ve gain_max >= gain_min olmalı")
         self._speed_lo = cfg["speed_lo"]
         self._speed_range = cfg["speed_hi"] - self._speed_lo
+        if (
+            not isfinite(self._speed_lo)
+            or not isfinite(self._speed_range)
+            or self._speed_range <= 0
+        ):
+            raise ValueError("speed_hi ve speed_lo sonlu olmalı ve speed_hi > speed_lo olmalı")
         self._gap_reset_s = cfg["gap_reset_ms"] / 1000.0
         self._history_s = max(HISTORY_MS, cfg["rollback_ms"]) / 1000.0
         self._hand_samples: deque[tuple[float, float]] = deque()
@@ -80,10 +88,13 @@ class PointerMotion:
         """Son kare zamanından geriye doğru verilen aralıktaki hareketi geri al."""
         if self._t is None:
             return 0, 0
+        return self.rollback_at(ms, self._t)
 
+    def rollback_at(self, ms: float, t: float) -> tuple[int, int]:
+        """En az son imleç örneği kadar yeni olan t zamanından geriye doğru hareketi geri al."""
         window_s = ms / 1000.0
         undo_x = undo_y = 0
-        while self._history and self._history[-1][0] + window_s >= self._t:
+        while self._history and self._history[-1][0] + window_s >= t:
             _, dx, dy = self._history.pop()
             undo_x -= dx
             undo_y -= dy
