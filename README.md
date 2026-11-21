@@ -44,10 +44,14 @@ uv run python -m tkt.vision.camera --probe
 uv run python -m tkt.vision.debug_view
 ```
 
-Debug penceresi el iskeletini, parmak ölçümlerini ve fps'yi gösterir. `c` ile
-el kalibrasyonunu başlatıp ekrandaki adımları izleyin. Sonuç `[hand].calibration`
-yoluna yazılır. `q` veya Esc ile çıkıp yeni kalibrasyonla devam edin. Tap
-kalibrasyonu için planlanan `t` kısayolu henüz uygulanmadı.
+Debug penceresi el iskeletini, parmak ölçümlerini, lift grafiğini ve fps'yi
+gösterir.
+
+- `c`: el kalibrasyonu (açık el 2 sn, yumruk 2 sn, başparmak kapalı 2 sn).
+- `t`: tap kalibrasyonu; ekranda "TAP!" görünce işaret parmağıyla tap yapın (10 kez).
+- `q`, Esc veya pencereyi kapatmak: çıkış.
+
+Kalibrasyon hemen uygulanır ve `[hand].calibration` yoluna yazılır.
 
 ```bash
 uv run python -m tkt.app.main --source live --backend pynput
