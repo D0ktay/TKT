@@ -160,7 +160,7 @@ def test_img_palm_and_fields():
         assert f.fingers[name].lift is None
     expected_palm = hand.image_pts[[0, 5, 9, 13, 17]].mean(axis=0)
     assert f.palm == pytest.approx(tuple(expected_palm))
-    assert f.confidence == pytest.approx(0.95)
+    assert f.confidence == pytest.approx(1.0)      # el bulundu, ceza yok: taban 1.0
 
 
 def test_lift_written_when_given():
@@ -223,10 +223,17 @@ def test_confidence_drops_near_edge():
     at_edge = build_frame(make_hand(center=(0.5, 1.0)), 0.0, 0, DEFAULT, INFO)
     # Bir kısmı kadraj dışında (sol).
     outside = build_frame(make_hand(center=(0.0, 0.6)), 0.0, 0, DEFAULT, INFO)
-    assert centered.confidence == pytest.approx(0.95)
+    assert centered.confidence == pytest.approx(1.0)
     assert at_edge.confidence < centered.confidence
     assert outside.confidence < centered.confidence
-    assert outside.confidence == pytest.approx(0.95 * features.EDGE_MIN_FACTOR)
+    assert outside.confidence == pytest.approx(features.EDGE_MIN_FACTOR)
+
+
+def test_confidence_ignores_raw_score():
+    # Eski kayıtlarda score MediaPipe'ın sağ/sol skorudur; aynı geometride güven değişmemeli.
+    low = build_frame(make_hand(score=0.51), 0.0, 0, DEFAULT, INFO)
+    high = build_frame(make_hand(score=0.99), 0.0, 0, DEFAULT, INFO)
+    assert low.confidence == high.confidence == pytest.approx(1.0)
 
 
 def test_confidence_stays_in_unit_range():

@@ -1,3 +1,4 @@
+import itertools
 import sys
 import threading
 import time
@@ -17,6 +18,7 @@ class FakeCapture:
     interval = 0.005
     fail = False
     unopenable_flags: set[int] = set()     # bu backend bayraklarıyla açılamaz
+    silent_flags: set[int] = set()         # açılır (isOpened=True) ama hiç kare vermez
     reported = {                            # sürücünün "gerçekleşen" değerleri
         cv2.CAP_PROP_FRAME_WIDTH: 640, cv2.CAP_PROP_FRAME_HEIGHT: 512, cv2.CAP_PROP_FPS: 60.0,
         cv2.CAP_PROP_FOURCC: cv2.VideoWriter_fourcc(*"MJPG"),
@@ -42,7 +44,7 @@ class FakeCapture:
 
     def read(self):
         time.sleep(self.interval)
-        if FakeCapture.fail:
+        if FakeCapture.fail or self.flag in FakeCapture.silent_flags:
             return False, None
         self.n += 1
         img = np.zeros((4, 6, 3), np.uint8)
@@ -59,9 +61,56 @@ def fake_cv2(monkeypatch):
     FakeCapture.interval = 0.005
     FakeCapture.fail = False
     FakeCapture.unopenable_flags = set()
+    FakeCapture.silent_flags = set()
     monkeypatch.setattr(FakeCapture, "reported", dict(FakeCapture.reported))   # test sonunda geri
     monkeypatch.setattr(cam_mod.cv2, "VideoCapture", FakeCapture)
     return FakeCapture
+
+
+class GatedCapture(FakeCapture):
+    """read() `want` olayı set edilene kadar bloklanır, sonra tek kare verir.
+
+    Kare sırası testte olaylarla yönetilir; gerçek saate dayanmaz.
+    """
+
+    def __init__(self, index, flag):
+        super().__init__(index, flag)
+        self.want = threading.Event()
+        self.in_read = threading.Event()
+        self.reading = False
+        self.release_during_read = False
+        self.thread: threading.Thread | None = None
+
+    def read(self):
+        self.thread = threading.current_thread()
+        self.reading = True
+        self.in_read.set()
+        self.want.wait()
+        self.want.clear()
+        self.in_read.clear()
+        self.n += 1
+        img = np.zeros((4, 6, 3), np.uint8)
+        img[0, 0] = self.n % 256
+        self.reading = False
+        return True, img
+
+    def release(self):
+        if self.reading:
+            self.release_during_read = True
+        self.released = True
+
+
+@pytest.fixture
+def gated_cv2(monkeypatch):
+    FakeCapture.instances = []
+    monkeypatch.setattr(cam_mod.cv2, "VideoCapture", GatedCapture)
+    # close() read'de bloklu thread'i uzun beklemesin; thread'ler teardown'da serbest kalır.
+    monkeypatch.setattr(cam_mod, "_CLOSE_TIMEOUT_S", 0.01)
+    yield GatedCapture
+    for cap in FakeCapture.instances:    # bloklu thread'leri bırak ve bitmelerini bekle
+        cap.want.set()
+        if cap.thread is not None:
+            cap.thread.join(5.0)
 
 
 def test_resolve_backend():
@@ -182,22 +231,109 @@ def test_open_failure_raises(monkeypatch, fake_cv2):
         Camera(0, 640, 512, 60).start()
 
 
-def test_frames_rotated_monotonic_and_increasing_ids(fake_cv2):
-    c = Camera(0, 6, 4, 60, rotate_180=True)
+def test_frames_rotated_monotonic_and_increasing_ids(gated_cv2):
+    before = time.monotonic()          # referans saati thread başlamadan alınır
+    c = Camera(0, 6, 4, 60, rotate_180=True, backend="avfoundation")
     c.start()
+    cap = gated_cv2.instances[0]
     try:
-        before = time.monotonic()
         ids, ts = [], []
-        for _ in range(10):
-            f = c.read()
-            assert f is not None
+        for expected in range(1, 11):
+            cap.want.set()             # tam bir kare üret
+            f = c.read(timeout=5.0)
+            assert f is not None and f.frame_id == expected
             ids.append(f.frame_id)
             ts.append(f.t)
             # 180° döndürme: sol üstteki işaret sağ alta gider
             assert f.image[3, 5, 0] != 0 and f.image[0, 0, 0] == 0
-        assert ids == sorted(set(ids)) and ids[0] >= 1
+        assert ids == list(range(1, 11))
         assert ts == sorted(ts) and ts[0] >= before
         assert c.frame_size == (6, 4)
+    finally:
+        c.close()
+
+
+def test_t_strictly_increasing_when_clock_repeats_or_goes_back(gated_cv2, monkeypatch):
+    # Windows'ta monotonic ~15 ms çözünürlüklü: iki kare aynı t'yi alabilir.
+    clock = itertools.chain([5.0, 5.0, 4.9, 5.2], itertools.repeat(6.0))
+    monkeypatch.setattr(cam_mod, "_clock", lambda: next(clock))
+    c = Camera(0, 6, 4, 60, backend="avfoundation")
+    c.start()
+    cap = gated_cv2.instances[0]
+    try:
+        ts = []
+        for _ in range(4):
+            cap.want.set()
+            ts.append(c.read(timeout=5.0).t)
+    finally:
+        c.close()
+    assert all(b > a for a, b in zip(ts, ts[1:], strict=False))
+    assert ts == pytest.approx([5.0, 5.0 + cam_mod._MIN_DT_S, 5.0 + 2 * cam_mod._MIN_DT_S, 5.2])
+
+
+def test_close_while_read_blocked_releases_in_thread_and_publishes_nothing(
+        gated_cv2, monkeypatch, caplog):
+    c = Camera(0, 6, 4, 60, backend="avfoundation")
+    c.start()
+    cap = gated_cv2.instances[0]
+    assert cap.in_read.wait(5.0)       # yakalama thread'i read() içinde bloklu
+    thread = c._thread
+    with caplog.at_level("WARNING", logger=cam_mod.log.name):
+        c.close()
+    assert any("bitmedi" in r.getMessage() for r in caplog.records)
+    assert not cap.released            # read sürerken aynı nesne bırakılmaz
+    cap.want.set()                     # bloklu read kapanıştan sonra bir kare döndürür
+    thread.join(5.0)
+    assert not thread.is_alive()
+    assert cap.released and not cap.release_during_read
+    assert c.read(0) is None           # kapanıştan sonra kare yayımlanmaz
+
+
+def test_read_after_close_returns_none(gated_cv2):
+    c = Camera(0, 6, 4, 60, backend="avfoundation")
+    c.start()
+    cap = gated_cv2.instances[0]
+    cap.want.set()
+    while c.frame_size is None:        # kare yayımlandı ama okunmadı
+        time.sleep(0.001)
+    c.close()
+    assert c.read(0) is None
+
+
+def test_auto_dshow_without_frames_falls_back_to_msmf(fake_cv2, monkeypatch, caplog):
+    monkeypatch.setattr(cam_mod.sys, "platform", "win32")
+    monkeypatch.setattr(cam_mod, "_FIRST_FRAME_TIMEOUT_S", 0.05)
+    fake_cv2.silent_flags = {cv2.CAP_DSHOW}      # isOpened=True ama kare yok
+    c = Camera(0, 640, 512, 60, backend="auto")
+    with caplog.at_level("WARNING", logger=cam_mod.log.name):
+        c.start()
+    try:
+        assert [i.flag for i in fake_cv2.instances] == [cv2.CAP_DSHOW, cv2.CAP_MSMF]
+        assert fake_cv2.instances[0].released
+        assert c.backend == "msmf" and c.negotiated()["backend"] == "msmf"
+        assert any("msmf" in r.getMessage() for r in caplog.records)
+        assert c.read(timeout=5.0) is not None
+    finally:
+        c.close()
+
+
+def test_auto_dshow_with_frames_keeps_dshow(fake_cv2, monkeypatch):
+    monkeypatch.setattr(cam_mod.sys, "platform", "win32")
+    c = Camera(0, 640, 512, 60, backend="auto")
+    c.start()
+    try:
+        assert [i.flag for i in fake_cv2.instances] == [cv2.CAP_DSHOW]
+        assert c.read(timeout=5.0) is not None
+    finally:
+        c.close()
+
+
+def test_explicit_dshow_is_not_verified_by_frames(fake_cv2):
+    fake_cv2.silent_flags = {cv2.CAP_DSHOW}
+    c = Camera(0, 640, 512, 60, backend="dshow")
+    c.start()
+    try:
+        assert c.backend == "dshow" and len(fake_cv2.instances) == 1
     finally:
         c.close()
 
