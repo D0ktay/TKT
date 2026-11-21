@@ -17,34 +17,7 @@ _SYSTEM_KEYS = {
     "desktop_right": _KEY_RIGHT,
 }
 _MAX_DISPLAYS = 16
-# Sistem diktesi: "Control tuşuna iki kez bas" kısayolu (sol Control sanal tuş kodu).
-_KEY_CONTROL = 59
 _DICTATION_ACTIONS = ("dictation_start", "dictation_stop")
-_DICTATION_TAP_GAP_S = 0.05
-# Cihaza bağlı sol Control bayrağı (NX_DEVICELCTLKEYMASK); gerçek klavye bunu da gönderir.
-_NX_DEVICE_LEFT_CONTROL = 0x1
-
-
-def post_control_double_tap(q: Any, post: Callable[[Any], None],
-                            sleep: Callable[[float], None] | None = None) -> None:
-    """Sol Control'e iki kez basıp bırakır (macOS "Control tuşuna iki kez bas" diktesi).
-
-    macOS değiştirici tuşların çift basışını `kCGEventFlagsChanged` olaylarından tanır;
-    `CGEventCreateKeyboardEvent` sıradan tuş olayı ürettiği için algılanmaz. Olaylar HID
-    sistem durumu kaynağıyla, bayrak değişimi türünde oluşturulur.
-    """
-    sleep = sleep or time.sleep
-    source = q.CGEventSourceCreate(q.kCGEventSourceStateHIDSystemState)
-    pressed = q.kCGEventFlagMaskControl | _NX_DEVICE_LEFT_CONTROL
-    for i in range(2):
-        if i:
-            sleep(_DICTATION_TAP_GAP_S)
-        for down in (True, False):
-            event = q.CGEventCreate(source)
-            q.CGEventSetType(event, q.kCGEventFlagsChanged)
-            q.CGEventSetIntegerValueField(event, q.kCGKeyboardEventKeycode, _KEY_CONTROL)
-            q.CGEventSetFlags(event, pressed if down else 0)
-            post(event)
 
 
 def _system_double_click_interval() -> float:
@@ -184,7 +157,10 @@ class MacBackend:
 
     def system_action(self, name: str) -> None:
         if name in _DICTATION_ACTIONS:
-            self._dictation_toggle()
+            from tkt.control.os_input import mac_dictation
+
+            mac_dictation.toggle(name == "dictation_start")
+            self.events_sent += 1
             return
         try:
             keycode = _SYSTEM_KEYS[name]
@@ -195,10 +171,6 @@ class MacBackend:
             event = q.CGEventCreateKeyboardEvent(None, keycode, down)
             q.CGEventSetFlags(event, q.kCGEventFlagMaskControl)
             self._post(event)
-
-    def _dictation_toggle(self) -> None:
-        """Control'e iki kez basar (macOS Dikte kısayolu bu olmalı)."""
-        post_control_double_tap(self._q, self._post)
 
     def release_all(self) -> None:
         self._scroll_x = self._scroll_y = 0.0

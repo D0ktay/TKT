@@ -277,11 +277,12 @@ def test_failed_mouse_up_stays_pressed_for_release_retry(monkeypatch, quartz):
     ]
 
 
-@pytest.mark.parametrize("name", ["dictation_start", "dictation_stop"])
-def test_dictation_double_taps_control(quartz, monkeypatch, name):
-    monkeypatch.setattr("tkt.control.os_input.macos.time.sleep", lambda s: None)
+@pytest.mark.parametrize(("name", "start"), [("dictation_start", True), ("dictation_stop", False)])
+def test_dictation_uses_menu_toggle(quartz, monkeypatch, name, start):
+    from tkt.control.os_input import mac_dictation
+
+    seen = []
+    monkeypatch.setattr(mac_dictation, "toggle", lambda s: seen.append(s))
     MacBackend().system_action(name)
-    posted = quartz.posted
-    assert [e.kind for e in posted] == [quartz.kCGEventFlagsChanged] * 4
-    assert [e.fields[quartz.kCGKeyboardEventKeycode] for e in posted] == [59] * 4
-    assert [e.flags for e in posted] == [quartz.kCGEventFlagMaskControl | 1, 0] * 2
+    assert seen == [start]
+    assert quartz.posted == []

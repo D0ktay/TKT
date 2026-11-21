@@ -137,33 +137,32 @@ def test_pynput_failed_mouse_up_can_be_retried(pynput_backend):
     assert mouse.release.call_args_list == [call("left"), call("right"), call("left")]
 
 
-@pytest.mark.parametrize("action", ["dictation_start", "dictation_stop"])
-def test_pynput_dictation_shortcuts(pynput_backend, monkeypatch, action):
+@pytest.mark.parametrize(
+    ("action", "start"), [("dictation_start", True), ("dictation_stop", False)])
+def test_pynput_dictation_shortcuts(pynput_backend, monkeypatch, action, start):
+    from tkt.control.os_input import mac_dictation
+
     backend, _, keyboard = pynput_backend
-    monkeypatch.setattr("tkt.control.os_input.pynput_backend.time.sleep", lambda s: None)
+    seen = []
+    monkeypatch.setattr(mac_dictation, "toggle", lambda s: seen.append(s))
     monkeypatch.setattr(
         "tkt.control.os_input.pynput_backend.sys", SimpleNamespace(platform="darwin"))
-    posted = []
-    fake_q = SimpleNamespace(
-        kCGEventSourceStateHIDSystemState=1, kCGEventFlagsChanged=12,
-        kCGKeyboardEventKeycode=9, kCGEventFlagMaskControl=0x40000, kCGHIDEventTap=0,
-        CGEventSourceCreate=lambda state: "src",
-        CGEventCreate=lambda src: SimpleNamespace(fields={}),
-        CGEventSetType=lambda e, k: setattr(e, "kind", k),
-        CGEventSetIntegerValueField=lambda e, f, v: e.fields.__setitem__(f, v),
-        CGEventSetFlags=lambda e, fl: setattr(e, "flags", fl),
-        CGEventPost=lambda tap, e: posted.append(e),
-    )
-    monkeypatch.setitem(sys.modules, "Quartz", fake_q)
     backend.system_action(action)
-    assert keyboard.mock_calls == []          # macOS'ta pynput klavyesi kullanılmaz
-    assert [(e.kind, e.fields[9], e.flags) for e in posted] == [
-        (12, 59, 0x40001), (12, 59, 0)] * 2
-    assert backend.events_sent == 4
-    backend.events_sent = 0
-    keyboard.reset_mock()
+    assert seen == [start] and keyboard.mock_calls == []   # macOS: menüden, tuş yok
     monkeypatch.setattr(
         "tkt.control.os_input.pynput_backend.sys", SimpleNamespace(platform="win32"))
     backend.system_action(action)
     assert keyboard.mock_calls == [call.press("cmd"), call.press("h"),
                                    call.release("h"), call.release("cmd")]
+
+
+def test_mac_dictation_toggle_runs_osascript_without_blocking():
+    from tkt.control.os_input import mac_dictation
+
+    calls = []
+    mac_dictation.toggle(True, popen=lambda args, **kw: calls.append((args, kw)))
+    mac_dictation.toggle(False, popen=lambda args, **kw: calls.append((args, kw)))
+    (a1, kw1), (a2, _) = calls
+    assert a1[:2] == ["osascript", "-e"] and a1[3] == "start" and a2[3] == "stop"
+    assert "Dikte" in a1[2] and "Dictation" in a1[2]
+    assert kw1["stdout"] is not None and kw1["stderr"] is not None

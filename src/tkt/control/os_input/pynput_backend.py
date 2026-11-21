@@ -1,7 +1,6 @@
 """pynput ile işletim sistemine girdi gönderen backend."""
 
 import sys
-import time
 from contextlib import ExitStack
 from math import isfinite, trunc
 
@@ -55,7 +54,7 @@ class PynputBackend:
     def system_action(self, name: str) -> None:
         key = self._keys
         if name in DICTATION_ACTIONS:
-            self._dictation_toggle()
+            self._dictation_toggle(name == "dictation_start")
             return
         if sys.platform == "win32":
             chords = {
@@ -77,20 +76,13 @@ class PynputBackend:
                 releases.callback(self._key, key, False)
                 self._key(key, True)
 
-    def _dictation_toggle(self) -> None:
-        """Sistem diktesini aç/kapat: macOS Control'e iki kez, Windows Win+H."""
+    def _dictation_toggle(self, start: bool) -> None:
+        """Sistem diktesini aç/kapat: macOS menüden (Düzen > Dikte), Windows Win+H."""
         if sys.platform == "darwin":
-            # pynput Control'ü sıradan tuş olayı olarak gönderir; macOS çift basışı
-            # algılamaz. Bayrak değişimi olayları Quartz ile gönderilir.
-            import Quartz  # type: ignore[import-not-found]
+            from tkt.control.os_input import mac_dictation
 
-            from tkt.control.os_input.macos import post_control_double_tap
-
-            def post(event) -> None:
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-                self.events_sent += 1
-
-            post_control_double_tap(Quartz, post, time.sleep)
+            mac_dictation.toggle(start)
+            self.events_sent += 1
         elif sys.platform == "win32":
             with ExitStack() as releases:
                 for k in (self._keys.cmd, "h"):
