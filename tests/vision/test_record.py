@@ -626,3 +626,63 @@ def test_from_raw_real_estimator_gets_aspect(tmp_path, monkeypatch):
         "curl_rate_suppress = 3.0\n"), encoding="utf-8")
     rec.rebuild_from_raw(raw, tmp_path / "ad.jsonl", cfg)
     assert made and made[0].aspect == pytest.approx(512 / 640)
+
+
+# ------------------------------------------------------------------ önizleme
+
+
+def preview_source(n=60, absent=()):
+    src = FakeSource(n, absent=absent)
+    src.items = [(f, h, np.zeros((120, 160, 3), np.uint8)) for f, h, _ in src.items]
+    return src
+
+
+def test_preview_lead_frames_shown_but_not_recorded(tmp_path):
+    shown = []
+    stop = threading.Event()
+    # kareler 1/60 sn arayla; 0,09 sn hazırlık -> ilk 6 kare (t farkı < 0,09) kayda girmez
+    ps = rec.PreviewSource(preview_source(60, absent={3}), "deneme", 0.055, stop, lead=0.09,
+                           show=lambda name, img: shown.append((name, img.shape)),
+                           poll_key=lambda: 255)
+    n = record(ps, tmp_path / "a.jsonl", duration=0.055)
+    frames = list(iter_frames(tmp_path / "a.jsonl"))
+    assert n == len(frames) == 5
+    assert frames[0].frame_id == 7
+    assert len(shown) == 6 + 5
+    assert all(name == rec.PREVIEW_WINDOW and shape == (120, 160, 3) for name, shape in shown)
+
+
+def test_preview_quit_key_stops_recording(tmp_path):
+    keys = iter([255, 255, ord("q")])
+    stop = threading.Event()
+    ps = rec.PreviewSource(preview_source(30), "x", None, stop, lead=0.0,
+                           show=lambda name, img: None, poll_key=lambda: next(keys, 255))
+    assert record(ps, tmp_path / "a.jsonl", stop=stop) == 3
+
+
+def test_preview_quit_during_lead_records_nothing(tmp_path):
+    stop = threading.Event()
+    ps = rec.PreviewSource(preview_source(30), "x", None, stop, lead=1.0,
+                           show=lambda name, img: None, poll_key=lambda: 27)
+    assert record(ps, tmp_path / "a.jsonl", stop=stop) == 0
+
+
+def test_cli_preview_wraps_source(tmp_path, monkeypatch):
+    import tkt.vision.live_source as ls
+
+    seen = {}
+
+    class Src(FakeSource):
+        def close(self):
+            pass
+
+    def fake_record(source, out, note, duration, raw, video, stop, **kw):
+        seen["source"] = source
+        return 0
+
+    monkeypatch.setattr(ls, "open_live_source", lambda cfg: Src(1))
+    monkeypatch.setattr(rec, "record", fake_record)
+    rec.main(["--out", str(tmp_path / "x.jsonl"), "--duration", "10", "--preview"])
+    assert isinstance(seen["source"], rec.PreviewSource)
+    rec.main(["--out", str(tmp_path / "x.jsonl"), "--duration", "10"])
+    assert isinstance(seen["source"], Src)

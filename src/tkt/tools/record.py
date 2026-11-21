@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -56,6 +57,10 @@ _WORLD_DIGITS = 6
 PROMPT_LEAD_S = 3.0       # kayıt başladıktan ilk bipe kadar hazırlık
 PROMPT_INTERVAL_S = 2.0   # bipler arası
 PROMPT_TAIL_S = 2.0       # son bipten sonra kayıt devam eder
+# Önizleme penceresi (config anahtarı değil, modül sabiti).
+PREVIEW_LEAD_S = 3.0      # pencere açıldıktan kayıt başlayana kadar hazırlık (kaydedilmez)
+PREVIEW_WINDOW = "TKT kayit"
+_PREVIEW_QUIT = (ord("q"), 27)
 _MAC_BEEP_SOUND = "/System/Library/Sounds/Tink.aiff"
 _WIN_BEEP_HZ = 880
 _WIN_BEEP_MS = 150
@@ -337,6 +342,79 @@ def record(source: Any, out: str | Path, note: str = "", duration: float | None 
     return count
 
 
+class PreviewSource:
+    """`frames_raw()` akışını kayda geçirirken her kareyi pencerede gösterir.
+
+    Önce `lead` saniye hazırlık evresi vardır: kareler gösterilir ama kayda verilmez.
+    Sonra kareler kayda verilir ve ekranda kalan süre yazar. Pencerede `q`/ESC `stop`'u
+    ayarlar. `show(name, img)` ve `poll_key()` testte değiştirilebilir; çizim
+    `debug_view.draw_overlay` ile yapılır. macOS'ta ana thread'de çalışmalıdır.
+    """
+
+    def __init__(self, source: Any, title: str, duration: float | None,
+                 stop: threading.Event, lead: float = PREVIEW_LEAD_S,
+                 show: Callable[[str, np.ndarray], None] | None = None,
+                 poll_key: Callable[[], int] | None = None) -> None:
+        import cv2
+
+        self.info = source.info
+        self._source = source
+        self._title = title
+        self._duration = duration
+        self._stop = stop
+        self._lead = lead
+        self._own_window = show is None
+        self._show = show or cv2.imshow
+        self._poll_key = poll_key or (lambda: cv2.waitKey(1) & 0xFF)
+
+    def _display(self, frame: Any, hand: RawHand | None, image: np.ndarray, text: str) -> None:
+        from tkt.vision import debug_view as dv
+
+        src = self._source
+        stats = dv.Stats(src.capture_fps(), src.process_fps(), src.last_process_ms) \
+            if hasattr(src, "capture_fps") else dv.Stats(0.0, 0.0, 0.0)
+        out = dv.draw_overlay(image, frame, hand if frame.present else None, stats,
+                              dv.CalibState(None, 0.0, 0.0, 0, text))
+        self._show(PREVIEW_WINDOW, out)
+        if self._poll_key() in _PREVIEW_QUIT:
+            self._stop.set()
+
+    def frames_raw(self) -> Iterator[tuple[Any, RawHand | None, np.ndarray]]:
+        stream = self._source.frames_raw()
+        t_lead: float | None = None
+        t_rec: float | None = None
+        try:
+            for frame, hand, image in stream:
+                if t_lead is None:
+                    t_lead = frame.t
+                left = self._lead - (frame.t - t_lead)
+                if t_rec is None and left > 0:
+                    self._display(frame, hand, image,
+                                  f"HAZIRLAN: {self._title} - {math.ceil(left)}")
+                    if self._stop.is_set():
+                        return
+                    continue
+                if t_rec is None:
+                    t_rec = frame.t
+                if self._duration is not None:
+                    rem = max(0.0, self._duration - (frame.t - t_rec))
+                    text = f"KAYIT: {self._title} - kalan {math.ceil(rem)} sn"
+                else:
+                    text = f"KAYIT: {self._title} - durdurmak icin q"
+                self._display(frame, hand, image, text)
+                yield frame, hand, image
+        finally:
+            stream.close()
+            self._close_window()
+
+    def _close_window(self) -> None:
+        if self._own_window:
+            import cv2
+
+            cv2.destroyWindow(PREVIEW_WINDOW)
+            cv2.waitKey(1)
+
+
 def _complete_lines(path: Path) -> int:
     """Dosyadaki tamamlanmış (\\n ile biten) satır sayısı, başlık dahil."""
     with path.open("rb") as fh:
@@ -464,6 +542,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kind", choices=("tap1", "tap2"), default="tap1", help="bip türü")
     p.add_argument("--from-raw", default=None, metavar="RAW",
                    help="ham kayıttan güncel features ve lift ile HandFrame kaydı üret")
+    p.add_argument("--preview", action="store_true",
+                   help=f"kaydı pencerede göster; önce {PREVIEW_LEAD_S:g} sn hazırlık, q durdurur")
     p.add_argument("--config", default="config/vision.toml")
     return p
 
@@ -486,11 +566,15 @@ def main(argv: list[str] | None = None) -> None:
 
     source = open_live_source(args.config)
     stop = threading.Event()
+    rec_source: Any = source
+    if args.preview:
+        title = args.note or Path(args.out).stem
+        rec_source = PreviewSource(source, title, args.duration, stop)
     if args.duration is None and sys.stdin is not None and sys.stdin.isatty():
         _watch_stdin_for_quit(stop)
         print("Kayıt başladı; durdurmak için q + Enter veya Ctrl+C.", file=sys.stderr)
     try:
-        n = record(source, args.out, args.note, args.duration, args.raw, args.video, stop,
+        n = record(rec_source, args.out, args.note, args.duration, args.raw, args.video, stop,
                    prompt=args.prompt, kind=args.kind)
     finally:
         source.close()
