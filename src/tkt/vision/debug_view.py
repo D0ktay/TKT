@@ -51,6 +51,15 @@ STEP_TITLES: dict[str, str] = {
     "thumb_closed": "Basparmak kapali",
 }
 
+# Adım adım kalibrasyon: her adım boşlukla başlar, önce geri sayım (örnek yok), sonra kayıt.
+GUIDED_COUNTDOWN_SECONDS = 3.0
+GUIDED_RECORD_SECONDS = 3.0
+STEP_HINTS: dict[str, str] = {
+    "open": "Elini masaya koy, parmaklar duz ve acik",
+    "fist": "Yumruk yap, parmaklar tam kivrik",
+    "thumb_closed": "Isaret parmagi acik, basparmagi ele yapistir",
+}
+
 # Kalibrasyon sonuç mesajının ekranda kalma süresi (kare zamanı, sn).
 MESSAGE_SECONDS = 4.0
 
@@ -69,6 +78,7 @@ LIFT_GRAPH_FINGERS = ("index", "middle")
 
 KEY_QUIT = (ord("q"), 27)   # q, ESC
 KEY_CALIB = ord("c")
+KEY_NEXT = ord(" ")          # adım adım kalibrasyonda sonraki adımı başlatır
 KEY_TAP = ord("t")
 
 # BGR renkler
@@ -244,7 +254,7 @@ def _draw_calibration(out: np.ndarray, cs: CalibState, u: int, fs: float, pad: i
     _bar(out, pad, y - u + 4, max(10, w - 2 * pad), u - 6, cs.progress, _YELLOW)
     y -= u
     _bar(out, pad, y - u + 4, max(10, w - 2 * pad), u - 6, cs.total_progress, _GREEN)
-    if cs.samples == 0:
+    if cs.samples == 0:   # -1: kayıt evresi değil (uyarı gösterme)
         y -= u
         _text(out, "el gorunmuyor", (pad, y), fs, _RED)
 
@@ -416,6 +426,112 @@ def draw_lift_graph(out: np.ndarray,
 # ---------------------------------------------------------------------- döngü
 
 
+class GuidedCalibration:
+    """Adım adım el kalibrasyonu (kamera/GUI yok).
+
+    Her adım `start()` (boşluk tuşu) ile başlar: `countdown_s` saniye geri sayım (örnek
+    toplanmaz), sonra `record_s` saniye kayıt. Kayıt bitince sonraki adım yeniden
+    `start()` bekler. Zaman yalnızca `add` ile verilen kare zamanından gelir.
+    `done`, `samples` ve `result()` `CalibrationSession` ile aynı anlamdadır.
+    """
+
+    def __init__(self, countdown_s: float = GUIDED_COUNTDOWN_SECONDS,
+                 record_s: float = GUIDED_RECORD_SECONDS) -> None:
+        if not (countdown_s >= 0 and record_s > 0):
+            raise ValueError("countdown_s >= 0 ve record_s > 0 olmalı")
+        self.countdown_s = float(countdown_s)
+        self.record_s = float(record_s)
+        self.samples: dict[str, list[RawHand]] = {s: [] for s in STEPS}
+        self._index = 0
+        self._pending = False            # start() çağrıldı, ilk karede zaman başlar
+        self._t0: float | None = None    # geçerli adımın başlangıcı (geri sayım dahil)
+        self._now: float | None = None
+
+    @property
+    def done(self) -> bool:
+        return self._index >= len(STEPS)
+
+    @property
+    def current_step(self) -> str | None:
+        return None if self.done else STEPS[self._index]
+
+    @property
+    def phase(self) -> str:
+        """"wait" (boşluk bekleniyor), "countdown", "record" veya "done"."""
+        if self.done:
+            return "done"
+        if self._t0 is None or self._now is None:
+            return "countdown" if self._pending else "wait"
+        return "countdown" if self._now - self._t0 < self.countdown_s else "record"
+
+    @property
+    def remaining(self) -> float:
+        """Geçerli evrenin kalan süresi (sn); beklemede 0."""
+        if self._t0 is None or self._now is None:
+            return self.countdown_s if self._pending else 0.0
+        el = self._now - self._t0
+        if el < self.countdown_s:
+            return self.countdown_s - el
+        return max(0.0, self.countdown_s + self.record_s - el)
+
+    @property
+    def progress(self) -> float:
+        """Kayıt evresinin ilerlemesi (0–1)."""
+        if self.phase != "record" or self._t0 is None or self._now is None:
+            return 0.0
+        return min(1.0, (self._now - self._t0 - self.countdown_s) / self.record_s)
+
+    @property
+    def total_progress(self) -> float:
+        return min(1.0, (self._index + self.progress) / len(STEPS))
+
+    def start(self) -> None:
+        """Beklemedeki adımı başlatır; geri sayım ya da kayıt sürerken etkisizdir."""
+        if not self.done and self.phase == "wait":
+            self._pending = True
+
+    def add(self, hand: RawHand | None, t: float) -> None:
+        """Kare zamanını ilerletir; kayıt evresinde eli geçerli adıma ekler."""
+        if self.done:
+            return
+        t = float(t)
+        if self._pending and self._t0 is None:
+            self._t0 = t
+        if self._now is None or t > self._now:
+            self._now = t
+        if self._t0 is None:
+            return
+        el = self._now - self._t0
+        if el >= self.countdown_s + self.record_s:
+            self._index += 1
+            self._pending, self._t0 = False, None
+            return
+        if el >= self.countdown_s and hand is not None:
+            self.samples[STEPS[self._index]].append(hand)
+
+    def result(self) -> HandCalibration:
+        if not self.done:
+            raise ValueError("kalibrasyon oturumu bitmedi")
+        return hand_calib.fit_hand(self.samples["open"], self.samples["fist"],
+                                   self.samples["thumb_closed"])
+
+
+def _guided_state(g: GuidedCalibration) -> CalibState:
+    step = g.current_step or ""
+    hint = STEP_HINTS.get(step, "")
+    phase = g.phase
+    if phase == "wait":
+        msg = f"{hint}. Hazir olunca BOSLUK"
+    elif phase == "countdown":
+        msg = f"{hint} -- basliyor: {math.ceil(g.remaining)}"
+    else:
+        msg = f"KAYIT: {hint} -- kipirdama ({g.remaining:.1f} sn)"
+    return CalibState(step=g.current_step, progress=g.progress,
+                      total_progress=g.total_progress,
+                      samples=len(g.samples.get(step, [])) if phase == "record" else -1,
+                      message=msg)
+
+
 def _calib_state(session: CalibrationSession, samples: int, message: str = "") -> CalibState:
     return CalibState(
         step=session.current_step,
@@ -493,7 +609,7 @@ def run(source: LiveSource, calib_path: Path) -> None:
     çıkartır. Kalibrasyon bitince yeni değerler `source.set_calibration` ile hemen
     geçerli olur ve `calib_path` dosyasına yazılır.
     """
-    session: CalibrationSession | None = None
+    session: CalibrationSession | GuidedCalibration | None = None
     tap: TapSession | None = None
     calib: HandCalibration | None = None     # geçerli kalibrasyon; ilk ihtiyaçta dosyadan
     history: deque[tuple[float, float | None, float | None]] = deque()
@@ -516,6 +632,8 @@ def run(source: LiveSource, calib_path: Path) -> None:
                     message, message_until, calib = _finish_calibration(
                         session, source, calib, calib_path, frame.t)
                     session = None
+                elif isinstance(session, GuidedCalibration):
+                    calib_state = _guided_state(session)
                 else:
                     calib_state = _calib_state(
                         session, len(session.samples.get(session.current_step or "", [])),
@@ -554,8 +672,10 @@ def run(source: LiveSource, calib_path: Path) -> None:
             elif visible is False and seen_visible:
                 break          # pencere X düğmesiyle kapatıldı
             if key == KEY_CALIB:
-                session, tap = CalibrationSession(), None
+                session, tap = GuidedCalibration(), None
                 message = ""
+            elif key == KEY_NEXT and isinstance(session, GuidedCalibration):
+                session.start()
             elif key == KEY_TAP:
                 tap, session = TapSession(), None
                 message = ""
@@ -575,7 +695,7 @@ def _apply(source: LiveSource, result: HandCalibration, calib_path: Path) -> str
     return None
 
 
-def _finish_calibration(session: CalibrationSession, source: LiveSource,
+def _finish_calibration(session: CalibrationSession | GuidedCalibration, source: LiveSource,
                         calib: HandCalibration, calib_path: Path,
                         t: float) -> tuple[str, float, HandCalibration]:
     """Oturum sonucunu uygular ve kaydeder; (ekran mesajı, bitiş zamanı, geçerli kalibrasyon).
