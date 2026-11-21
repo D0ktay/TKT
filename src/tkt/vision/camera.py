@@ -3,6 +3,15 @@
 Yakalama ayrı thread'de döner ve yalnızca en son kareyi tutar. Görüntü kullanıcının bakış
 açısına göre 180° döndürülür.
 
+Kamera seçimi: config `[camera]` içinde `index` sabittir; `name` (alt dize) doluysa aygıt
+adlarından eşleşen ilk index kullanılır, `kind` (any | rgb | ir) ad bulunamazsa yoklamayla
+seçer (bkz. `resolve_camera`). Ad listesi:
+- Windows: DirectShow (ICreateDevEnum, ctypes + COM); sıra OpenCV DSHOW index'iyle aynıdır.
+- macOS: `ffmpeg -f avfoundation -list_devices` (ffmpeg PATH'teyse). Bu sıranın OpenCV
+  AVFoundation index'iyle aynı olması garanti DEĞİLDİR (ölçümde ffmpeg sırası çalıştırmalar
+  arasında değişti); doğrulanmamıştır. macOS'ta güvenilir yol `kind` yoklamasıdır.
+- Diğer: ad listesi yok; yalnızca `kind` yoklaması ve `index`.
+
 CLI: python -m tkt.vision.camera --probe
      python -m tkt.vision.camera --list
 """
@@ -10,11 +19,17 @@ CLI: python -m tkt.vision.camera --probe
 from __future__ import annotations
 
 import argparse
+import ctypes
 import logging
+import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +43,21 @@ BACKENDS = ("auto", "avfoundation", "dshow", "msmf", "pyav")
 
 # --list'in taradığı kamera index'leri.
 LIST_INDICES = tuple(range(6))
+
+# config `kind` değerleri: any = yoklama yok, rgb = renkli, ir = gri (NIR) ve dikey kare.
+KINDS = ("any", "rgb", "ir")
+
+# `_is_gray`: JPEG (MJPG) kod çözme kanallar arasında küçük farklar üretir. Kanallar arası
+# mutlak farkın ortalaması ve %99'u bu eşiklerin altındaysa görüntü gri sayılır.
+GRAY_MEAN_MAX = 2.0
+GRAY_P99_MAX = 8.0
+
+# Ad listesi alan alt süreçler (ffmpeg) bu kadar saniyeden uzun beklenmez.
+_NAME_LIST_TIMEOUT_S = 10.0
+
+# `kind` yoklamasında her index bu kadar saniye / en çok bu kadar kare okunur.
+_KIND_PROBE_S = 0.3
+_KIND_PROBE_FRAMES = 30
 
 # measured_fps() bu kadar saniyelik pencerede sayar.
 _FPS_WINDOW_S = 2.0
@@ -329,11 +359,17 @@ def probe(camera: Camera, seconds: float = 5.0) -> dict[str, float | int | tuple
 
 
 def _is_gray(image: np.ndarray) -> bool:
-    """Tek kanallı veya üç kanalı birbirine eşit görüntü gri sayılır (NIR kamera)."""
+    """Tek kanallı veya kanalları (toleransla) eşit görüntü gri sayılır (NIR kamera).
+
+    MJPG gri akış kod çözülünce kanallar tam eşit çıkmaz; kanallar arası mutlak farkın
+    ortalaması `GRAY_MEAN_MAX`, %99'u `GRAY_P99_MAX` altındaysa gri denir.
+    """
     if image.ndim == 2 or image.shape[2] == 1:
         return True
-    return bool(np.array_equal(image[..., 0], image[..., 1])
-                and np.array_equal(image[..., 1], image[..., 2]))
+    ch = image[..., :3].astype(np.int16)
+    b, g, r = ch[..., 0], ch[..., 1], ch[..., 2]
+    diff = np.maximum(np.maximum(np.abs(b - g), np.abs(g - r)), np.abs(b - r))
+    return bool(diff.mean() < GRAY_MEAN_MAX and np.percentile(diff, 99) < GRAY_P99_MAX)
 
 
 def _orientation(width: int, height: int) -> str:
@@ -342,18 +378,298 @@ def _orientation(width: int, height: int) -> str:
     return "yatay" if width > height else "kare"
 
 
+# ---------------------------------------------------------------------- aygıt adları
+
+
+def parse_avfoundation_list(text: str) -> list[str]:
+    """`ffmpeg -f avfoundation -list_devices true -i ""` çıktısından video aygıt adları.
+
+    Dönen listenin sırası ffmpeg'in [n] numarasıdır (boşluklar "" ile doldurulur). Ses
+    aygıtları ("audio devices") dışarıda kalır.
+    """
+    names: dict[int, str] = {}
+    in_video = False
+    for line in text.splitlines():
+        low = line.lower()
+        if "video devices" in low:
+            in_video = True
+            continue
+        if "audio devices" in low:
+            in_video = False
+            continue
+        if not in_video:
+            continue
+        m = re.search(r"\[(\d+)\]\s+(.+?)\s*$", line)
+        if m:
+            names[int(m.group(1))] = m.group(2)
+    if not names:
+        return []
+    return [names.get(i, "") for i in range(max(names) + 1)]
+
+
+def avfoundation_device_names(run=subprocess.run, which=shutil.which) -> list[str] | None:
+    """ffmpeg PATH'teyse AVFoundation video aygıt adları; yoksa/başarısızsa None.
+
+    Sıra OpenCV AVFoundation index'iyle aynı olmayabilir (doğrulanmadı); modül notuna bakın.
+    """
+    exe = which("ffmpeg")
+    if not exe:
+        return None
+    try:
+        proc = run([exe, "-hide_banner", "-f", "avfoundation", "-list_devices", "true",
+                    "-i", ""], capture_output=True, text=True, timeout=_NAME_LIST_TIMEOUT_S,
+                   check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("ffmpeg aygıt listesi alınamadı: %s", exc)
+        return None
+    names = parse_avfoundation_list((proc.stderr or "") + "\n" + (proc.stdout or ""))
+    return names or None
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+
+def _guid(text: str) -> _GUID:
+    u = uuid.UUID(text)
+    return _GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+
+
+class _VARIANT(ctypes.Structure):
+    # 16 bayt (x86 ve x64): vt + 3 ayrılmış + 8 baytlık birleşim (burada BSTR işaretçisi).
+    _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort),
+                ("r3", ctypes.c_ushort), ("bstr", ctypes.c_wchar_p),
+                ("pad", ctypes.c_ubyte * (8 - ctypes.sizeof(ctypes.c_void_p)))]
+
+
+_VT_BSTR = 8
+_CLSID_SYSTEM_DEVICE_ENUM = "62BE5D10-60EB-11D0-BD3B-00A0C911CE86"
+_IID_ICREATE_DEV_ENUM = "29840822-5B84-11D0-BD3B-00A0C911CE86"
+_CLSID_VIDEO_INPUT_CATEGORY = "860BB310-5D01-11D0-BD3B-00A0C911CE86"
+_IID_IPROPERTY_BAG = "55272A00-42CB-11CE-8135-00AA004BB851"
+
+
+def _com_method(obj: ctypes.c_void_p, slot: int, *argtypes):
+    """COM nesnesinin vtable `slot` numaralı yöntemini çağrılabilir yapar (HRESULT döner)."""
+    functype = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+    vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    return functype(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[slot])
+
+
+def _com_release(obj: ctypes.c_void_p) -> None:
+    if obj:
+        _com_method(obj, 2)(obj)
+
+
+def _friendly_name(moniker: ctypes.c_void_p, oleaut32) -> str:
+    bag = ctypes.c_void_p()
+    # IMoniker::BindToStorage (yuva 9) -> IPropertyBag
+    hr = _com_method(moniker, 9, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                     ctypes.c_void_p)(moniker, None, None,
+                                      ctypes.byref(_guid(_IID_IPROPERTY_BAG)), ctypes.byref(bag))
+    if hr < 0 or not bag:
+        return ""
+    try:
+        var = _VARIANT()
+        # IPropertyBag::Read (yuva 3)
+        hr = _com_method(bag, 3, ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_void_p)(
+            bag, "FriendlyName", ctypes.byref(var), None)
+        if hr < 0 or var.vt != _VT_BSTR:
+            return ""
+        name = var.bstr or ""
+        oleaut32.VariantClear(ctypes.byref(var))
+        return name
+    finally:
+        _com_release(bag)
+
+
+def dshow_device_names(ole32=None, oleaut32=None) -> list[str] | None:
+    """DirectShow video aygıtlarının FriendlyName listesi (Windows; ctypes + COM).
+
+    Sıra OpenCV `CAP_DSHOW` index'iyle aynıdır (aynı ICreateDevEnum sıralaması). Adı
+    okunamayan aygıt "" olur (index kaymasın diye). Windows dışında ya da COM hatasında None.
+    `ole32`/`oleaut32` testlerde sahte DLL vermek içindir.
+    """
+    if ole32 is None:
+        if sys.platform != "win32":
+            return None
+        ole32, oleaut32 = ctypes.windll.ole32, ctypes.windll.oleaut32  # type: ignore[attr-defined]
+    try:
+        # RPC_E_CHANGED_MODE (negatif): thread zaten başka modda başlatılmış; devam edilir,
+        # ama CoUninitialize çağrılmaz.
+        inited = ole32.CoInitializeEx(None, 0) >= 0     # COINIT_MULTITHREADED
+        try:
+            return _dshow_names(ole32, oleaut32)
+        finally:
+            if inited:
+                ole32.CoUninitialize()
+    except OSError as exc:
+        log.warning("DirectShow aygıt listesi alınamadı: %s", exc)
+        return None
+
+
+def _dshow_names(ole32, oleaut32) -> list[str] | None:
+    dev_enum = ctypes.c_void_p()
+    hr = ole32.CoCreateInstance(ctypes.byref(_guid(_CLSID_SYSTEM_DEVICE_ENUM)), None, 1,
+                                ctypes.byref(_guid(_IID_ICREATE_DEV_ENUM)),
+                                ctypes.byref(dev_enum))      # CLSCTX_INPROC_SERVER = 1
+    if hr < 0 or not dev_enum:
+        return None
+    names: list[str] = []
+    enum = ctypes.c_void_p()
+    try:
+        # ICreateDevEnum::CreateClassEnumerator (yuva 3); S_FALSE (1) = kategori boş
+        hr = _com_method(dev_enum, 3, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)(
+            dev_enum, ctypes.byref(_guid(_CLSID_VIDEO_INPUT_CATEGORY)), ctypes.byref(enum), 0)
+        if hr < 0:
+            return None
+        if hr != 0 or not enum:
+            return names
+        while True:
+            moniker, fetched = ctypes.c_void_p(), ctypes.c_ulong(0)
+            # IEnumMoniker::Next (yuva 3)
+            hr = _com_method(enum, 3, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(
+                enum, 1, ctypes.byref(moniker), ctypes.byref(fetched))
+            if hr != 0 or not moniker:
+                break
+            try:
+                names.append(_friendly_name(moniker, oleaut32))
+            finally:
+                _com_release(moniker)
+        return names
+    finally:
+        _com_release(enum)
+        _com_release(dev_enum)
+
+
+def list_device_names(backend: str = "auto") -> list[str] | None:
+    """Arka uca uygun aygıt adı listesi; index sırasıyla. Bilinmiyorsa None."""
+    resolved = resolve_backend(backend)
+    if resolved == "dshow":
+        return dshow_device_names()
+    if resolved == "avfoundation":
+        return avfoundation_device_names()
+    return None
+
+
+def match_device_name(names: Sequence[str], needle: str) -> int | None:
+    """`needle`'ı (büyük/küçük harf duyarsız alt dize) içeren ilk aygıtın index'i."""
+    needle = needle.strip().lower()
+    if not needle:
+        return None
+    for i, name in enumerate(names):
+        if needle in name.lower():
+            return i
+    return None
+
+
+# ---------------------------------------------------------------------- kamera seçimi
+
+
+@dataclass(frozen=True)
+class CameraChoice:
+    index: int
+    reason: str                 # insan okunur; log ve --list/--probe çıktısında görünür
+    name: str | None = None     # biliniyorsa aygıt adı
+
+
+def _kind_matches(kind: str, row: dict, strict: bool = True) -> bool:
+    if not row.get("opened"):
+        return False
+    if kind == "rgb":
+        return not row["gray"]
+    # ir: gri ve dikey; strict=False iken yalnızca gri
+    return bool(row["gray"] and (not strict or row["orientation"] == "dikey"))
+
+
+def probe_kind(kind: str, indices: Sequence[int] = LIST_INDICES, *, width: int, height: int,
+               fps: int, backend: str = "auto", camera_factory=None) -> int | None:
+    """Index'leri sırayla kısa süre açıp `kind`'e uyan ilkini döndürür (yoksa None).
+
+    rgb = renkli; ir = gri ve dikey (bulunamazsa ilk gri). Uyan index bulununca durulur.
+    """
+    if kind not in ("rgb", "ir"):
+        return None
+    gray_fallback: int | None = None
+    for index in indices:
+        (row,) = list_cameras((index,), width=width, height=height, fps=fps, backend=backend,
+                              seconds=_KIND_PROBE_S, max_frames=_KIND_PROBE_FRAMES,
+                              camera_factory=camera_factory)
+        if _kind_matches(kind, row):
+            return index
+        if kind == "ir" and gray_fallback is None and _kind_matches(kind, row, strict=False):
+            gray_fallback = index
+    return gray_fallback
+
+
+_UNSET = object()
+
+
+def resolve_camera(cfg: Mapping, *, names: Sequence[str] | None | object = _UNSET,
+                   camera_factory=None) -> CameraChoice:
+    """Config `[camera]`'dan kullanılacak index'i ve nedenini belirler.
+
+    Sıra: `name` doluysa aygıt adlarında eşleşen ilk index; ad listesi alınamazsa veya
+    eşleşme yoksa `kind` (rgb | ir) yoklaması; o da yoksa `index`.
+    `names`: verilirse (liste ya da None) ad listesi alınmaz, o kullanılır (testler ve
+    `main`'in tek sefer listelemesi için).
+    """
+    kind = str(cfg.get("kind", "any") or "any").lower()
+    if kind not in KINDS:
+        raise ValueError(f"kamera kind {kind!r} geçersiz; seçenekler: {', '.join(KINDS)}")
+    want = str(cfg.get("name", "") or "").strip()
+    backend = cfg.get("backend", "auto")
+    index = int(cfg.get("index", 0))
+    notes: list[str] = []
+
+    dev_names: Sequence[str] | None = None
+    if want:
+        dev_names = list_device_names(backend) if names is _UNSET else names  # type: ignore[assignment]
+        if dev_names is None:
+            notes.append(f"ad listesi alınamadı (name={want!r})")
+        else:
+            hit = match_device_name(dev_names, want)
+            if hit is not None:
+                return CameraChoice(hit, f"ad eşleşti: name={want!r} -> index {hit} "
+                                         f"({dev_names[hit]!r})", dev_names[hit])
+            notes.append(f"ad eşleşmedi (name={want!r}, aygıtlar: {list(dev_names)})")
+
+    if kind != "any":
+        found = probe_kind(kind, width=cfg["width"], height=cfg["height"], fps=cfg["fps"],
+                           backend=backend, camera_factory=camera_factory)
+        if found is not None:
+            nm = dev_names[found] if dev_names and found < len(dev_names) else None
+            notes.append(f"kind={kind!r} yoklaması index {found} buldu")
+            return CameraChoice(found, "; ".join(notes), nm or None)
+        notes.append(f"kind={kind!r} yoklaması sonuç vermedi")
+
+    nm = dev_names[index] if dev_names and 0 <= index < len(dev_names) else None
+    notes.append(f"config index={index} kullanılıyor")
+    return CameraChoice(index, "; ".join(notes), nm or None)
+
+
+def format_choice(choice: CameraChoice) -> str:
+    name = f" ({choice.name})" if choice.name else ""
+    return f"seçilen kamera: index={choice.index}{name} — {choice.reason}"
+
+
+# ---------------------------------------------------------------------- --list / --probe
+
+
 def list_cameras(indices: tuple[int, ...] = LIST_INDICES, *, width: int, height: int, fps: int,
                  backend: str = "auto", seconds: float = 1.0, max_frames: int = 600,
-                 camera_factory=None) -> list[dict]:
+                 camera_factory=None, names: Sequence[str] | None = None) -> list[dict]:
     """Her index'i kısa süre açıp özelliklerini toplar; açılmayanlar `opened=False` olur.
 
     fps, kare zaman damgalarından ölçülür (duvar saatine bağlı değil). `camera_factory`
-    testlerde sahte kamera vermek içindir.
+    testlerde sahte kamera vermek içindir. `names` biliniyorsa satırlara `name` eklenir.
     """
     factory = camera_factory or Camera
     rows: list[dict] = []
     for index in indices:
-        row: dict = {"index": index, "opened": False}
+        name = names[index] if names and 0 <= index < len(names) and names[index] else None
+        row: dict = {"index": index, "opened": False, "name": name}
         cam = factory(index, width, height, fps, rotate_180=False, backend=backend)
         try:
             cam.start()
@@ -383,15 +699,17 @@ def list_cameras(indices: tuple[int, ...] = LIST_INDICES, *, width: int, height:
 
 
 def format_camera_table(rows: list[dict]) -> str:
-    lines = [f"{'index':>5}  {'çözünürlük':<11} {'fps':>6}  {'renk':<6} {'yön':<6} fourcc"]
+    lines = [f"{'index':>5}  {'çözünürlük':<11} {'fps':>6}  {'renk':<6} {'yön':<6} "
+             f"{'fourcc':<6} ad"]
     for r in rows:
+        name = r.get("name") or "-"
         if not r["opened"]:
-            lines.append(f"{r['index']:>5}  (açılamadı / kare gelmedi)")
+            lines.append(f"{r['index']:>5}  {'(açılamadı / kare gelmedi)':<40} {name}")
             continue
         fourcc = r.get("negotiated", {}).get("fourcc") or "-"
         lines.append(
             f"{r['index']:>5}  {str(r['width']) + 'x' + str(r['height']):<11} {r['fps']:>6.1f}  "
-            f"{'gri' if r['gray'] else 'renkli':<6} {r['orientation']:<6} {fourcc}")
+            f"{'gri' if r['gray'] else 'renkli':<6} {r['orientation']:<6} {fourcc:<6} {name}")
     return "\n".join(lines)
 
 
@@ -405,7 +723,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m tkt.vision.camera")
     parser.add_argument("--probe", action="store_true", help="5 sn sayıp gerçek fps'i yazar")
     parser.add_argument("--list", action="store_true",
-                        help="0-5 arası index'leri açıp çözünürlük/fps/renk/yön tablosu yazar")
+                        help="0-5 arası index'leri açıp çözünürlük/fps/renk/yön/ad tablosu yazar")
     parser.add_argument("--config", default="config/vision.toml")
     parser.add_argument("--seconds", type=float, default=5.0, help="--probe süresi")
     args = parser.parse_args(argv)
@@ -415,14 +733,18 @@ def main(argv: list[str] | None = None) -> None:
     from tkt.vision.live_source import load_vision_config
 
     cfg = load_vision_config(Path(args.config))["camera"]
+    backend = cfg.get("backend", "auto")
+    names = list_device_names(backend) if (args.list or cfg.get("name")) else None
     if args.list:
         rows = list_cameras(width=cfg["width"], height=cfg["height"], fps=cfg["fps"],
-                            backend=cfg.get("backend", "auto"))
+                            backend=backend, names=names)
         print(format_camera_table(rows))
+    choice = resolve_camera(cfg, names=names)
+    print(format_choice(choice))
     if not args.probe:
         return
-    cam = Camera(cfg["index"], cfg["width"], cfg["height"], cfg["fps"],
-                 cfg.get("rotate_180", True), cfg.get("backend", "auto"))
+    cam = Camera(choice.index, cfg["width"], cfg["height"], cfg["fps"],
+                 cfg.get("rotate_180", True), backend)
     cam.start()
     try:
         r = probe(cam, args.seconds)

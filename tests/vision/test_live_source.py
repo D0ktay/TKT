@@ -194,12 +194,14 @@ def test_set_calibration_reaches_build_frame(monkeypatch):
 
 def test_set_calibration_rebuilds_lift_when_tap_ref(monkeypatch):
     built = []
-    monkeypatch.setattr(ls, "LiftEstimator", lambda c, cfg: built.append((c, cfg)) or FakeLift())
+    monkeypatch.setattr(
+        ls, "LiftEstimator",
+        lambda c, cfg, aspect=1.0: built.append((c, cfg, aspect)) or FakeLift())
     src = LiveSource(FakeCamera(n=2), FakeTracker([True] * 2), DEFAULT, "right", FakeLift())
     src.lift_cfg = {"w_angle": 1.0}
     new = calib_with_tap_ref()
     src.set_calibration(new)
-    assert built == [(new, {"w_angle": 1.0})]
+    assert built == [(new, {"w_angle": 1.0}, 512 / 640)]   # kare 512x640
     frames = list(src.frames())
     assert frames[0].fingers["index"].lift == 0.25      # yeni lift kullanılıyor
 
@@ -218,7 +220,7 @@ def test_set_calibration_without_lift_stays_without_lift():
 
 
 def test_set_calibration_creates_lift_for_config_built_source(monkeypatch):
-    monkeypatch.setattr(ls, "LiftEstimator", lambda c, cfg: FakeLift())
+    monkeypatch.setattr(ls, "LiftEstimator", lambda c, cfg, aspect=1.0: FakeLift())
     src = LiveSource(FakeCamera(n=1), FakeTracker([True]), DEFAULT, "right")
     src.lift_cfg = {}
     src.set_calibration(calib_with_tap_ref())
@@ -287,7 +289,7 @@ def test_open_live_source_makes_lift_when_tap_ref(tmp_path, monkeypatch):
     monkeypatch.setattr(ls, "Camera", lambda *a: FakeCamera(n=1))
     monkeypatch.setattr(ls, "HandTracker", lambda *a: FakeTracker([]))
     monkeypatch.setattr(ls.hand_calib, "load", lambda p: calib)
-    monkeypatch.setattr(ls, "LiftEstimator", lambda c, cfg: ("lift", c, cfg))
+    monkeypatch.setattr(ls, "LiftEstimator", lambda c, cfg, aspect=1.0: ("lift", c, cfg))
     src = ls.open_live_source(cfg)
     assert src._lift == ("lift", calib, {"w_angle": 1.0})
     assert src.lift_cfg == {"w_angle": 1.0}
@@ -356,6 +358,66 @@ def test_open_live_source_bad_lift_config_closes_tracker_and_camera(tmp_path, mo
         ls.open_live_source(_write_cfg(tmp_path))
     assert made["trk"].closed
     assert made.get("cam") is None or made["cam"].closed
+
+
+def test_given_lift_is_rebuilt_with_real_frame_aspect():
+    from tkt.vision.lift import LiftEstimator
+
+    cfg = {"w_angle": 2.0, "w_length": 0.5, "baseline_s": 1.5, "curl_rate_suppress": 4.0}
+    est = LiftEstimator(calib_with_tap_ref(), cfg)            # aspect=1.0 ile kurulmuş
+    src = LiveSource(FakeCamera(n=1, shape=(640, 512, 3)), FakeTracker([True]),
+                     calib_with_tap_ref(), "right", est)
+    assert src._lift is not est
+    assert src._lift.aspect == pytest.approx(512 / 640)
+    assert (src._lift.w_angle, src._lift.w_length, src._lift.baseline_s) == (2.0, 0.5, 1.5)
+    src.set_calibration(calib_with_tap_ref())
+    assert src._lift.aspect == pytest.approx(512 / 640)
+
+
+def test_given_lift_with_matching_aspect_is_kept():
+    from tkt.vision.lift import LiftEstimator
+
+    cfg = {"w_angle": 1.0, "w_length": 1.0, "baseline_s": 1.0, "curl_rate_suppress": 3.0}
+    est = LiftEstimator(calib_with_tap_ref(), cfg, aspect=640 / 512)
+    src = LiveSource(FakeCamera(n=1, shape=(512, 640, 3)), FakeTracker([True]),
+                     calib_with_tap_ref(), "right", est)
+    assert src._lift is est
+
+
+def test_open_live_source_lift_uses_frame_aspect(tmp_path, monkeypatch):
+    cfg = tmp_path / "v.toml"
+    cfg.write_text(
+        '[camera]\nindex = 0\nwidth = 640\nheight = 512\nfps = 60\n[tracker]\nmodel = "m"\n'
+        'min_detection = 0.5\nmin_tracking = 0.5\n[hand]\nside = "right"\ncalibration = "c"\n'
+        '[lift]\nw_angle = 1.0\nw_length = 1.0\nbaseline_s = 1.0\ncurl_rate_suppress = 3.0\n',
+        encoding="utf-8")
+    monkeypatch.setattr(ls, "Camera", lambda *a: FakeCamera(n=1, shape=(640, 512, 3)))
+    monkeypatch.setattr(ls, "HandTracker", lambda *a: FakeTracker([]))
+    monkeypatch.setattr(ls.hand_calib, "load", lambda p: calib_with_tap_ref())
+    src = ls.open_live_source(cfg)
+    assert src._lift.aspect == pytest.approx(512 / 640)
+
+
+def test_open_live_source_resolves_camera_by_name(tmp_path, monkeypatch):
+    import tkt.vision.camera as cam_mod
+
+    cfg = tmp_path / "v.toml"
+    cfg.write_text(
+        '[camera]\nindex = 0\nname = "lvnext"\nwidth = 640\nheight = 512\nfps = 60\n'
+        'backend = "dshow"\n[tracker]\nmodel = "m"\nmin_detection = 0.5\nmin_tracking = 0.5\n'
+        '[hand]\nside = "right"\ncalibration = "c"\n[lift]\nw_angle = 1.0\n', encoding="utf-8")
+    made = {}
+
+    def make_cam(*a):
+        made["cam"] = a
+        return FakeCamera(n=1)
+
+    monkeypatch.setattr(ls, "Camera", make_cam)
+    monkeypatch.setattr(ls, "HandTracker", lambda *a: FakeTracker([]))
+    monkeypatch.setattr(ls.hand_calib, "load", lambda p: None)
+    monkeypatch.setattr(cam_mod, "list_device_names", lambda backend: ["Laptop", "LVNext Camera"])
+    ls.open_live_source(cfg)
+    assert made["cam"][0] == 1
 
 
 @pytest.mark.camera
