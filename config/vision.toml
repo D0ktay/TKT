@@ -2,8 +2,8 @@
 index = 0                 # name boşsa veya bulunamazsa son çare
 name = "LVNext"           # aygıt adında geçen alt dize (büyük/küçük harf duyarsız); "" = index kullan
 kind = "any"              # any | rgb | ir: ad bulunamazsa yoklamayla seç (ir = gri+dikey, rgb = renkli)
-width = 640               # LogiInsight NIR akışı: 640x512 isteğinde 60 fps (1280x1024 yalnızca 15 fps)
-height = 512
+width = 640               # Mac, renkli akış: ~31 fps; 640x480'de işleme kameraya yetişiyor (1280x720'de 27 fps)
+height = 480              # IR akışta istek 640x512 -> gelen 512x640 dikey (Windows dshow 60 fps)
 fps = 60
 rotate_180 = true
 backend = "auto"          # auto | avfoundation | dshow | pyav
