@@ -40,6 +40,7 @@ def rig(monkeypatch, request):
     pointer = Mock(spec=gestures.PointerMotion)
     pointer.update.return_value = (0, 0)
     pointer.rollback.return_value = (0, 0)
+    pointer.rollback_at.return_value = (0, 0)
     pointer_factory = Mock(return_value=pointer)
     scroll = Mock(spec=gestures.ScrollMotion)
     scroll.update.return_value = (0, 0)
@@ -59,9 +60,9 @@ def pose(t, *opened, **kwargs):
     return make_frame(t=t, curls=curls, **kwargs)
 
 
-def lock_pointer(engine):
-    engine.process(pose(0, "index"))
-    engine.process(pose(0.125, "index"))
+def lock_pointer(engine, **kwargs):
+    engine.process(pose(0, "index", **kwargs))
+    engine.process(pose(0.125, "index", **kwargs))
     assert engine.mode is Mode.POINTER
 
 
@@ -154,7 +155,7 @@ def test_swipe_can_trigger_again_after_fingers_close():
 
 
 @pytest.mark.parametrize("missing", [{"present": False}, {"confidence": 0.5}])
-def test_swipe_resets_history_and_trigger_on_brief_hand_loss(rig, missing):
+def test_swipe_clears_history_but_keeps_trigger_on_brief_hand_loss(rig, missing):
     engine, backend, _, _ = rig
     engine.process(pose(0, *FINGERS))
     engine.process(pose(0.125, *FINGERS))
@@ -168,6 +169,13 @@ def test_swipe_resets_history_and_trigger_on_brief_hand_loss(rig, missing):
     engine.process(make_frame(t=0.375, **missing))
     engine.process(pose(0.4375, *FINGERS, palm=(0.125, 0.6)))
     engine.process(pose(0.5, *FINGERS, palm=(0.25, 0.6)))
+    assert backend_events(backend) == [("system", "desktop_left")]
+
+    engine.process(make_frame(t=0.75, **missing))
+    assert engine.mode is Mode.NONE
+    engine.process(pose(0.8125, *FINGERS))
+    engine.process(pose(0.9375, *FINGERS))
+    engine.process(pose(1, *FINGERS, palm=(0.75, 0.6)))
     assert backend_events(backend) == [("system", "desktop_left"), ("system", "desktop_right")]
 
 
@@ -212,8 +220,7 @@ def test_curl_hysteresis_preserves_state_at_both_thresholds(rig):
     assert engine.mode is Mode.NONE
 
 
-@pytest.mark.parametrize("missing", [{"present": False}, {"confidence": 0.5}])
-def test_missing_or_low_confidence_releases_after_timeout(rig, missing):
+def test_unreliable_frames_release_at_deadline_from_last_reliable_frame(rig):
     engine, backend, pointer, _ = rig
     lock_pointer(engine)
     engine.process(pose(0.15625, "index", thumb_out=0))
@@ -222,15 +229,16 @@ def test_missing_or_low_confidence_releases_after_timeout(rig, missing):
     backend.events.clear()
     pointer.reset_mock()
 
-    engine.process(make_frame(t=0.25, **missing))
-    engine.process(make_frame(t=0.4375, **missing))
+    engine.process(make_frame(t=0.25, present=False))
+    engine.process(make_frame(t=0.421875, confidence=0.5))
     assert engine.mode is Mode.POINTER
     assert engine.left_down
     assert backend_events(backend) == []
     assert pointer.mock_calls == []
 
-    engine.process(make_frame(t=0.5, **missing))
-    engine.process(make_frame(t=0.75, **missing))
+    engine.process(make_frame(t=0.4375, confidence=0.5))
+    assert not engine.left_down
+    engine.process(make_frame(t=0.75, present=False))
     assert engine.mode is Mode.NONE
     assert not engine.left_down
     backend.release_all.assert_called_once()
@@ -242,10 +250,10 @@ def test_low_confidence_does_not_count_toward_lock(rig):
     engine, _, pointer, _ = rig
     engine.process(pose(0, "index"))
     engine.process(pose(0.125, "index", confidence=0.5))
-    engine.process(pose(0.25, "index", confidence=0.75))
+    engine.process(pose(0.21875, "index", confidence=0.75))
     assert engine.mode is Mode.WAIT
     assert pointer.mock_calls == []
-    engine.process(pose(0.375, "index", confidence=0.75))
+    engine.process(pose(0.34375, "index", confidence=0.75))
     assert engine.mode is Mode.POINTER
 
 
@@ -254,9 +262,9 @@ def test_brief_loss_rebases_pointer_without_releasing(rig):
     lock_pointer(engine)
     pointer.reset_mock()
     engine.process(make_frame(t=0.25, present=False))
-    engine.process(pose(0.375, "index", index_pos=(0.8, 0.7)))
+    engine.process(pose(0.34375, "index", index_pos=(0.8, 0.7)))
     assert engine.mode is Mode.POINTER
-    assert pointer.mock_calls == [call.rebase(), call.update((0.8, 0.7), 0.2, 0.375)]
+    assert pointer.mock_calls == [call.rebase(), call.update((0.8, 0.7), 0.2, 0.34375)]
     assert backend_events(backend) == []
 
 
@@ -265,15 +273,15 @@ def test_recovery_after_loss_timeout_requires_a_new_mode_lock(rig):
     lock_pointer(engine)
     pointer.reset_mock()
     engine.process(make_frame(t=0.25, present=False))
-    engine.process(pose(0.5, "index"))
+    engine.process(pose(0.375, "index"))
     assert engine.mode is Mode.WAIT
     assert pointer.mock_calls == [call.reset()]
     backend.release_all.assert_called_once()
     assert backend_events(backend) == []
 
-    engine.process(pose(0.625, "index"))
+    engine.process(pose(0.5, "index"))
     assert engine.mode is Mode.POINTER
-    assert pointer.mock_calls[-2:] == [call.rebase(), call.update((0.5, 0.4), 0.2, 0.625)]
+    assert pointer.mock_calls[-2:] == [call.rebase(), call.update((0.5, 0.4), 0.2, 0.5)]
 
 
 def test_pointer_uses_image_tip_and_sends_only_nonzero_moves(rig):
@@ -389,32 +397,31 @@ def test_brief_hand_loss_stops_scroll_and_rebases_on_return(rig):
 
     engine.process(make_frame(t=0.25, present=False))
     assert scroll.mock_calls == [call.stop()]
-    engine.process(pose(0.375, "index", "middle"))
+    engine.process(pose(0.34375, "index", "middle"))
     assert engine.mode is Mode.SCROLL
-    assert scroll.mock_calls == [call.stop(), call.rebase(), call.update((0.5, 0.4), 0.2, 0.375)]
+    assert scroll.mock_calls == [call.stop(), call.rebase(), call.update((0.5, 0.4), 0.2, 0.34375)]
     assert backend.events == []
 
 
 @pytest.mark.parametrize("rig", ["tap"], indirect=True)
 def test_tap_takeoff_rolls_back_and_landing_rebases_pointer(rig):
     engine, backend, pointer, scroll = rig
-    lock_pointer(engine)
+    lock_pointer(engine, lift=0)
     pointer.reset_mock()
-    pointer.rollback.return_value = (-4, 2)
+    pointer.rollback_at.return_value = (-4, 2)
 
     engine.process(pose(0.25, "index", lift=0.3))
     assert backend_events(backend) == [("move", -4, 2)]
-    assert pointer.mock_calls == [call.rollback(80)]
+    assert pointer.mock_calls == [call.rollback_at(80, 0.25)]
     scroll.stop.assert_called_once()
 
     engine.process(pose(0.3125, "index", lift=0.8))
-    engine.process(pose(0.34375, "index", lift=None))
-    assert pointer.mock_calls == [call.rollback(80)]
+    assert pointer.mock_calls == [call.rollback_at(80, 0.25)]
     assert backend_events(backend) == [("move", -4, 2)]
 
     engine.process(pose(0.375, "index", lift=0))
     assert pointer.mock_calls == [
-        call.rollback(80),
+        call.rollback_at(80, 0.25),
         call.rebase(),
         call.update((0.5, 0.4), 0.2, 0.375),
     ]
@@ -443,7 +450,7 @@ def test_scroll_requires_two_fingers_for_right_tap(rig, fingers):
 def test_leaving_scroll_mid_tap_does_not_restart_inertia(rig):
     engine, backend, _, scroll = rig
     engine.process(pose(0, "index", "middle"))
-    engine.process(pose(0.125, "index", "middle"))
+    engine.process(pose(0.125, "index", "middle", lift=0))
     engine.process(pose(0.25, "index", "middle", lift=0.8))
     engine.process(pose(0.3125, lift=0.8))
     engine.process(pose(0.375, lift=0))
@@ -504,3 +511,81 @@ def test_thumb_in_tap_mode_presses_only_after_drag_threshold(rig):
         ("move", 4, 0),
         ("button", "left", False),
     ]
+
+
+@pytest.mark.parametrize("reopen", [False, True])
+def test_scroll_skips_curled_tip_and_rebases_on_reopening(reopen):
+    source = SyntheticSource()
+    backend = DryBackend()
+    engine = GestureEngine(load_control_config(), backend, source.info)
+    engine.process(pose(0, "index", "middle"))
+    engine.process(pose(0.125, "index", "middle"))
+
+    engine.process(pose(0.15625, "index", positions={"middle": (0.5, 0.95)}))
+    assert engine.mode is Mode.SCROLL
+    assert backend.events == []
+
+    if reopen:
+        engine.process(
+            pose(0.1875, "index", "middle", index_pos=(0.5, 0.7), positions={"middle": (0.5, 0.7)})
+        )
+        assert backend.events == []
+        engine.process(
+            pose(
+                0.21875, "index", "middle", index_pos=(0.5, 0.75), positions={"middle": (0.5, 0.75)}
+            )
+        )
+        assert [event.kind for event in backend.events] == ["scroll"]
+    else:
+        engine.process(pose(0.1875))
+        engine.process(pose(0.21875))
+        assert backend.events == []
+
+
+def test_missing_lift_cancels_tap_and_resumes_pointer_motion():
+    config = load_control_config()
+    config["general"]["click_method"] = "tap"
+    backend = DryBackend()
+    engine = GestureEngine(config, backend, SyntheticSource().info)
+    lock_pointer(engine, lift=0)
+
+    engine.process(pose(0.1875, "index", lift=0.8))
+    engine.process(pose(0.21875, "index", lift=None, index_pos=(0.7, 0.4)))
+    assert backend.events == []
+    engine.process(pose(0.25, "index", lift=None, index_pos=(0.75, 0.4)))
+    engine.process(pose(0.5625, "index", lift=None, index_pos=(0.8, 0.4)))
+    assert [event.kind for event in backend.events] == ["move"]
+
+    engine.process(pose(0.59375, "index", lift=0.8, index_pos=(0.85, 0.4)))
+    engine.process(pose(0.65625, "index", lift=0, index_pos=(0.85, 0.4)))
+    assert len(backend.events) > 1
+    assert all(event.kind == "move" and event.args[0] > 0 for event in backend.events)
+
+
+def test_tap_rollback_window_is_relative_to_takeoff_frame():
+    config = load_control_config()
+    config["general"]["click_method"] = "tap"
+    backend = DryBackend()
+    engine = GestureEngine(config, backend, SyntheticSource().info)
+    lock_pointer(engine, lift=0)
+    engine.process(pose(0.15625, "index", lift=0, index_pos=(0.55, 0.4)))
+    engine.process(pose(0.21875, "index", lift=0, index_pos=(0.6, 0.4)))
+    older, recent = backend.events
+    assert older.args[0] > 0 and recent.args[0] > 0
+
+    engine.process(pose(0.28125, "index", lift=0.8, index_pos=(0.65, 0.4)))
+    assert backend_events(backend)[2:] == [("move", -recent.args[0], 0)]
+
+
+@pytest.mark.parametrize("size", [(512, 640), (640, 512)])
+def test_tap_palm_motion_uses_source_pixel_aspect_ratio(size):
+    config = load_control_config()
+    config["general"]["click_method"] = "tap"
+    backend = DryBackend()
+    engine = GestureEngine(config, backend, SourceInfo(1, *size, 60, "right"))
+    lock_pointer(engine, lift=0)
+    engine.process(pose(0.1875, "index", lift=0.8))
+    engine.process(pose(0.25, "index", lift=0, palm=(0.5, 0.605)))
+
+    click = [("button", "left", True), ("button", "left", False)]
+    assert backend_events(backend) == (click if size[0] > size[1] else [])

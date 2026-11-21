@@ -168,3 +168,20 @@ def test_pointer_processing_average_is_under_two_ms(pointer_cfg):
     for sample in samples:
         pointer.update(*sample)
     assert (process_time_ns() - started) / len(samples) < 2_000_000
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"speed_hi": 0.3}, "speed_hi.*speed_lo"),
+        ({"speed_hi": 0.1}, "speed_hi.*speed_lo"),
+        ({"speed_hi": float("inf")}, "speed_hi.*speed_lo"),
+        ({"speed_lo": float("nan")}, "speed_hi.*speed_lo"),
+        ({"gain_max": 499}, "gain_max.*gain_min"),
+        ({"gain_min": float("-inf")}, "gain_max.*gain_min"),
+        ({"gain_max": float("nan")}, "gain_max.*gain_min"),
+    ],
+)
+def test_invalid_acceleration_config_raises_value_error(pointer_cfg, override, message):
+    with pytest.raises(ValueError, match=message):
+        PointerMotion(pointer_cfg | override, INFO)

@@ -65,6 +65,8 @@ class GestureEngine:
         self._pointer = PointerMotion(cfg["pointer"], info)
         self._scroll = ScrollMotion(cfg["scroll"], info)
         self._tap = TapDetector(cfg) if self._click_method in ("tap", "both") else None
+        if self._tap is not None:
+            self._tap.set_info(info)
         self._lock = RLock()
         self._reset_state()
 
@@ -75,33 +77,38 @@ class GestureEngine:
                 self._process_missing_hand(frame.t)
                 return
 
-            if self._lost_until is not None and frame.t >= self._lost_until:
-                self.release()
             index = frame.fingers["index"]
-            if self._lost_until is not None:
-                if self.mode is Mode.SCROLL:
-                    self._scroll.rebase()
-                if self._drag_origin is not None:
-                    self._drag_origin = index.img
-            self._lost_until = None
-            self._lost_released = False
+            if self._hand_missing:
+                if self._loss_expired(frame.t):
+                    self.release()
+                else:
+                    if self.mode is Mode.SCROLL:
+                        self._rebase_scroll()
+                    if self._drag_origin is not None:
+                        self._drag_origin = index.img
+            self._hand_missing = False
+            self._last_reliable_t = frame.t
             # Hızlı kıvrılma aynı karede modu kapatsa bile geri almayı gönder.
             curling_fast = self._check_curl_rate(index.curl, frame.t)
             previous_mode = self.mode
             self._update_mode(frame)
             if self.mode is not previous_mode:
                 self._change_mode(previous_mode, frame.t)
-            self._update_tap(frame)
-            self._record_palm(frame)
+            scroll_pos = self._scroll_position(frame)
+            self._record_stillness(frame, scroll_pos)
+            was_dragging = self.left_down
             self._update_thumb(frame)
+            self._update_tap(frame, suppress=was_dragging or self.left_down)
+            if self.mode is Mode.SCROLL and scroll_pos is None:
+                self._scroll_needs_rebase = True
             if self._tap_busy:
                 return
             if self.mode is Mode.POINTER:
                 self._move_pointer(index, frame.hand_size, frame.t, curling_fast)
-            elif self.mode is Mode.SCROLL:
-                middle = frame.fingers["middle"]
-                pos = ((index.img[0] + middle.img[0]) / 2, (index.img[1] + middle.img[1]) / 2)
-                self._send_scroll(self._scroll.update(pos, frame.hand_size, frame.t))
+            elif self.mode is Mode.SCROLL and scroll_pos is not None:
+                if self._scroll_needs_rebase:
+                    self._rebase_scroll()
+                self._send_scroll(self._scroll.update(scroll_pos, frame.hand_size, frame.t))
             elif self.mode is Mode.SWIPE:
                 self._update_swipe(frame)
             elif self._scroll_coasting and previous_mode is Mode.NONE:
@@ -120,8 +127,8 @@ class GestureEngine:
         self.left_down = False
         self._open_fingers: tuple[str, ...] = ()
         self._wait_until: float | None = None
-        self._lost_until: float | None = None
-        self._lost_released = False
+        self._last_reliable_t: float | None = None
+        self._hand_missing = False
         self._previous_index: tuple[float, float] | None = None
         self._pointer_frozen = False
         self._pointer_needs_rebase = True
@@ -131,27 +138,32 @@ class GestureEngine:
         self._thumb_closed = False
         self._thumb_change_at: float | None = None
         self._drag_origin: tuple[float, float] | None = None
-        self._palm_history: deque[tuple[float, tuple[float, float]]] = deque()
+        self._still_history: deque[tuple[float, tuple[float, float], tuple[float, float]]] = deque()
         self._swipe_history: deque[tuple[float, tuple[float, float]]] = deque()
         self._swipe_triggered = False
         self._scroll_coasting = False
+        self._scroll_needs_rebase = False
 
     def _process_missing_hand(self, t: float) -> None:
-        if self._lost_released:
+        if self._last_reliable_t is None:
             return
-        if self._lost_until is None:
-            self._lost_until = t + self._lost_release_s
+        if self._loss_expired(t):
+            self.release()
+            return
+        if not self._hand_missing:
+            self._hand_missing = True
             self._wait_until = None
             self._previous_index = None
             self._pointer_needs_rebase = True
             self._thumb_change_at = None
-            self._palm_history.clear()
-            self._reset_swipe()
+            self._still_history.clear()
+            self._swipe_history.clear()
             self._cancel_active_tap()
             self._stop_scroll()
-        if t >= self._lost_until:
-            self.release()
-            self._lost_released = True
+
+    def _loss_expired(self, t: float) -> bool:
+        last = self._last_reliable_t
+        return last is not None and t >= last + self._lost_release_s
 
     def _update_mode(self, frame: HandFrame) -> None:
         opened = tuple(
@@ -187,7 +199,7 @@ class GestureEngine:
             self._stop_scroll()
         self._cancel_active_tap()
         if self.mode is Mode.SCROLL:
-            self._scroll.rebase()
+            self._rebase_scroll()
 
     def _reset_swipe(self) -> None:
         self._swipe_history.clear()
@@ -227,17 +239,17 @@ class GestureEngine:
             self._tap.reset()
             self._tap_busy = False
 
-    def _update_tap(self, frame: HandFrame) -> None:
+    def _update_tap(self, frame: HandFrame, *, suppress: bool) -> None:
         watched = _TAP_FINGERS.get(self.mode)
-        if self._tap is None or watched is None or any(
-            frame.fingers[name].lift is None for name in watched
-        ):
+        if self._tap is None or watched is None:
             return
+        if suppress:
+            self._tap.cancel_until_landing(watched)
         update = self._tap.update(frame, watched)
         if update.started:
-            self._send_move(self._pointer.rollback(self._rollback_ms))
+            self._send_move(self._pointer.rollback_at(self._rollback_ms, frame.t))
             self._stop_scroll()
-        if update.kind is not None and not self.left_down:
+        if update.kind is not None:
             button = "left" if update.kind == "tap1" else "right"
             self._backend.button(button, True)
             self._backend.button(button, False)
@@ -245,24 +257,37 @@ class GestureEngine:
             self._pointer.rebase()
             self._pointer_needs_rebase = False
             if self.mode is Mode.SCROLL:
-                self._scroll.rebase()
+                self._rebase_scroll()
         self._tap_busy = update.busy
 
-    def _record_palm(self, frame: HandFrame) -> None:
-        self._palm_history.append((frame.t, frame.palm))
+    def _scroll_position(self, frame: HandFrame) -> tuple[float, float] | None:
+        if "index" not in self._open_fingers or "middle" not in self._open_fingers:
+            return None
+        ix, iy = frame.fingers["index"].img
+        mx, my = frame.fingers["middle"].img
+        return (ix + mx) / 2, (iy + my) / 2
+
+    def _record_stillness(self, frame: HandFrame, scroll_pos: tuple[float, float] | None) -> None:
+        history = self._still_history
+        if scroll_pos is None:
+            history.clear()
+            return
+        history.append((frame.t, frame.palm, scroll_pos))
         # Pencerenin başlangıcını kapsayan son örneği de tut.
         window_start = frame.t - self._still_s
-        while len(self._palm_history) > 1 and self._palm_history[1][0] <= window_start:
-            self._palm_history.popleft()
+        while len(history) > 1 and history[1][0] <= window_start:
+            history.popleft()
 
     def _hand_is_still(self, frame: HandFrame) -> bool:
-        oldest_t, _ = self._palm_history[0]
-        return (
-            oldest_t <= frame.t - self._still_s
-            and all(
-                self._image_distance(palm, frame.palm) <= self._drag_threshold * frame.hand_size
-                for _, palm in self._palm_history
-            )
+        history = self._still_history
+        if not history or history[0][0] > frame.t - self._still_s:
+            return False
+        _, palm, scroll_pos = history[-1]
+        threshold = self._drag_threshold * frame.hand_size
+        return all(
+            self._image_distance(old_palm, palm) <= threshold
+            and self._image_distance(old_pos, scroll_pos) <= threshold
+            for _, old_palm, old_pos in history
         )
 
     def _update_thumb(self, frame: HandFrame) -> None:
@@ -294,9 +319,7 @@ class GestureEngine:
             if self._click_method != "tap":
                 self._press_left()
         elif (
-            self.mode is Mode.SCROLL
-            and self._click_method != "tap"
-            and self._hand_is_still(frame)
+            self.mode is Mode.SCROLL and self._click_method != "tap" and self._hand_is_still(frame)
         ):
             self._stop_scroll()
             self._backend.button("right", True)
@@ -359,6 +382,10 @@ class GestureEngine:
     def _stop_scroll(self) -> None:
         self._scroll.stop()
         self._scroll_coasting = False
+
+    def _rebase_scroll(self) -> None:
+        self._scroll.rebase()
+        self._scroll_needs_rebase = False
 
     def _send_scroll(self, delta: tuple[float, float]) -> None:
         if delta != (0, 0):

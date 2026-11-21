@@ -71,12 +71,15 @@ def test_pair_checks_both_takeoff_and_landing_windows(
     )
 
 
-def test_missing_lift_leaves_active_tap_unchanged(detector):
-    assert detector.update(make_frame(lift=None), INDEX) == TapUpdate(False, False, None)
-    detector.update(make_frame(t=0.0625, lift=0.8), INDEX)
-    missing = make_frame(t=0.125, lift=None, curls={"index": 1}, palm=(0.8, 0.8))
-    assert detector.update(missing, INDEX) == TapUpdate(False, True, None)
-    assert detector.update(make_frame(t=0.1875, lift=0), INDEX).kind == "tap1"
+def test_missing_lift_requires_a_landing_before_rearming(detector):
+    assert detector.update(make_frame(t=0, lift=0.8), INDEX).started
+    assert detector.update(make_frame(t=0.0625, lift=None), INDEX) == TapUpdate(False, False, None)
+
+    for t, lift in [(0.125, 0.8), (0.1875, 0.25), (0.25, 0.8), (0.3125, 0)]:
+        assert detector.update(make_frame(t=t, lift=lift), INDEX) == TapUpdate(False, False, None)
+
+    assert detector.update(make_frame(t=0.375, lift=0.8), INDEX).started
+    assert detector.update(make_frame(t=0.4375, lift=0), INDEX).kind == "tap1"
 
 
 def test_cooldown_ignores_entire_lift_started_during_cooldown(detector):
