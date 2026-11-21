@@ -15,6 +15,7 @@ from tkt.control.gestures import GestureEngine
 from tkt.control.os_input.base import InputBackend
 from tkt.control.os_input.dry_backend import DryBackend
 from tkt.control.os_input.pynput_backend import PynputBackend
+from tkt.control.os_input.windows import WindowsBackend
 from tkt.control.sources import ReplaySource, SyntheticSource
 from tkt.core.source import HandFrameSource
 from tkt.core.types import HandFrame
@@ -144,7 +145,7 @@ def _open_source(args: argparse.Namespace) -> HandFrameSource:
 
 def _run(
     source: HandFrameSource,
-    backend: DryBackend | PynputBackend,
+    backend: InputBackend,
     cfg: dict,
     report: _LatencyReport | None = None,
 ) -> None:
@@ -188,7 +189,7 @@ def _run(
     watchdog = Thread(target=watch_frames, name="tkt-frame-watchdog")
     watchdog.start()
     try:
-        if isinstance(backend, PynputBackend):
+        if isinstance(backend, (PynputBackend, WindowsBackend)):
             from pynput.keyboard import GlobalHotKeys
 
             listener = GlobalHotKeys({cfg["general"]["panic_hotkey"]: toggle_pause})
@@ -231,7 +232,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.source == "replay" and args.file is None:
         parser.error("--source replay için --file gerekli")
-    if args.backend == "native":
+    if args.backend == "native" and sys.platform != "win32":
+        if sys.platform == "darwin":
+            parser.error("native henüz yok (macos.py, V3 şeridi)")
         parser.error("native backend henüz desteklenmiyor")
     if args.source == "replay" and args.latency_out is not None:
         if args.file.resolve() == args.latency_out.resolve() or (
@@ -249,6 +252,8 @@ def main(argv: list[str] | None = None) -> None:
         if backend_name == "pynput":
             backend = PynputBackend()
             backend.step_px = cfg["scroll"]["step_px"]
+        elif backend_name == "native":
+            backend = WindowsBackend(step_px=cfg["scroll"]["step_px"], smooth=True)
         else:
             backend = DryBackend()
         try:
