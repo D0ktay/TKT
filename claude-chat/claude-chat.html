@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude API Chat</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11/lib/highlight.min.js"></script>
+<style>
+  :root{
+    --bg:#0f1115;--panel:#161922;--panel2:#1d2130;--border:#2a2f40;--text:#e6e8ef;--muted:#8b91a5;
+    --accent:#d97757;--accent2:#e9967a;--user:#232a3d;--danger:#e5534b;--ok:#46b07c;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  button,select,input,textarea{font:inherit;color:inherit}
+  .app{display:grid;grid-template-columns:270px 1fr;height:100vh}
+  /* sidebar */
+  aside{background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0}
+  .side-top{padding:14px;border-bottom:1px solid var(--border);display:flex;gap:8px}
+  .btn{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.primary:hover{background:var(--accent2)}
+  .btn.danger{color:var(--danger)}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .convs{flex:1;overflow:auto;padding:8px}
+  .conv{padding:8px 10px;border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;gap:6px;align-items:center}
+  .conv:hover{background:var(--panel2)}
+  .conv.active{background:var(--user)}
+  .conv .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14px}
+  .conv .x{opacity:0;color:var(--muted);border:none;background:none;cursor:pointer}
+  .conv:hover .x{opacity:1}
+  .side-bottom{padding:14px;border-top:1px solid var(--border);font-size:13px;color:var(--muted)}
+  .side-bottom b{color:var(--text)}
+  /* main */
+  main{display:flex;flex-direction:column;min-height:0}
+  header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel)}
+  header label{font-size:12px;color:var(--muted);display:flex;flex-direction:column;gap:2px}
+  header select,header input{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 8px}
+  .spacer{flex:1}
+  #messages{flex:1;overflow:auto;padding:24px 0}
+  .msg{max-width:860px;margin:0 auto 18px;padding:0 20px}
+  .bubble{padding:12px 16px;border-radius:12px}
+  .msg.user .bubble{background:var(--user);margin-left:80px}
+  .msg.assistant .bubble{background:transparent}
+  .meta{font-size:12px;color:var(--muted);margin-top:4px;display:flex;gap:10px;flex-wrap:wrap}
+  .meta button{background:none;border:none;color:var(--muted);cursor:pointer;padding:0}
+  .meta button:hover{color:var(--accent)}
+  .bubble pre{background:#0b0d12;border:1px solid var(--border);border-radius:8px;padding:12px;overflow:auto;position:relative}
+  .bubble code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px}
+  .bubble :not(pre)>code{background:var(--panel2);padding:1px 5px;border-radius:4px}
+  .bubble p:first-child{margin-top:0}.bubble p:last-child{margin-bottom:0}
+  .bubble table{border-collapse:collapse}.bubble td,.bubble th{border:1px solid var(--border);padding:4px 8px}
+  .copy-code{position:absolute;top:6px;right:6px;font-size:11px;padding:2px 8px;border-radius:5px;background:var(--panel2);border:1px solid var(--border);cursor:pointer;color:var(--muted)}
+  details.thinking{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:6px 10px;margin-bottom:10px;font-size:13px;color:var(--muted)}
+  details.thinking pre{white-space:pre-wrap;background:none;border:none;padding:4px 0}
+  .att{display:inline-block;font-size:12px;background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:2px 8px;margin:0 6px 6px 0}
+  .error{color:var(--danger)}
+  .empty{text-align:center;color:var(--muted);margin-top:15vh}
+  .empty h2{color:var(--text);font-weight:600}
+  /* composer */
+  .composer{border-top:1px solid var(--border);padding:12px 16px;background:var(--panel)}
+  .composer-inner{max-width:860px;margin:0 auto}
+  .attach-list{margin-bottom:6px}
+  .attach-list .att button{background:none;border:none;color:var(--danger);cursor:pointer;margin-left:4px}
+  .row{display:flex;gap:8px;align-items:flex-end}
+  textarea#input{flex:1;resize:none;min-height:48px;max-height:260px;background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:12px}
+  textarea#input:focus{outline:none;border-color:var(--accent)}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  /* modal */
+  .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:10}
+  .modal.open{display:flex}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px;width:min(560px,92vw);max-height:90vh;overflow:auto}
+  .card h3{margin-top:0}
+  .card label{display:block;font-size:13px;color:var(--muted);margin:12px 0 4px}
+  .card input,.card textarea,.card select{width:100%;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px}
+  .card textarea{min-height:110px;resize:vertical}
+  .card .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+  .small{font-size:12px;color:var(--muted)}
+  .prices{display:grid;grid-template-columns:1fr 90px 90px;gap:6px;align-items:center;font-size:13px}
+  .prices input{padding:5px}
+  @media (max-width:800px){.app{grid-template-columns:1fr}aside{display:none}.msg.user .bubble{margin-left:20px}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div class="side-top">
+      <button class="btn primary" id="newChat" style="flex:1">+ Yeni sohbet</button>
+      <button class="btn" id="openSettings" title="Ayarlar">⚙</button>
+    </div>
+    <div class="convs" id="convs"></div>
+    <div class="side-bottom">
+      Bu sohbet: <b id="costConv">$0.0000</b><br>
+      Bu tarayıcıda toplam: <b id="costTotal">$0.0000</b><br>
+      <span class="small">Tahmini; kesin rakam için Console → Billing.</span>
+    </div>
+  </aside>
+
+  <main>
+    <header>
+      <label>Model
+        <select id="model">
+          <option value="claude-fable-5-2">Fable 5.2</option>
+          <option value="claude-opus-5-5">Opus 5.5</option>
+          <option value="claude-sonnet-5-5" selected>Sonnet 5.5</option>
+          <option value="claude-haiku-5-5">Haiku 5.5</option>
+        </select>
+      </label>
+      <label>Effort
+        <select id="effort">
+          <option value="">varsayılan</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+      </label>
+      <label>Max output
+        <input id="maxTokens" type="number" min="256" step="256" value="8192" style="width:90px">
+      </label>
+      <label>Temperature
+        <input id="temperature" type="number" min="0" max="1" step="0.1" placeholder="—" style="width:70px">
+      </label>
+      <div class="spacer"></div>
+      <button class="btn" id="editSystem">System prompt</button>
+      <button class="btn" id="exportChat">Dışa aktar (.md)</button>
+    </header>
+
+    <div id="messages"></div>
+
+    <div class="composer">
+      <div class="composer-inner">
+        <div class="attach-list" id="attachList"></div>
+        <div class="row">
+          <button class="btn" id="attachBtn" title="Dosya ekle (resim, PDF, metin/kod)">📎</button>
+          <input type="file" id="fileInput" multiple hidden>
+          <textarea id="input" rows="1" placeholder="Mesaj yaz… (Enter gönder, Shift+Enter yeni satır)"></textarea>
+          <button class="btn primary" id="sendBtn">Gönder</button>
+          <button class="btn danger" id="stopBtn" style="display:none">Durdur</button>
+        </div>
+        <div class="hint" id="hint"></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- Settings -->
+<div class="modal" id="settingsModal">
+  <div class="card">
+    <h3>Ayarlar</h3>
+    <label>Anthropic API key</label>
+    <input id="apiKey" type="password" placeholder="sk-ant-...">
+    <div class="small">Anahtar yalnızca bu tarayıcının localStorage'ında durur, sadece api.anthropic.com'a gönderilir.</div>
+
+    <label>Fiyatlar ($ / 1M token) — maliyet sayacı için</label>
+    <div class="prices" id="prices"></div>
+    <div class="small">Kasım 2026 liste fiyatları önceden dolu. Anthropic fiyatları değiştirirse buradan güncelle.</div>
+
+    <label>Ek model ID (opsiyonel, virgülle)</label>
+    <input id="extraModels" placeholder="ör. claude-opus-5-5-fast">
+
+    <div class="actions">
+      <button class="btn danger" id="clearAll">Tüm sohbetleri sil</button>
+      <div class="spacer"></div>
+      <button class="btn" id="testKey">Anahtarı test et</button>
+      <button class="btn primary" id="saveSettings">Kaydet</button>
+    </div>
+    <div class="small" id="testResult" style="margin-top:8px"></div>
+  </div>
+</div>
+
+<!-- System prompt -->
+<div class="modal" id="systemModal">
+  <div class="card">
+    <h3>System prompt (bu sohbet için)</h3>
+    <textarea id="systemText" placeholder="ör. Sen kıdemli bir embedded/Python geliştiricisin. Türkçe, kısa ve net cevap ver."></textarea>
+    <label><input type="checkbox" id="systemDefault" style="width:auto"> Yeni sohbetlerde varsayılan olarak kullan</label>
+    <div class="actions">
+      <button class="btn" data-close="systemModal">İptal</button>
+      <button class="btn primary" id="saveSystem">Kaydet</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_URL = "https://api.anthropic.com/v1/messages";
+const DEFAULT_PRICES = {
+  "claude-fable-5-2":  {in:8,   out:40},
+  "claude-opus-5-5":   {in:4,   out:20},
+  "claude-sonnet-5-5": {in:2,   out:10},
+  "claude-haiku-5-5":  {in:0.10,out:0.50},
+};
+const LS = {
+  get(k,d){try{const v=localStorage.getItem(k);return v===null?d:JSON.parse(v)}catch{return d}},
+  set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){console.warn(e)}}
+};
+
+let state = {
+  apiKey: LS.get("cc_key",""),
+  prices: Object.assign({}, DEFAULT_PRICES, LS.get("cc_prices",{})),
+  convs: LS.get("cc_convs",[]),
+  activeId: LS.get("cc_active",null),
+  totalCost: LS.get("cc_total",0),
+  defaultSystem: LS.get("cc_defsys",""),
+  prefs: LS.get("cc_prefs",{model:"claude-sonnet-5-5",effort:"",maxTokens:8192,temperature:""}),
+  extraModels: LS.get("cc_extra",""),
+};
+let pending = [];          // attachments for next message
+let controller = null;     // AbortController for streaming
+
+const $ = id => document.getElementById(id);
+const uid = () => Math.random().toString(36).slice(2)+Date.now().toString(36);
+const persist = () => {LS.set("cc_convs",state.convs);LS.set("cc_active",state.activeId);LS.set("cc_total",state.totalCost)};
+const active = () => state.convs.find(c=>c.id===state.activeId);
+const fmt$ = n => "$"+(n||0).toFixed(4);
+const esc = s => s.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function renderMd(text){
+  if(window.marked && window.DOMPurify){
+    const html = DOMPurify.sanitize(marked.parse(text||""));
+    return html;
+  }
+  return "<pre style='white-space:pre-wrap'>"+esc(text||"")+"</pre>";
+}
+function enhance(el){
+  el.querySelectorAll("pre code").forEach(b=>{ if(window.hljs) try{hljs.highlightElement(b)}catch{} });
+  el.querySelectorAll("pre").forEach(pre=>{
+    if(pre.querySelector(".copy-code")) return;
+    const btn=document.createElement("button");btn.className="copy-code";btn.textContent="kopyala";
+    btn.onclick=()=>{navigator.clipboard.writeText(pre.innerText.replace(/kopyala$/,"").trim());btn.textContent="✓";setTimeout(()=>btn.textContent="kopyala",1200)};
+    pre.appendChild(btn);
+  });
+}
+
+/* ---------- models ---------- */
+function populateModels(){
+  const sel=$("model");
+  [...sel.querySelectorAll("option[data-extra]")].forEach(o=>o.remove());
+  state.extraModels.split(",").map(s=>s.trim()).filter(Boolean).forEach(m=>{
+    const o=document.createElement("option");o.value=m;o.textContent=m;o.dataset.extra=1;sel.appendChild(o);
+  });
+  sel.value=state.prefs.model; if(!sel.value) sel.value="claude-sonnet-5-5";
+  $("effort").value=state.prefs.effort||"";
+  $("maxTokens").value=state.prefs.maxTokens||8192;
+  $("temperature").value=state.prefs.temperature??"";
+}
+["model","effort","maxTokens","temperature"].forEach(id=>$(id).addEventListener("change",()=>{
+  state.prefs={model:$("model").value,effort:$("effort").value,maxTokens:+$("maxTokens").value||8192,temperature:$("temperature").value};
+  LS.set("cc_prefs",state.prefs);
+}));
+
+/* ---------- conversations ---------- */
+function newConv(){
+  const c={id:uid(),title:"Yeni sohbet",messages:[],system:state.defaultSystem,cost:0,created:Date.now()};
+  state.convs.unshift(c);state.activeId=c.id;persist();renderAll();$("input").focus();
+}
+function renderConvs(){
+  const box=$("convs");box.innerHTML="";
+  state.convs.forEach(c=>{
+    const d=document.createElement("div");d.className="conv"+(c.id===state.activeId?" active":"");
+    d.innerHTML=`<span class="t">${esc(c.title)}</span><button class="x" title="Sil">✕</button>`;
+    d.onclick=()=>{state.activeId=c.id;persist();renderAll()};
+    d.querySelector(".x").onclick=e=>{e.stopPropagation();if(!confirm("Bu sohbet silinsin mi?"))return;
+      state.convs=state.convs.filter(x=>x.id!==c.id);if(state.activeId===c.id)state.activeId=state.convs[0]?.id||null;persist();renderAll()};
+    box.appendChild(d);
+  });
+}
+function renderMessages(){
+  const box=$("messages");box.innerHTML="";
+  const c=active();
+  if(!c||!c.messages.length){
+    box.innerHTML=`<div class="empty"><h2>Claude API Chat</h2><p>${state.apiKey?"Model seç ve yazmaya başla.":"Başlamak için ⚙ Ayarlar'dan API anahtarını gir."}</p></div>`;
+  } else c.messages.forEach((m,i)=>box.appendChild(msgEl(m,i)));
+  box.scrollTop=box.scrollHeight;
+  $("costConv").textContent=fmt$(c?.cost);
+  $("costTotal").textContent=fmt$(state.totalCost);
+}
+function msgEl(m,i){
+  const wrap=document.createElement("div");wrap.className="msg "+m.role;
+  const b=document.createElement("div");b.className="bubble";
+  let html="";
+  if(m.attachments?.length) html+=m.attachments.map(a=>`<span class="att">📄 ${esc(a.name)}</span>`).join("");
+  if(m.thinking) html+=`<details class="thinking"><summary>Düşünme</summary><pre>${esc(m.thinking)}</pre></details>`;
+  if(m.role==="user") html+=`<div style="white-space:pre-wrap">${esc(m.text)}</div>`;
+  else html+=m.error?`<div class="error">${esc(m.error)}</div>`:renderMd(m.text);
+  b.innerHTML=html;enhance(b);wrap.appendChild(b);
+  const meta=document.createElement("div");meta.className="meta";
+  if(m.role==="assistant"){
+    if(m.model) meta.insertAdjacentHTML("beforeend",`<span>${esc(m.model)}</span>`);
+    if(m.usage) meta.insertAdjacentHTML("beforeend",`<span>in ${m.usage.input} · out ${m.usage.output}${m.usage.cacheRead?` · cache ${m.usage.cacheRead}`:""}</span><span>${fmt$(m.cost)}</span>`);
+    if(m.stop && m.stop!=="end_turn") meta.insertAdjacentHTML("beforeend",`<span>stop: ${esc(m.stop)}</span>`);
+  }
+  const copy=document.createElement("button");copy.textContent="kopyala";copy.onclick=()=>navigator.clipboard.writeText(m.text||"");meta.appendChild(copy);
+  const c=active();
+  if(m.role==="assistant" && i===c.messages.length-1){
+    const r=document.createElement("button");r.textContent="yeniden üret";r.onclick=regenerate;meta.appendChild(r);
+  }
+  if(m.role==="user"){
+    const e=document.createElement("button");e.textContent="düzenle";e.onclick=()=>editFrom(i);meta.appendChild(e);
+  }
+  wrap.appendChild(meta);
+  return wrap;
+}
+function renderAll(){renderConvs();renderMessages();updateHint()}
+function updateHint(){
+  const p=state.prices[$("model").value];
+  $("hint").textContent=p?`${$("model").selectedOptions[0].text}: $${p.in} giriş / $${p.out} çıkış (1M token başına). Uzun sohbetlerde her mesajda tüm geçmiş tekrar gönderilir.`:"";
+}
+$("model").addEventListener("change",updateHint);
+
+/* ---------- attachments ---------- */
+$("attachBtn").onclick=()=>$("fileInput").click();
+$("fileInput").onchange=async e=>{ for(const f of e.target.files) await addFile(f); e.target.value=""; renderAttach(); };
+document.addEventListener("paste",async e=>{
+  const files=[...(e.clipboardData?.files||[])]; if(!files.length) return;
+  e.preventDefault(); for(const f of files) await addFile(f); renderAttach();
+});
+document.addEventListener("dragover",e=>e.preventDefault());
+document.addEventListener("drop",async e=>{e.preventDefault();for(const f of e.dataTransfer.files) await addFile(f);renderAttach()});
+const b64 = f => new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(",")[1]);r.onerror=rej;r.readAsDataURL(f)});
+async function addFile(f){
+  if(f.size>30*1024*1024){alert(f.name+" çok büyük (30MB üstü).");return}
+  if(/^image\/(png|jpeg|gif|webp)$/.test(f.type)) pending.push({name:f.name,kind:"image",media:f.type,data:await b64(f)});
+  else if(f.type==="application/pdf") pending.push({name:f.name,kind:"pdf",media:f.type,data:await b64(f)});
+  else pending.push({name:f.name,kind:"text",data:await f.text()});
+}
+function renderAttach(){
+  $("attachList").innerHTML=pending.map((a,i)=>`<span class="att">📄 ${esc(a.name)}<button data-i="${i}">✕</button></span>`).join("");
+  $("attachList").querySelectorAll("button").forEach(b=>b.onclick=()=>{pending.splice(+b.dataset.i,1);renderAttach()});
+}
+
+/* ---------- API ---------- */
+function toApiMessages(msgs){
+  return msgs.filter(m=>!m.error).map(m=>{
+    if(m.role==="assistant") return {role:"assistant",content:m.text||" "};
+    const content=[];
+    (m.attachments||[]).forEach(a=>{
+      if(a.kind==="image") content.push({type:"image",source:{type:"base64",media_type:a.media,data:a.data}});
+      else if(a.kind==="pdf") content.push({type:"document",source:{type:"base64",media_type:"application/pdf",data:a.data},title:a.name});
+      else content.push({type:"text",text:`<file name="${a.name}">\n${a.data}\n</file>`});
+    });
+    content.push({type:"text",text:m.text||"(dosyaya bak)"});
+    // cache the latest user turn so long histories get cheaper on the next call
+    return {role:"user",content};
+  });
+}
+function calcCost(model,u){
+  const p=state.prices[model]; if(!p) return 0;
+  const inTok=(u.input||0), cw=(u.cacheWrite||0), cr=(u.cacheRead||0);
+  return (inTok*p.in + cw*p.in*1.25 + cr*p.in*0.1 + (u.output||0)*p.out)/1e6;
+}
+
+async function send(){
+  const text=$("input").value.trim();
+  if(!text && !pending.length) return;
+  if(!state.apiKey){openModal("settingsModal");return}
+  if(!active()) newConv();
+  const c=active();
+  c.messages.push({role:"user",text,attachments:pending});
+  if(c.title==="Yeni sohbet") c.title=(text||pending[0]?.name||"Sohbet").slice(0,48);
+  pending=[];renderAttach();$("input").value="";autoGrow();
+  persist();renderAll();
+  await runAssistant();
+}
+
+async function runAssistant(){
+  const c=active();
+  const model=$("model").value;
+  const body={model,max_tokens:+$("maxTokens").value||8192,stream:true,messages:toApiMessages(c.messages)};
+  // cache breakpoint on the last user message => repeated history is billed at cache rate
+  const last=body.messages[body.messages.length-1];
+  if(last && Array.isArray(last.content)) last.content[last.content.length-1].cache_control={type:"ephemeral"};
+  if(c.system) body.system=[{type:"text",text:c.system,cache_control:{type:"ephemeral"}}];
+  const t=$("temperature").value; if(t!=="") body.temperature=+t;
+  const eff=$("effort").value; if(eff) body.output_config={effort:eff};
+
+  const msg={role:"assistant",text:"",model,thinking:""};
+  c.messages.push(msg);
+  renderMessages();
+  const box=$("messages"); const el=box.lastElementChild; const bubble=el.querySelector(".bubble");
+  setBusy(true);
+  controller=new AbortController();
+  const usage={input:0,output:0,cacheRead:0,cacheWrite:0};
+  let raf=null;
+  const paint=()=>{raf=null;bubble.innerHTML=(msg.thinking?`<details class="thinking"><summary>Düşünüyor…</summary><pre>${esc(msg.thinking)}</pre></details>`:"")+renderMd(msg.text||"…");
+    if(box.scrollHeight-box.scrollTop-box.clientHeight<200) box.scrollTop=box.scrollHeight};
+  try{
+    const res=await fetch(API_URL,{method:"POST",signal:controller.signal,headers:{
+      "content-type":"application/json","x-api-key":state.apiKey,"anthropic-version":"2023-06-01",
+      "anthropic-dangerous-direct-browser-access":"true"},body:JSON.stringify(body)});
+    if(!res.ok){
+      let err; try{err=(await res.json()).error}catch{}
+      throw new Error(`${res.status} ${err?.type||""}: ${err?.message||res.statusText}`);
+    }
+    const reader=res.body.getReader(); const dec=new TextDecoder(); let buf="";
+    while(true){
+      const {done,value}=await reader.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let idx;
+      while((idx=buf.indexOf("\n\n"))>=0){
+        const chunk=buf.slice(0,idx); buf=buf.slice(idx+2);
+        const line=chunk.split("\n").find(l=>l.startsWith("data:")); if(!line) continue;
+        let ev; try{ev=JSON.parse(line.slice(5))}catch{continue}
+        if(ev.type==="message_start"){const u=ev.message.usage||{};usage.input=u.input_tokens||0;usage.cacheRead=u.cache_read_input_tokens||0;usage.cacheWrite=u.cache_creation_input_tokens||0;usage.output=u.output_tokens||0}
+        else if(ev.type==="content_block_delta"){
+          if(ev.delta.type==="text_delta") msg.text+=ev.delta.text;
+          else if(ev.delta.type==="thinking_delta") msg.thinking+=ev.delta.thinking;
+          if(!raf) raf=requestAnimationFrame(paint);
+        }
+        else if(ev.type==="message_delta"){ if(ev.usage?.output_tokens!=null) usage.output=ev.usage.output_tokens; msg.stop=ev.delta?.stop_reason }
+        else if(ev.type==="error") throw new Error(ev.error?.message||"stream error");
+      }
+    }
+  }catch(e){
+    if(e.name==="AbortError"){ msg.stop="kullanıcı durdurdu" }
+    else { if(!msg.text) msg.error="Hata: "+e.message; else msg.stop="hata: "+e.message }
+  }finally{
+    if(!msg.thinking) delete msg.thinking;
+    msg.usage=usage; msg.cost=calcCost(model,usage);
+    c.cost=(c.cost||0)+msg.cost; state.totalCost+=msg.cost;
+    setBusy(false); controller=null; persist(); renderMessages();
+  }
+}
+function setBusy(b){$("sendBtn").style.display=b?"none":"";$("stopBtn").style.display=b?"":"none"}
+$("stopBtn").onclick=()=>controller?.abort();
+function regenerate(){const c=active();if(c.messages.at(-1)?.role==="assistant")c.messages.pop();persist();runAssistant()}
+function editFrom(i){
+  const c=active();const m=c.messages[i];
+  if(!confirm("Bu mesaj ve sonrası silinip düzenlemeye açılacak. Devam?"))return;
+  c.messages=c.messages.slice(0,i);pending=m.attachments||[];renderAttach();
+  $("input").value=m.text;autoGrow();persist();renderAll();$("input").focus();
+}
+
+/* ---------- composer ---------- */
+const autoGrow=()=>{const t=$("input");t.style.height="auto";t.style.height=Math.min(t.scrollHeight,260)+"px"};
+$("input").addEventListener("input",autoGrow);
+$("input").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey&&!e.isComposing){e.preventDefault();if(!controller)send()}});
+$("sendBtn").onclick=send;
+$("newChat").onclick=newConv;
+
+/* ---------- modals ---------- */
+function openModal(id){$(id).classList.add("open")}
+function closeModal(id){$(id).classList.remove("open")}
+document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>closeModal(b.dataset.close));
+document.querySelectorAll(".modal").forEach(m=>m.addEventListener("click",e=>{if(e.target===m)closeModal(m.id)}));
+
+$("openSettings").onclick=()=>{
+  $("apiKey").value=state.apiKey;$("extraModels").value=state.extraModels;$("testResult").textContent="";
+  const p=$("prices");p.innerHTML="<b>Model</b><b>Giriş</b><b>Çıkış</b>";
+  const models=[...new Set([...Object.keys(DEFAULT_PRICES),...state.extraModels.split(",").map(s=>s.trim()).filter(Boolean)])];
+  models.forEach(m=>{const v=state.prices[m]||{in:0,out:0};
+    p.insertAdjacentHTML("beforeend",`<span>${m}</span><input data-m="${m}" data-k="in" type="number" step="0.01" value="${v.in}"><input data-m="${m}" data-k="out" type="number" step="0.01" value="${v.out}">`)});
+  openModal("settingsModal");
+};
+$("saveSettings").onclick=()=>{
+  state.apiKey=$("apiKey").value.trim();LS.set("cc_key",state.apiKey);
+  state.extraModels=$("extraModels").value;LS.set("cc_extra",state.extraModels);
+  $("prices").querySelectorAll("input").forEach(i=>{state.prices[i.dataset.m]=state.prices[i.dataset.m]||{};state.prices[i.dataset.m][i.dataset.k]=+i.value});
+  LS.set("cc_prices",state.prices);
+  populateModels();closeModal("settingsModal");renderAll();
+};
+$("testKey").onclick=async()=>{
+  const key=$("apiKey").value.trim(); $("testResult").textContent="Test ediliyor…";
+  try{
+    const r=await fetch("https://api.anthropic.com/v1/models",{headers:{"x-api-key":key,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"}});
+    const j=await r.json();
+    if(!r.ok) throw new Error(j.error?.message||r.status);
+    $("testResult").innerHTML=`<span style="color:var(--ok)">✓ Anahtar çalışıyor.</span> Erişilebilen modeller: ${j.data.map(m=>m.id).join(", ")}`;
+  }catch(e){$("testResult").innerHTML=`<span class="error">✕ ${esc(String(e.message||e))}</span>`}
+};
+$("clearAll").onclick=()=>{if(!confirm("Tüm sohbetler silinsin mi?"))return;state.convs=[];state.activeId=null;state.totalCost=0;persist();closeModal("settingsModal");renderAll()};
+
+$("editSystem").onclick=()=>{const c=active();$("systemText").value=c?c.system:state.defaultSystem;$("systemDefault").checked=false;openModal("systemModal")};
+$("saveSystem").onclick=()=>{
+  const v=$("systemText").value; if(!active()) newConv(); active().system=v;
+  if($("systemDefault").checked){state.defaultSystem=v;LS.set("cc_defsys",v)}
+  persist();closeModal("systemModal");
+};
+$("exportChat").onclick=()=>{
+  const c=active(); if(!c) return;
+  let md=`# ${c.title}\n\n`+(c.system?`> System: ${c.system}\n\n`:"");
+  c.messages.forEach(m=>{md+=`## ${m.role==="user"?"Sen":"Claude ("+(m.model||"")+")"}\n\n${m.error||m.text}\n\n`});
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([md],{type:"text/markdown"}));
+  a.download=c.title.replace(/[^\w\-ğüşöçıİĞÜŞÖÇ ]/g,"").slice(0,40)+".md";a.click();
+};
+
+/* ---------- init ---------- */
+if(window.marked) marked.setOptions({breaks:true,gfm:true});
+populateModels();
+if(!state.activeId && state.convs[0]) state.activeId=state.convs[0].id;
+renderAll();
+if(!state.apiKey) setTimeout(()=>$("openSettings").click(),300);
+</script>
+</body>
+</html>
