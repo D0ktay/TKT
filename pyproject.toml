@@ -5,7 +5,7 @@ description = "Kamera ile el jestlerinden touchpad: imleç, tık, scroll"
 readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    "opencv-python",
+    "opencv-contrib-python",  # mediapipe de bunu getirir; ikinci bir cv2 paketi kurulmasın
     "mediapipe",
     "numpy",
     "pynput",
