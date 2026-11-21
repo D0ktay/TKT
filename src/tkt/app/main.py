@@ -13,6 +13,7 @@ from time import monotonic, perf_counter
 from typing import TextIO
 
 from tkt.app.config import load_control_config
+from tkt.app.hud import HudClosed
 from tkt.control.gestures import GestureEngine
 from tkt.control.os_input.base import InputBackend
 from tkt.control.os_input.dry_backend import DryBackend
@@ -129,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loop", action="store_true", help="Kaydı başa sararak yinele")
     parser.add_argument("--latency", action="store_true", help="Gecikme ve kontrol süresini ölç")
     parser.add_argument("--latency-out", type=Path, help="Ölçümü aç ve kareleri CSV'ye yaz")
+    parser.add_argument("--hud", action="store_true",
+                        help="Kamera görüntüsü ve algılanan hareketi pencerede göster (q kapatır)")
     return parser
 
 
@@ -169,7 +172,16 @@ def _run(
     backend: InputBackend,
     cfg: dict,
     report: _LatencyReport | None = None,
+    hud: bool = False,
 ) -> None:
+    hud_view = None
+    os_backend = backend          # tür kontrolleri (acil durdurma, DryBackend saati) için
+    if hud:
+        from tkt.app.hud import ActionTap, Hud, HudSource
+
+        source = HudSource(source)
+        backend = ActionTap(backend, monotonic)
+        hud_view = Hud(source, backend, cfg["general"]["confidence_min"])
     timed_backend = _TimedBackend(backend) if report is not None else None
     engine = GestureEngine(cfg, timed_backend or backend, source.info)
     general = cfg["general"]
@@ -236,7 +248,7 @@ def _run(
 
     watchdog = Thread(target=watch_frames, name="tkt-frame-watchdog")
     try:
-        if isinstance(backend, (PynputBackend, WindowsBackend, MacBackend)):
+        if isinstance(os_backend, (PynputBackend, WindowsBackend, MacBackend)):
             from pynput.keyboard import GlobalHotKeys
 
             listener = GlobalHotKeys({general["panic_hotkey"]: toggle_pause})
@@ -256,8 +268,8 @@ def _run(
                     raise RuntimeError(_HOTKEY_ERROR)
                 now = monotonic()
                 expire_frames(now)
-                if isinstance(backend, DryBackend):
-                    backend.set_time(frame.t)
+                if isinstance(os_backend, DryBackend):
+                    os_backend.set_time(frame.t)
                 if not paused:
                     # Kayıt ve sentetik kareler ayrı bir zaman ekseninde olabilir.
                     if frame.present and frame.confidence >= general["confidence_min"]:
@@ -275,6 +287,8 @@ def _run(
                     now = monotonic()
                     if now >= report.deadline:
                         report.report(now)
+            if hud_view is not None:
+                hud_view.show(frame, engine, monotonic(), paused)
         with condition:
             check_listener()
             if listener_failed:
@@ -291,6 +305,8 @@ def _run(
                 watchdog.join()
             if report is not None:
                 report.report(monotonic(), final=True)
+            if hud_view is not None:
+                hud_view.close()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -331,7 +347,10 @@ def main(argv: list[str] | None = None) -> None:
                     if args.latency_out is not None:
                         output = files.enter_context(args.latency_out.open("w", newline=""))
                     report = _LatencyReport(args.source == "live", output)
-                _run(source, backend, cfg, report)
+                try:
+                    _run(source, backend, cfg, report, hud=args.hud)
+                except HudClosed:
+                    pass
         finally:
             if _release_with_retry(backend.release_all) is None:
                 raise RuntimeError("Çıkışta girdi tuşları bırakılamadı")
