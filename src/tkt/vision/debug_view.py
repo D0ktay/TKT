@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import math
+import sys
 from collections import deque
 from collections.abc import Sequence
 from contextlib import suppress
@@ -426,6 +427,11 @@ def draw_lift_graph(out: np.ndarray,
 # ---------------------------------------------------------------------- döngü
 
 
+def _log(msg: str) -> None:
+    """Olay günlüğü (stderr); pencere dışından neler olduğunu görmek için."""
+    print(f"[debug_view] {msg}", file=sys.stderr, flush=True)
+
+
 class GuidedCalibration:
     """Adım adım el kalibrasyonu (kamera/GUI yok).
 
@@ -631,6 +637,8 @@ def run(source: LiveSource, calib_path: Path) -> None:
                     calib = calib or _current_calibration(calib_path)
                     message, message_until, calib = _finish_calibration(
                         session, source, calib, calib_path, frame.t)
+                    counts = {k: len(v) for k, v in session.samples.items()}
+                    _log(f"kalibrasyon bitti: ornekler={counts} -> {message} ({calib_path})")
                     session = None
                 elif isinstance(session, GuidedCalibration):
                     calib_state = _guided_state(session)
@@ -665,20 +673,27 @@ def run(source: LiveSource, calib_path: Path) -> None:
                 cocoa = _enable_cocoa_close()
             key = cv2.waitKey(1) & 0xFF
             if key in KEY_QUIT:
+                _log("cikis tusu")
                 break
             visible = _window_visible()
             if visible:
                 seen_visible = True
             elif visible is False and seen_visible:
+                _log("pencere kapatildi")
                 break          # pencere X düğmesiyle kapatıldı
             if key == KEY_CALIB:
                 session, tap = GuidedCalibration(), None
                 message = ""
+                _log("c: kalibrasyon basladi")
             elif key == KEY_NEXT and isinstance(session, GuidedCalibration):
                 session.start()
+                _log(f"bosluk: adim {session.current_step} -> {session.phase}")
             elif key == KEY_TAP:
                 tap, session = TapSession(), None
                 message = ""
+                _log("t: tap kalibrasyonu basladi")
+            elif key not in (255, -1):
+                _log(f"tus: {key!r} ({chr(key) if 32 <= key < 127 else '?'})")
     finally:
         source.close()
         _restore_cocoa(cocoa)
