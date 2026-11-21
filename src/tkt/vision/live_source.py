@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import tomllib
@@ -16,10 +17,12 @@ import numpy as np
 
 from tkt.core.types import SCHEMA_VERSION, HandFrame, SourceInfo
 from tkt.vision import features, hand_calib
-from tkt.vision.camera import Camera, CapturedFrame
+from tkt.vision.camera import Camera, CapturedFrame, format_choice, resolve_camera
 from tkt.vision.hand_calib import HandCalibration
 from tkt.vision.lift import LiftEstimator
 from tkt.vision.tracker import HandTracker, RawHand
+
+log = logging.getLogger(__name__)
 
 # process_fps() bu kadar saniyelik pencerede sayar.
 _FPS_WINDOW_S = 2.0
@@ -75,6 +78,12 @@ class LiveSource:
             schema=SCHEMA_VERSION, width=int(w), height=int(h),
             fps=float(camera.fps), hand=hand,
         )
+        self._aspect = self.info.width / self.info.height
+        # Dışarıdan verilen tahminci kare boyutunu bilmeden kurulmuş olabilir (aspect=1.0):
+        # ayarlarını koruyarak gerçek en-boy oranıyla yeniden kur.
+        if (lift is not None and self._lift_settings is not None
+                and getattr(lift, "aspect", None) != self._aspect):
+            self._lift = LiftEstimator(calib, self._lift_settings, aspect=self._aspect)
 
     # ------------------------------------------------------------------ ölçümler
 
@@ -103,7 +112,7 @@ class LiveSource:
         cfg = self.lift_cfg if self.lift_cfg is not None else self._lift_settings
         lift = None
         if calib.tap_ref is not None and cfg is not None:
-            lift = LiftEstimator(calib, cfg)
+            lift = LiftEstimator(calib, cfg, aspect=self._aspect)
         elif calib.tap_ref is not None and self._lift is not None:
             raise ValueError("lift ayarları bilinmiyor: LiveSource.lift_cfg verin")
         with self._calib_lock:
@@ -176,8 +185,10 @@ def open_live_source(config_path: str | Path = "config/vision.toml") -> LiveSour
     tracker = HandTracker(trk_cfg["model"], trk_cfg["min_detection"], trk_cfg["min_tracking"])
     camera: Camera | None = None
     try:
+        choice = resolve_camera(cam_cfg)
+        log.info("%s", format_choice(choice))
         camera = Camera(
-            cam_cfg["index"], cam_cfg["width"], cam_cfg["height"], cam_cfg["fps"],
+            choice.index, cam_cfg["width"], cam_cfg["height"], cam_cfg["fps"],
             cam_cfg.get("rotate_180", True), cam_cfg.get("backend", "auto"))
 
         calib_path = Path(hand_cfg["calibration"]).expanduser()

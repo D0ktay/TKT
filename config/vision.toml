@@ -1,5 +1,7 @@
 [camera]
-index = 0
+index = 0                 # name boşsa veya bulunamazsa son çare
+name = "LVNext"           # aygıt adında geçen alt dize (büyük/küçük harf duyarsız); "" = index kullan
+kind = "any"              # any | rgb | ir: ad bulunamazsa yoklamayla seç (ir = gri+dikey, rgb = renkli)
 width = 640               # LogiInsight NIR akışı: 640x512 isteğinde 60 fps (1280x1024 yalnızca 15 fps)
 height = 512
 fps = 60
