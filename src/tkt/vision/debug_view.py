@@ -61,6 +61,12 @@ STEP_HINTS: dict[str, str] = {
     "thumb_closed": "Isaret parmagi acik, basparmagi ele yapistir",
 }
 
+# Masa modeli kalibrasyonu: geri sayım, sonra elin mousepad'de gezdirildiği süre.
+TABLE_COUNTDOWN_SECONDS = 3.0
+TABLE_RECORD_SECONDS = 12.0
+# Taranan alan: örnekler bu ızgarada sayılır (kapsama yüzdesi ve kareler).
+TABLE_GRID = 8
+
 # Kalibrasyon sonuç mesajının ekranda kalma süresi (kare zamanı, sn).
 MESSAGE_SECONDS = 4.0
 
@@ -81,6 +87,7 @@ KEY_QUIT = (ord("q"), 27)   # q, ESC
 KEY_CALIB = ord("c")
 KEY_NEXT = ord(" ")          # adım adım kalibrasyonda sonraki adımı başlatır
 KEY_TAP = ord("t")
+KEY_TABLE = ord("m")         # masa (mousepad) modeli kalibrasyonu
 
 # BGR renkler
 _WHITE = (255, 255, 255)
@@ -235,7 +242,7 @@ def draw_overlay(image: np.ndarray, frame: HandFrame, hand: RawHand | None,
     if calib_state is not None:
         _draw_calibration(out, calib_state, u, fs, pad)
     else:
-        _text(out, "c: kalibrasyon  t: tap kalibrasyonu  q/ESC: cikis",
+        _text(out, "c: kalibrasyon  t: tap  m: masa  q/ESC: cikis",
               (pad, h - pad), fs * 0.8, _GRAY)
     return out
 
@@ -337,6 +344,81 @@ class TapSession:
             progress=min(1.0, self._elapsed / self.duration),
             samples=len(self.samples),
         )
+
+
+class TableSession:
+    """Masa modeli kalibrasyonu: geri sayım, sonra el mousepad'de gezinirken örnek toplama.
+
+    Zaman ilk `add` çağrısındaki `t` ile başlar; ilk `countdown_s` saniyede örnek
+    alınmaz, sonraki `record_s` saniyede el olan kareler `samples`'a yazılır.
+    Gerçek saate bakmaz (kamera/GUI yok).
+    """
+
+    def __init__(self, countdown_s: float = TABLE_COUNTDOWN_SECONDS,
+                 record_s: float = TABLE_RECORD_SECONDS) -> None:
+        if countdown_s < 0 or not record_s > 0:
+            raise ValueError("TableSession: countdown_s >= 0, record_s > 0 olmalı")
+        self.countdown_s = float(countdown_s)
+        self.record_s = float(record_s)
+        self.samples: list[RawHand] = []
+        self.points: list[tuple[float, float]] = []   # avuç merkezi, 0–1 (çizim için)
+        self._t0: float | None = None
+        self._elapsed = 0.0
+
+    @property
+    def done(self) -> bool:
+        return self._elapsed >= self.countdown_s + self.record_s
+
+    @property
+    def recording(self) -> bool:
+        return not self.done and self._elapsed >= self.countdown_s
+
+    def add(self, hand: RawHand | None, t: float) -> None:
+        if self.done:
+            return
+        if self._t0 is None:
+            self._t0 = float(t)
+        self._elapsed = max(self._elapsed, float(t) - self._t0)
+        if self.done or hand is None or self._elapsed < self.countdown_s:
+            return
+        self.samples.append(hand)
+        img = np.asarray(hand.image_pts, dtype=float)
+        x, y = img[[0, 5, 9, 13, 17]].mean(axis=0)
+        self.points.append((float(x), float(y)))
+
+    def message(self) -> str:
+        """Ekranda gösterilen yönerge ve kalan süre (ASCII)."""
+        if self._elapsed < self.countdown_s:
+            left = math.ceil(self.countdown_s - self._elapsed)
+            return f"MASA: elini mousepad'e koy - {left}"
+        left = math.ceil(self.countdown_s + self.record_s - self._elapsed)
+        return f"MASA: eli mousepad'in her yerinde gezdir - {left} sn ({len(self.samples)})"
+
+
+def draw_table_area(out: np.ndarray, points: Sequence[tuple[float, float]],
+                    grid: int = TABLE_GRID) -> None:
+    """Masa kalibrasyonunda taranan alanı çizer (yerinde): avuç izleri ve dış sınır.
+
+    Görüntü `grid`×`grid` hücreye bölünür; avucun geçtiği hücreler yarı saydam yeşil
+    boyanır, izler nokta, örneklerin dış sınırı (dışbükey zarf) çizgi olarak gösterilir.
+    """
+    if not points:
+        return
+    h, w = out.shape[:2]
+    px = np.array([(min(w - 1, max(0, round(x * w))), min(h - 1, max(0, round(y * h))))
+                   for x, y in points], dtype=np.int32)
+    overlay = out.copy()
+    cw, ch = w / grid, h / grid
+    cells = {(int(x // cw), int(y // ch)) for x, y in px}
+    for cx, cy in cells:
+        cv2.rectangle(overlay, (int(cx * cw), int(cy * ch)),
+                      (int((cx + 1) * cw) - 1, int((cy + 1) * ch) - 1), _GREEN, -1)
+    cv2.addWeighted(overlay, 0.25, out, 0.75, 0, dst=out)
+    for x, y in px[:: max(1, len(px) // 300)]:
+        cv2.circle(out, (int(x), int(y)), 2, _GREEN, -1)
+    if len(px) >= 3:
+        hull = cv2.convexHull(px)
+        cv2.polylines(out, [hull], True, _YELLOW, 2)
 
 
 def draw_tap_prompt(out: np.ndarray, ts: TapState) -> None:
@@ -515,11 +597,11 @@ class GuidedCalibration:
         if el >= self.countdown_s and hand is not None:
             self.samples[STEPS[self._index]].append(hand)
 
-    def result(self) -> HandCalibration:
+    def result(self, aspect: float = 1.0) -> HandCalibration:
         if not self.done:
             raise ValueError("kalibrasyon oturumu bitmedi")
         return hand_calib.fit_hand(self.samples["open"], self.samples["fist"],
-                                   self.samples["thumb_closed"])
+                                   self.samples["thumb_closed"], aspect)
 
 
 def _guided_state(g: GuidedCalibration) -> CalibState:
@@ -617,6 +699,8 @@ def run(source: LiveSource, calib_path: Path) -> None:
     """
     session: CalibrationSession | GuidedCalibration | None = None
     tap: TapSession | None = None
+    table: TableSession | None = None
+    table_points: list[tuple[float, float]] = []   # son masa kalibrasyonunun alanı
     calib: HandCalibration | None = None     # geçerli kalibrasyon; ilk ihtiyaçta dosyadan
     history: deque[tuple[float, float | None, float | None]] = deque()
     message = ""
@@ -655,6 +739,17 @@ def run(source: LiveSource, calib_path: Path) -> None:
                     tap = None
                 else:
                     tap_state = tap.state()
+            if table is not None:
+                table.add(hand if frame.present else None, frame.t)
+                if table.done:
+                    calib = calib or _current_calibration(calib_path)
+                    message, message_until, calib = _finish_table(
+                        table, source, calib, calib_path, frame.t)
+                    _log(f"masa bitti: ornek={len(table.samples)} -> {message}")
+                    table_points = table.points
+                    table = None
+                else:
+                    calib_state = CalibState(None, 0.0, 0.0, 0, table.message())
             if calib_state is None and message:
                 calib_state = CalibState(None, 0.0, 0.0, 0, message)
 
@@ -667,6 +762,10 @@ def run(source: LiveSource, calib_path: Path) -> None:
             draw_lift_graph(out, history)
             if tap_state is not None:
                 draw_tap_prompt(out, tap_state)
+            if table is not None:
+                draw_table_area(out, table.points)
+            elif table_points and message:
+                draw_table_area(out, table_points)   # sonuç mesajı süresince alan kalır
             cv2.imshow(WINDOW_NAME, out)
             if not shown:
                 shown = True
@@ -682,16 +781,20 @@ def run(source: LiveSource, calib_path: Path) -> None:
                 _log("pencere kapatildi")
                 break          # pencere X düğmesiyle kapatıldı
             if key == KEY_CALIB:
-                session, tap = GuidedCalibration(), None
+                session, tap, table = GuidedCalibration(), None, None
                 message = ""
                 _log("c: kalibrasyon basladi")
             elif key == KEY_NEXT and isinstance(session, GuidedCalibration):
                 session.start()
                 _log(f"bosluk: adim {session.current_step} -> {session.phase}")
             elif key == KEY_TAP:
-                tap, session = TapSession(), None
+                tap, session, table = TapSession(), None, None
                 message = ""
                 _log("t: tap kalibrasyonu basladi")
+            elif key == KEY_TABLE:
+                table, session, tap = TableSession(), None, None
+                message = ""
+                _log("m: masa kalibrasyonu basladi")
             elif key not in (255, -1):
                 _log(f"tus: {key!r} ({chr(key) if 32 <= key < 127 else '?'})")
     finally:
@@ -718,11 +821,12 @@ def _finish_calibration(session: CalibrationSession | GuidedCalibration, source:
     Daha önce çıkarılmış `tap_ref`/`angle_sign` korunur: eğri kalibrasyonu lift'i etkilemez.
     """
     try:
-        result = session.result()
+        result = session.result(aspect=_source_aspect(source))
     except ValueError as e:
         # Örn. örnek yok (el görünmedi) veya yumruk açık elden büyük değil.
         return f"Kalibrasyon basarisiz: {e}"[:90], t + MESSAGE_SECONDS, calib
-    result = dataclasses.replace(result, tap_ref=calib.tap_ref, angle_sign=calib.angle_sign)
+    result = dataclasses.replace(result, tap_ref=calib.tap_ref, angle_sign=calib.angle_sign,
+                                 table=calib.table)
     err = _apply(source, result, calib_path)
     return err or "Kaydedildi ve uygulandi", t + MESSAGE_SECONDS, result
 
@@ -753,6 +857,19 @@ def _finish_tap(tap: TapSession, source: LiveSource, calib: HandCalibration,
         return f"Tap kalibrasyonu basarisiz: {e}"[:90], until, calib
     err = _apply(source, result, calib_path)
     return err or "Tap kaydedildi ve uygulandi", until, result
+
+
+def _finish_table(table: TableSession, source: LiveSource, calib: HandCalibration,
+                  calib_path: Path, t: float) -> tuple[str, float, HandCalibration]:
+    """Masa örneklerinden `fit_table`; diğer kalibrasyon alanları korunur."""
+    until = t + MESSAGE_SECONDS
+    try:
+        model = hand_calib.fit_table(table.samples, aspect=_source_aspect(source))
+    except ValueError as e:
+        return f"Masa kalibrasyonu basarisiz: {e}"[:90], until, calib
+    result = dataclasses.replace(calib, table=model)
+    err = _apply(source, result, calib_path)
+    return err or "Masa kaydedildi ve uygulandi", until, result
 
 
 def main(argv: list[str] | None = None) -> None:

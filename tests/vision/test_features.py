@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from tkt.vision.hand_calib import DEFAULT, HandCalibration
 from tkt.vision.tracker import RawHand
 
 INFO = SourceInfo(schema=SCHEMA_VERSION, width=640, height=512, fps=60.0, hand="right")
+ASPECT = INFO.width / INFO.height
 PORTRAIT = SourceInfo(schema=SCHEMA_VERSION, width=512, height=640, fps=60.0, hand="right")
 
 # Parmak kökleri (dünya, metre): bilekten 9 cm ileride, yan yana; orta kök tam karşıda.
@@ -28,8 +30,10 @@ def make_hand(pip: float | dict[str, float] = 0.0, dip: float | dict[str, float]
               center: tuple[float, float] = (0.5, 0.6), scale: float = 2.0) -> RawHand:
     """Yapay 21 nokta. `pip`, `dip`: orta ve uç eklem bükülmesi (radyan).
 
-    Görüntü noktaları dünya noktalarının x-y izdüşümüdür: ileri (+y dünya) görüntüde yukarı
-    (y azalır). `center` bileğin görüntü konumu, `scale` metre → görüntü birimi.
+    Görüntü noktaları eğik izdüşümdür: görüntü x = dünya x + z / ASPECT, görüntü y = -dünya y
+    (ileri görüntüde yukarı). Bükülme y-z düzleminde olduğundan INFO'nun piksel uzayında
+    açısı korunur; z=0 olan noktalar (avuç, düz parmak) düz x-y izdüşümüyle aynıdır.
+    `center` bileğin görüntü konumu, `scale` metre → görüntü birimi.
     """
     w = np.zeros((21, 3))
     w[0] = (0.0, 0.0, 0.0)
@@ -48,7 +52,8 @@ def make_hand(pip: float | dict[str, float] = 0.0, dip: float | dict[str, float]
     w[2] = (-0.05, 0.04, 0.0)
     w[3] = (-0.06, 0.06, 0.0)
     w[4] = w[5] + np.array([-thumb_dist, 0.0, 0.0])
-    img = np.stack([center[0] + w[:, 0] * scale, center[1] - w[:, 1] * scale], axis=1)
+    img = np.stack([center[0] + (w[:, 0] + w[:, 2] / ASPECT) * scale,
+                    center[1] - w[:, 1] * scale], axis=1)
     return RawHand(image_pts=img, world_pts=w, score=score)
 
 
@@ -64,19 +69,40 @@ def test_straight_finger_curl_raw_zero():
 def test_curl_raw_sums_pip_and_dip():
     hand = make_hand(pip=1.7, dip=1.2)
     for name in FINGERS:
-        assert curl_raw(hand, name) == pytest.approx(2.9, abs=1e-6)
+        assert curl_raw(hand, name, ASPECT) == pytest.approx(2.9, abs=1e-6)
 
 
 def test_curl_raw_ignores_mcp_flexion():
-    """Kök eklemden bükülme (lift) curl_raw'u değiştirmez."""
-    hand = make_hand(pip=0.5, dip=0.3)
-    w = hand.world_pts.copy()
+    """Kök eklemden kalkış (lift) curl_raw'u değiştirmez: düz parmak görüntüde düz kalır."""
+    hand = make_hand()
+    img = hand.image_pts.copy()
     mcp, p, d, t = features.FINGER_JOINTS["index"]
-    # İşaret parmağını kökten 30° kaldır: tüm parmak kök etrafında döner.
+    # Düz işaret parmağını kökten kaldır: görüntüde parmak kısalır ama doğru kalır.
     for i in (p, d, t):
-        w[i] = w[mcp] + _rot_x(w[i] - w[mcp], 0.5)
-    lifted = RawHand(image_pts=hand.image_pts, world_pts=w, score=hand.score)
-    assert curl_raw(lifted, "index") == pytest.approx(0.8, abs=1e-6)
+        img[i] = img[mcp] + 0.6 * (img[i] - img[mcp])
+    lifted = RawHand(image_pts=img, world_pts=hand.world_pts, score=hand.score)
+    assert curl_raw(lifted, "index") == pytest.approx(0.0, abs=1e-6)
+
+
+def test_curl_raw_uses_image_points_not_world():
+    """Dünya noktaları bozuk olsa da (MediaPipe derinlik hatası) sonuç görüntüden gelir."""
+    hand = make_hand(pip=0.5, dip=0.3)
+    broken = RawHand(image_pts=hand.image_pts, world_pts=make_hand(pip=1.7).world_pts,
+                     score=hand.score)
+    assert curl_raw(broken, "index", ASPECT) == pytest.approx(0.8, abs=1e-6)
+
+
+def test_curl_raw_aspect_scales_x():
+    """Açı piksel uzayında ölçülür: x ekseni aspect ile ölçeklenir."""
+    hand = make_hand()
+    img = hand.image_pts.copy()
+    mcp, p, d, t = features.FINGER_JOINTS["index"]
+    # Orta eklemden sonra 45° (normalize birimde) yana kıvrık parmak.
+    img[d] = img[p] + (0.02, -0.02)
+    img[t] = img[d] + (0.02, -0.02)
+    bent = RawHand(image_pts=img, world_pts=hand.world_pts, score=hand.score)
+    assert curl_raw(bent, "index") == pytest.approx(math.pi / 4, abs=1e-6)
+    assert curl_raw(bent, "index", aspect=2.0) == pytest.approx(math.atan(2.0), abs=1e-6)
 
 
 def test_curl_raw_unknown_finger():
@@ -126,15 +152,27 @@ def test_degenerate_calibration_does_not_divide_by_zero():
 # --------------------------------------------------------------------------- thumb
 
 
-def test_thumb_raw_is_distance_over_hand_size():
+def test_thumb_raw_is_image_distance_to_index_pip_over_hand_size():
     hand = make_hand(thumb_dist=0.045)
-    hand_size = 0.09  # bilek–orta kök
-    assert thumb_raw(hand) == pytest.approx(0.045 / hand_size, rel=1e-6)
+    # Görüntüde uç işaret kökünün 0,045 solunda, işaret orta eklemi kökün 0,04 önünde;
+    # el boyu (bilek–orta kök) 0,09. aspect ile x piksel uzayına ölçeklenir.
+    assert thumb_raw(hand) == pytest.approx(math.hypot(0.045, 0.04) / 0.09, rel=1e-6)
+    assert thumb_raw(hand, ASPECT) == pytest.approx(
+        math.hypot(0.045 * ASPECT, 0.04) / 0.09, rel=1e-6)
+
+
+def test_thumb_raw_uses_image_points_not_world():
+    hand = make_hand(thumb_dist=0.05)
+    broken = RawHand(image_pts=hand.image_pts, world_pts=hand.world_pts * 0.0,
+                     score=hand.score)
+    assert thumb_raw(broken) == pytest.approx(thumb_raw(hand), rel=1e-12)
 
 
 def test_thumb_raw_scale_invariant():
     hand = make_hand(thumb_dist=0.05)
-    big = RawHand(image_pts=hand.image_pts, world_pts=hand.world_pts * 1.3, score=hand.score)
+    img = hand.image_pts
+    big = RawHand(image_pts=(img - img[0]) * 1.3 + img[0], world_pts=hand.world_pts,
+                  score=hand.score)
     assert thumb_raw(big) == pytest.approx(thumb_raw(hand), rel=1e-9)
 
 
@@ -239,3 +277,45 @@ def test_confidence_ignores_raw_score():
 def test_confidence_stays_in_unit_range():
     f = build_frame(make_hand(score=1.5), 0.0, 0, DEFAULT, INFO)
     assert 0.0 <= f.confidence <= 1.0
+
+
+# --------------------------------------------------------------------------- masa modeli
+
+
+def _table_for(hands, aspect=1.0):
+    from tkt.vision.hand_calib import fit_table
+    return fit_table(hands, aspect)
+
+
+def _grid_hands(scale=2.0):
+    return [make_hand(center=(0.3 + 0.05 * i, 0.4 + 0.04 * j), scale=scale)
+            for i in range(9) for j in range(8)]
+
+
+def test_palm_shape_terms_and_logs():
+    hand = make_hand(center=(0.5, 0.6), scale=2.0)
+    log_len, log_wid, terms = features.palm_shape(hand)
+    assert log_len == pytest.approx(math.log(0.18), abs=1e-9)        # 0,09 m × 2
+    assert log_wid == pytest.approx(math.log(0.12), abs=1e-9)        # 0,06 m × 2
+    x, y = terms[1], terms[2]
+    assert terms == pytest.approx([1.0, x, y, x * x, y * y, x * y])
+
+
+def test_table_deviation_zero_on_table_and_large_when_lifted():
+    table = _table_for(_grid_hands())
+    on = make_hand(center=(0.45, 0.55))
+    assert features.table_deviation(on, table) == pytest.approx(0.0, abs=1e-6)
+    # Kalkık el: aynı konumda görüntüde %30 küçük.
+    lifted = make_hand(center=(0.45, 0.55), scale=1.4)
+    assert features.table_deviation(lifted, table) > 0.25
+
+
+def test_build_frame_lift_off_drops_confidence():
+    calib = replace(DEFAULT, table=_table_for(_grid_hands()))
+    on = make_hand(center=(0.45, 0.55))
+    lifted = make_hand(center=(0.45, 0.55), scale=1.4)
+    assert build_frame(on, 0.0, 0, calib, INFO, lift_off=0.25).confidence > 0.5
+    assert build_frame(lifted, 0.0, 0, calib, INFO, lift_off=0.25).confidence == 0.0
+    # Eşik yoksa veya masa modeli yoksa değişmez.
+    assert build_frame(lifted, 0.0, 0, calib, INFO).confidence > 0.5
+    assert build_frame(lifted, 0.0, 0, DEFAULT, INFO, lift_off=0.25).confidence > 0.5

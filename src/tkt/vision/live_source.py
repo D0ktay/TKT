@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 import tomllib
@@ -60,6 +61,8 @@ class LiveSource:
         self._lift = lift
         # `set_calibration` lift'i yeniden kurarken bunu kullanır; open_live_source doldurur.
         self.lift_cfg: Mapping | None = None
+        # Masadan kalkış eşiği (config `hand.lift_off`); None: kapalı. open_live_source doldurur.
+        self.lift_off: float | None = None
         # lift_cfg yoksa kurulumda verilen tahmincinin ayarları kullanılır.
         self._lift_settings = _lift_settings(lift)
         self._calib_lock = threading.Lock()
@@ -144,12 +147,13 @@ class LiveSource:
                 lift_est.reset()
             frame = features.build_frame(
                 hand, cap.t, cap.frame_id, calib, self.info,
-                lift=None, prev_hand_size=prev_size)
+                lift=None, prev_hand_size=prev_size, lift_off=self.lift_off)
             if hand is not None and lift_est is not None and frame.present:
                 curls = {name: f.curl for name, f in frame.fingers.items()}
                 frame = features.build_frame(
                     hand, cap.t, cap.frame_id, calib, self.info,
-                    lift=lift_est.update(hand, cap.t, curls), prev_hand_size=prev_size)
+                    lift=lift_est.update(hand, cap.t, curls), prev_hand_size=prev_size,
+                    lift_off=self.lift_off)
             done = time.perf_counter()
             self.last_process_ms = (done - t0) * 1000.0
             self._proc_times.append(time.monotonic())
@@ -168,6 +172,17 @@ class LiveSource:
 
 
 # ---------------------------------------------------------------------- yapılandırma
+
+
+def _lift_off(hand_cfg: Mapping) -> float | None:
+    """Config `hand.lift_off`: masadan kalkış eşiği; anahtar yoksa None (kapalı)."""
+    v = hand_cfg.get("lift_off")
+    if v is None:
+        return None
+    v = float(v)
+    if not (math.isfinite(v) and v > 0):
+        raise ValueError(f"hand.lift_off pozitif olmalı: {v!r}")
+    return v
 
 
 def load_vision_config(path: str | Path) -> dict:
@@ -197,6 +212,7 @@ def open_live_source(config_path: str | Path = "config/vision.toml") -> LiveSour
 
         source = LiveSource(camera, tracker, calib, hand_cfg["side"], lift)
         source.lift_cfg = cfg["lift"]
+        source.lift_off = _lift_off(hand_cfg)
         return source
     except BaseException:
         # Kurulum yarıda kaldı: sahiplik henüz kimseye geçmedi, açılanları kapat.

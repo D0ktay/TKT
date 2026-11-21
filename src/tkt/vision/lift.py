@@ -96,13 +96,14 @@ def raw_signals(hand: RawHand, aspect: float = 1.0) -> dict[str, tuple[float, fl
     return out
 
 
-def curls_from_hand(hand: RawHand, calib: HandCalibration) -> dict[str, float]:
-    """`build_frame` ile aynı 0–1 curl değerleri (görüntü boyutu gerektirmez)."""
+def curls_from_hand(hand: RawHand, calib: HandCalibration,
+                    aspect: float = 1.0) -> dict[str, float]:
+    """`build_frame` ile aynı 0–1 curl değerleri; `aspect` görüntü genişliği / yüksekliği."""
     out: dict[str, float] = {}
     for name in FINGER_JOINTS:
         lo, hi = calib.open_ref[name], calib.fist_ref[name]
         span = hi - lo
-        raw = curl_raw(hand, name)
+        raw = curl_raw(hand, name, aspect)
         if abs(span) < _EPS:
             out[name] = 0.0 if raw <= lo else 1.0
         else:
@@ -269,14 +270,15 @@ def _run_lift(path: str | Path, calib: HandCalibration,
     sıfırlanır."""
     from tkt.tools.record import iter_raw
 
-    est = LiftEstimator(calib, cfg, aspect=_aspect_of(path))
+    aspect = _aspect_of(path)
+    est = LiftEstimator(calib, cfg, aspect=aspect)
     out: list[tuple[float, dict[str, float] | None]] = []
     for s in iter_raw(path):
         if s.hand is None:
             est.reset()
             out.append((s.t, None))
             continue
-        out.append((s.t, est.update(s.hand, s.t, curls_from_hand(s.hand, calib))))
+        out.append((s.t, est.update(s.hand, s.t, curls_from_hand(s.hand, calib, aspect))))
     return out
 
 

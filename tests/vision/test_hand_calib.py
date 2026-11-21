@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ from tkt.vision.hand_calib import (
     CalibrationSession,
     HandCalibration,
     fit_hand,
+    fit_table,
     load,
     save,
 )
@@ -42,7 +44,8 @@ def make_hand(pip: float = 0.0, dip: float = 0.0, thumb_dist: float = 0.07) -> R
     w[2] = (-0.05, 0.04, 0.0)
     w[3] = (-0.06, 0.06, 0.0)
     w[4] = w[5] + np.array([-thumb_dist, 0.0, 0.0])
-    img = np.stack([0.5 + w[:, 0] * 2.0, 0.6 - w[:, 1] * 2.0], axis=1)
+    # Eğik izdüşüm (görüntü x = dünya x + z): bükülme görüntüde görünür.
+    img = np.stack([0.5 + (w[:, 0] + w[:, 2]) * 2.0, 0.6 - w[:, 1] * 2.0], axis=1)
     return RawHand(image_pts=img, world_pts=w, score=0.95)
 
 
@@ -157,7 +160,8 @@ def test_fit_hand_uses_median():
 
 
 def test_fit_hand_maps_poses_to_unit_range():
-    c = fit_hand([_open()] * 3, [_fist()] * 3, [_thumb_closed()] * 3)
+    c = fit_hand([_open()] * 3, [_fist()] * 3, [_thumb_closed()] * 3,
+                 aspect=INFO.width / INFO.height)
     open_f = build_frame(_open(), 0.0, 0, c, INFO)
     fist_f = build_frame(_fist(), 0.0, 1, c, INFO)
     closed_f = build_frame(_thumb_closed(), 0.0, 2, c, INFO)
@@ -454,3 +458,41 @@ def test_fit_taps_aspect_matches_pixel_geometry():
 def test_fit_taps_rejects_bad_aspect(bad):
     with pytest.raises(ValueError, match="aspect"):
         hand_calib.fit_taps(DEFAULT, _tap_samples(["tap1"] * 2), aspect=bad)
+
+
+# --------------------------------------------------------------------------- masa modeli
+
+
+def _moved(hand, dx, dy, s=1.0):
+    img = (hand.image_pts - hand.image_pts[0]) * s + hand.image_pts[0] + (dx, dy)
+    return RawHand(image_pts=img, world_pts=hand.world_pts, score=hand.score)
+
+
+def test_fit_table_needs_samples_and_spread():
+    with pytest.raises(ValueError, match="en az"):
+        fit_table([_open()] * 10)
+    with pytest.raises(ValueError, match="geniş"):
+        fit_table([_open()] * 100)   # hep aynı konum
+
+
+def test_fit_table_roundtrip_and_old_files(tmp_path):
+    hands = [_moved(_open(), 0.03 * i - 0.1, 0.02 * j - 0.05) for i in range(8) for j in range(8)]
+    table = fit_table(hands)
+    assert set(table) == {"length", "width"} and all(len(v) == 6 for v in table.values())
+    c = replace(_calib(), table=table)
+    path = tmp_path / "c.json"
+    save(c, path)
+    assert load(path) == c
+    # Masa modeli olmayan eski dosya okunur, table None.
+    save(_calib(), path)
+    assert load(path).table is None
+
+
+def test_load_rejects_bad_table(tmp_path):
+    path = tmp_path / "c.json"
+    save(_calib(), path)
+    d = json.loads(path.read_text())
+    d["table"] = {"length": [1, 2], "width": [0] * 6}
+    path.write_text(json.dumps(d))
+    with pytest.raises(ValueError, match="table"):
+        load(path)

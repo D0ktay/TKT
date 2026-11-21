@@ -20,6 +20,7 @@ from tkt.vision.tracker import RawHand
 WRIST = 0
 THUMB_TIP = 4
 INDEX_MCP = 5
+INDEX_PIP = 6
 MIDDLE_MCP = 9
 
 # Parmak adı → (kök, orta eklem, uç eklem, uç) nokta numaraları.
@@ -40,8 +41,18 @@ EDGE_MIN_FACTOR = 0.5
 # hand_size bir önceki kareye göre bu orandan fazla değişirse güven JUMP_FACTOR ile çarpılır.
 HAND_SIZE_JUMP = 0.20
 JUMP_FACTOR = 0.5
+# El masadan kalkık (masa modelinden sapma eşiği aşıldı): güven bu katsayıyla çarpılır.
+# 0: control eli "yok" sayar, imleç durur (J10 davranışı).
+LIFT_OFF_FACTOR = 0.0
 
 _EPS = 1e-9
+
+
+def _joints(finger: str) -> tuple[int, int, int, int]:
+    try:
+        return FINGER_JOINTS[finger]
+    except KeyError:
+        raise ValueError(f"bilinmeyen parmak adı: {finger!r}") from None
 
 
 def _flexion(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
@@ -56,38 +67,64 @@ def _flexion(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     return math.acos(min(1.0, max(-1.0, cos)))
 
 
-def _joints(finger: str) -> tuple[int, int, int, int]:
-    try:
-        return FINGER_JOINTS[finger]
-    except KeyError:
-        raise ValueError(f"bilinmeyen parmak adı: {finger!r}") from None
+def curl_raw(hand: RawHand, finger: str, aspect: float = 1.0) -> float:
+    """Orta ve uç eklem bükülmesinin toplamı (radyan), görüntü (2B) noktalarıyla.
 
+    Kök eklemi dışarıdadır; kökten hareket `lift`'e aittir. Düz parmak kökten kalksa da
+    görüntüde düz kalır, açı değişmez. `aspect` = görüntü genişliği / yüksekliği; x ekseni
+    buna göre ölçeklenir, açılar piksel uzayında ölçülür.
 
-def curl_raw(hand: RawHand, finger: str) -> float:
-    """Orta ve uç eklem bükülmesinin toplamı (radyan, dünya noktalarıyla).
-
-    Kök eklemi dışarıdadır; kökten hareket `lift`'e aittir.
+    Dünya (3B) noktaları kullanılmaz: tek parmak açıkken MediaPipe'ın derinlik tahmini o
+    parmağı kıvrık gösteriyor, görüntü noktaları ise doğru (kayıt ölçümü, 2026-11-21:
+    açık ~0,1, kıvrık ~2,6–2,9 rad).
     """
     mcp, pip, dip, tip = _joints(finger)
-    p = np.asarray(hand.world_pts, dtype=float)
+    p = np.asarray(hand.image_pts, dtype=float) * (float(aspect), 1.0)
     return _flexion(p[mcp], p[pip], p[dip]) + _flexion(p[pip], p[dip], p[tip])
 
 
-def _world_hand_size(hand: RawHand) -> float:
-    p = np.asarray(hand.world_pts, dtype=float)
-    return float(np.linalg.norm(p[MIDDLE_MCP] - p[WRIST]))
+def thumb_raw(hand: RawHand, aspect: float = 1.0) -> float:
+    """Görüntüde başparmak ucu ile işaret orta eklemi arası mesafe, el boyuna oranlı (2B).
 
+    El boyu: görüntüde bilek (0) ile orta parmak kökü (9) arası. `aspect` = görüntü
+    genişliği / yüksekliği; mesafeler piksel uzayında ölçülür.
 
-def thumb_raw(hand: RawHand) -> float:
-    """Başparmak ucu ile işaret kökü arası 3D mesafe, el boyuna oranlı.
-
-    El boyu: dünya noktalarında bilek (0) ile orta parmak kökü (9) arası mesafe.
+    Dünya (3B) noktaları ve işaret kökü yerine görüntü noktaları ve işaret orta eklemi
+    kullanılır: kayıtlarda bu ölçünün açık-kapalı aralığı kare-kare titremesine göre ~1,6 kat
+    daha geniş (2026-11-21).
     """
-    p = np.asarray(hand.world_pts, dtype=float)
-    size = _world_hand_size(hand)
+    p = np.asarray(hand.image_pts, dtype=float) * (float(aspect), 1.0)
+    size = float(np.linalg.norm(p[MIDDLE_MCP] - p[WRIST]))
     if size < _EPS:
         return 0.0
-    return float(np.linalg.norm(p[THUMB_TIP] - p[INDEX_MCP])) / size
+    return float(np.linalg.norm(p[THUMB_TIP] - p[INDEX_PIP])) / size
+
+
+def palm_shape(hand: RawHand, aspect: float = 1.0) -> tuple[float, float, list[float]]:
+    """Masa modeli girdisi: (log avuç uzunluğu, log avuç genişliği, konum terimleri).
+
+    Uzunluk bilek (0)–orta kök (9), genişlik işaret kökü (5)–serçe kökü (17); görüntüde,
+    x `aspect` ile ölçeklenmiş birimde. Konum: avuç noktalarının ortalaması (0–1);
+    terimler `[1, x, y, x², y², xy]`.
+    """
+    img = np.asarray(hand.image_pts, dtype=float)
+    p = img * (float(aspect), 1.0)
+    length = max(float(np.linalg.norm(p[MIDDLE_MCP] - p[WRIST])), _EPS)
+    width = max(float(np.linalg.norm(p[17] - p[INDEX_MCP])), _EPS)
+    x, y = (float(v) for v in img[list(PALM_POINTS)].mean(axis=0))
+    return math.log(length), math.log(width), [1.0, x, y, x * x, y * y, x * y]
+
+
+def table_deviation(hand: RawHand, table: dict[str, list[float]],
+                    aspect: float = 1.0) -> float:
+    """Avuç şeklinin masa modelinden sapması: uzunluk ve genişlik log farklarının büyüğü.
+
+    El masadayken ~0 (kayıtlarda p99 ≈ 0,05–0,2); masadan kalkınca belirgin büyür.
+    """
+    log_len, log_wid, terms = palm_shape(hand, aspect)
+    pred_len = float(np.dot(table["length"], terms))
+    pred_wid = float(np.dot(table["width"], terms))
+    return max(abs(log_len - pred_len), abs(log_wid - pred_wid))
 
 
 def _normalize(raw: float, lo: float, hi: float) -> float:
@@ -141,17 +178,24 @@ def _empty_frame(t: float, frame_id: int) -> HandFrame:
 
 def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibration,
                 info: SourceInfo, lift: dict[str, float] | None = None,
-                prev_hand_size: float | None = None) -> HandFrame:
-    """Tek karenin `HandFrame`'ini üretir; el yoksa `present=False`."""
+                prev_hand_size: float | None = None,
+                lift_off: float | None = None) -> HandFrame:
+    """Tek karenin `HandFrame`'ini üretir; el yoksa `present=False`.
+
+    `lift_off`: masa modelinden sapma eşiği (config `hand.lift_off`). Verilir ve
+    `calib.table` doluysa, sapma eşiği aşan karede güven `LIFT_OFF_FACTOR` ile çarpılır.
+    """
     if hand is None:
         return _empty_frame(t, frame_id)
 
     img = np.asarray(hand.image_pts, dtype=float)
+    aspect = info.width / info.height if info.height else 1.0
 
     fingers: dict[str, Finger] = {}
     for name in FINGERS:
         tip = FINGER_JOINTS[name][3]
-        curl = _normalize(curl_raw(hand, name), calib.open_ref[name], calib.fist_ref[name])
+        curl = _normalize(curl_raw(hand, name, aspect), calib.open_ref[name],
+                          calib.fist_ref[name])
         lift_v = None
         if lift is not None and name in lift and lift[name] is not None:
             lift_v = float(lift[name])
@@ -162,7 +206,7 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
             lift=lift_v,
         )
 
-    thumb_out = _normalize(thumb_raw(hand), calib.thumb_closed, calib.thumb_open)
+    thumb_out = _normalize(thumb_raw(hand, aspect), calib.thumb_closed, calib.thumb_open)
     palm_xy = img[list(PALM_POINTS)].mean(axis=0)
     hand_size = _hand_size_img(img, info)
 
@@ -174,6 +218,9 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
     if prev_hand_size is not None and prev_hand_size > _EPS:
         if abs(hand_size / prev_hand_size - 1.0) > HAND_SIZE_JUMP:
             confidence *= JUMP_FACTOR
+    if lift_off is not None and calib.table is not None:
+        if table_deviation(hand, calib.table, aspect) > lift_off:
+            confidence *= LIFT_OFF_FACTOR
 
     return HandFrame(
         t=t,

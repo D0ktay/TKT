@@ -55,7 +55,8 @@ class FakeTracker:
         self.closed = True
 
 
-def fake_build_frame(hand, t, frame_id, calib, info, lift=None, prev_hand_size=None):
+def fake_build_frame(hand, t, frame_id, calib, info, lift=None, prev_hand_size=None,
+                     lift_off=None):
     if hand is None:
         return HandFrame(t, frame_id, False, {}, 0.0, (0.0, 0.0), 0.0, 0.0)
     fingers = {f: Finger((0.5, 0.5), None, 0.1, None if lift is None else lift[f])
@@ -176,7 +177,7 @@ def calib_with_tap_ref():
 def test_set_calibration_reaches_build_frame(monkeypatch):
     seen = []
 
-    def spy(hand, t, frame_id, calib, info, lift=None, prev_hand_size=None):
+    def spy(hand, t, frame_id, calib, info, lift=None, prev_hand_size=None, lift_off=None):
         seen.append(calib)
         return fake_build_frame(hand, t, frame_id, calib, info, lift, prev_hand_size)
 
@@ -427,3 +428,24 @@ def test_real_live_source_opens():
         assert src.info.width > 0
     finally:
         src.close()
+
+
+def test_lift_off_passed_to_build_frame(monkeypatch):
+    seen = []
+
+    def spy(hand, t, frame_id, calib, info, lift=None, prev_hand_size=None, lift_off=None):
+        seen.append(lift_off)
+        return fake_build_frame(hand, t, frame_id, calib, info, lift, prev_hand_size)
+
+    monkeypatch.setattr(ls.features, "build_frame", spy)
+    src = LiveSource(FakeCamera(n=3), FakeTracker([True] * 3), DEFAULT, "right")
+    src.lift_off = 0.3
+    list(src.frames())
+    assert seen and all(v == 0.3 for v in seen)
+
+
+def test_lift_off_config():
+    assert ls._lift_off({}) is None
+    assert ls._lift_off({"lift_off": 0.25}) == 0.25
+    with pytest.raises(ValueError):
+        ls._lift_off({"lift_off": 0})
