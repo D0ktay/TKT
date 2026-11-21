@@ -3,7 +3,7 @@
 from collections import deque
 from collections.abc import Mapping
 from enum import Enum
-from math import hypot
+from math import hypot, isfinite
 from threading import RLock
 from typing import Any
 
@@ -44,6 +44,7 @@ class GestureEngine:
         general = cfg["general"]
         mode = cfg["mode"]
         thumb = cfg["thumb"]
+        swipe = cfg["swipe"]
         self._click_method = general.get("click_method", "thumb")
         self._confidence_min = general["confidence_min"]
         self._lost_release_s = general["lost_release_ms"] / 1000
@@ -56,6 +57,8 @@ class GestureEngine:
         self._thumb_debounce_s = thumb["debounce_ms"] / 1000
         self._drag_threshold = thumb["drag_threshold"]
         self._still_s = thumb["still_ms"] / 1000
+        self._swipe_distance = swipe["distance"]
+        self._swipe_window_s = swipe["window_ms"] / 1000
         self._image_aspect = info.height / info.width
         self._rollback_ms = cfg["pointer"]["rollback_ms"]
         self._backend = backend
@@ -99,6 +102,8 @@ class GestureEngine:
                 middle = frame.fingers["middle"]
                 pos = ((index.img[0] + middle.img[0]) / 2, (index.img[1] + middle.img[1]) / 2)
                 self._send_scroll(self._scroll.update(pos, frame.hand_size, frame.t))
+            elif self.mode is Mode.SWIPE:
+                self._update_swipe(frame)
             elif self._scroll_coasting and previous_mode is Mode.NONE:
                 self._send_scroll(self._scroll.tick(frame.t))
 
@@ -127,6 +132,8 @@ class GestureEngine:
         self._thumb_change_at: float | None = None
         self._drag_origin: tuple[float, float] | None = None
         self._palm_history: deque[tuple[float, tuple[float, float]]] = deque()
+        self._swipe_history: deque[tuple[float, tuple[float, float]]] = deque()
+        self._swipe_triggered = False
         self._scroll_coasting = False
 
     def _process_missing_hand(self, t: float) -> None:
@@ -139,6 +146,7 @@ class GestureEngine:
             self._pointer_needs_rebase = True
             self._thumb_change_at = None
             self._palm_history.clear()
+            self._reset_swipe()
             self._cancel_active_tap()
             self._stop_scroll()
         if t >= self._lost_until:
@@ -168,6 +176,7 @@ class GestureEngine:
         self._open_fingers = opened
 
     def _change_mode(self, previous_mode: Mode, t: float) -> None:
+        self._reset_swipe()
         if self.left_down:
             self._release_left()
         self._drag_origin = None
@@ -179,6 +188,39 @@ class GestureEngine:
         self._cancel_active_tap()
         if self.mode is Mode.SCROLL:
             self._scroll.rebase()
+
+    def _reset_swipe(self) -> None:
+        self._swipe_history.clear()
+        self._swipe_triggered = False
+
+    def _update_swipe(self, frame: HandFrame) -> None:
+        if self._swipe_triggered or not isfinite(frame.hand_size) or frame.hand_size <= 0:
+            return
+
+        history = self._swipe_history
+        while history and history[0][0] + self._swipe_window_s < frame.t:
+            history.popleft()
+
+        # Her iki farkı da görüntü genişliği biriminde tut; hand_size da aynı ölçekte.
+        threshold = self._swipe_distance * frame.hand_size
+        x, y = frame.palm
+        for _, (old_x, old_y) in history:
+            dx = x - old_x
+            dy = (y - old_y) * self._image_aspect
+            if hypot(dx, dy) < threshold:
+                continue
+            if abs(dx) >= abs(dy):
+                action = "desktop_left" if dx < 0 else "desktop_right"
+            elif dy < 0:
+                action = "mission_control"
+            else:
+                continue
+            self._swipe_triggered = True
+            history.clear()
+            self._backend.system_action(action)
+            return
+
+        history.append((frame.t, frame.palm))
 
     def _cancel_active_tap(self) -> None:
         if self._tap is not None and self._tap_busy:

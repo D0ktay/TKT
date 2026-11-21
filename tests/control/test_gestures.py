@@ -29,6 +29,7 @@ def rig(monkeypatch, request):
         },
         "pointer": {"rollback_ms": 80},
         "scroll": {},
+        "swipe": {"distance": 0.625, "window_ms": 250},
     }
     if hasattr(request, "param"):
         cfg["general"]["click_method"] = request.param
@@ -96,6 +97,92 @@ def test_locked_mode_changes_only_after_all_fingers_close(rig):
     assert engine.mode is Mode.SWIPE
     assert backend_events(backend) == []
     assert pointer.mock_calls == []
+
+
+@pytest.mark.parametrize(
+    ("dx", "dy", "action"),
+    [
+        (-0.25, 0, "desktop_left"),
+        (0.25, 0, "desktop_right"),
+        (0, -0.35, "mission_control"),
+    ],
+)
+def test_swipe_direction_and_one_shot(dx, dy, action):
+    source = SyntheticSource().open(4, s=0.75).move(dx, dy, s=0.25)
+    source.move(-dx, -dy, s=0.25).move(dx, dy, s=0.25)
+    backend = DryBackend()
+    engine = GestureEngine(load_control_config(), backend, source.info)
+    for frame in source.frames():
+        engine.process(frame)
+
+    assert engine.mode is Mode.SWIPE
+    assert backend_events(backend) == [("system", action)]
+
+
+@pytest.mark.parametrize(("dx", "dy", "duration"), [(-0.25, 0, 1), (0, 0.3, 0.125)])
+def test_slow_and_downward_swipes_do_not_trigger(rig, dx, dy, duration):
+    engine, backend, _, _ = rig
+    source = SyntheticSource().open(4).move(dx, dy, s=duration)
+    for frame in source.frames():
+        engine.process(frame)
+
+    assert engine.mode is Mode.SWIPE
+    assert backend_events(backend) == []
+
+
+def test_swipe_uses_palm_and_pixel_aspect_ratio_at_the_window_boundary(rig):
+    engine, backend, _, _ = rig
+    engine.process(pose(0, *FINGERS, palm=(0.5, 0.5)))
+    engine.process(pose(0.125, *FINGERS, palm=(0.5, 0.5)))
+    engine.process(pose(0.25, *FINGERS, palm=(0.5, 0.375)))
+    assert backend_events(backend) == []
+
+    # Piksel cinsinden ilk örneğe göre daha büyük fark yatay eksendedir.
+    engine.process(pose(0.375, *FINGERS, palm=(0.609375, 0.3671875)))
+    assert backend_events(backend) == [("system", "desktop_right")]
+
+
+def test_swipe_can_trigger_again_after_fingers_close():
+    source = SyntheticSource().open(4).move(-0.25, 0, s=0.25)
+    source.curl_all().open(3).move(0.25, 0, s=0.25)
+    backend = DryBackend()
+    engine = GestureEngine(load_control_config(), backend, source.info)
+    for frame in source.frames():
+        engine.process(frame)
+
+    assert backend_events(backend) == [("system", "desktop_left"), ("system", "desktop_right")]
+
+
+@pytest.mark.parametrize("missing", [{"present": False}, {"confidence": 0.5}])
+def test_swipe_resets_history_and_trigger_on_brief_hand_loss(rig, missing):
+    engine, backend, _, _ = rig
+    engine.process(pose(0, *FINGERS))
+    engine.process(pose(0.125, *FINGERS))
+    engine.process(make_frame(t=0.1875, **missing))
+    engine.process(pose(0.25, *FINGERS, palm=(0.25, 0.6)))
+    assert engine.mode is Mode.SWIPE
+    assert backend_events(backend) == []
+
+    engine.process(pose(0.3125, *FINGERS, palm=(0.125, 0.6)))
+    assert backend_events(backend) == [("system", "desktop_left")]
+    engine.process(make_frame(t=0.375, **missing))
+    engine.process(pose(0.4375, *FINGERS, palm=(0.125, 0.6)))
+    engine.process(pose(0.5, *FINGERS, palm=(0.25, 0.6)))
+    assert backend_events(backend) == [("system", "desktop_left"), ("system", "desktop_right")]
+
+
+@pytest.mark.parametrize("rig", ["both"], indirect=True)
+def test_swipe_does_not_move_scroll_or_click(rig):
+    engine, backend, pointer, scroll = rig
+    pointer.update.return_value = (1, 1)
+    scroll.update.return_value = (0, 1)
+    source = SyntheticSource().open(4).thumb(True).thumb(False).tap().move(0.25, 0, s=0.25)
+    for frame in source.frames():
+        engine.process(frame)
+
+    assert backend_events(backend) == [("system", "desktop_right")]
+    assert pointer.mock_calls == []
+    assert scroll.mock_calls == []
 
 
 def test_wait_requires_the_same_fingers_to_stay_open(rig):
