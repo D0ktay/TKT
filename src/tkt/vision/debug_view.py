@@ -63,7 +63,9 @@ STEP_HINTS: dict[str, str] = {
 
 # Masa modeli kalibrasyonu: geri sayım, sonra elin mousepad'de gezdirildiği süre.
 TABLE_COUNTDOWN_SECONDS = 3.0
-TABLE_RECORD_SECONDS = 6.0
+TABLE_RECORD_SECONDS = 12.0
+# Taranan alan: örnekler bu ızgarada sayılır (kapsama yüzdesi ve kareler).
+TABLE_GRID = 8
 
 # Kalibrasyon sonuç mesajının ekranda kalma süresi (kare zamanı, sn).
 MESSAGE_SECONDS = 4.0
@@ -359,12 +361,17 @@ class TableSession:
         self.countdown_s = float(countdown_s)
         self.record_s = float(record_s)
         self.samples: list[RawHand] = []
+        self.points: list[tuple[float, float]] = []   # avuç merkezi, 0–1 (çizim için)
         self._t0: float | None = None
         self._elapsed = 0.0
 
     @property
     def done(self) -> bool:
         return self._elapsed >= self.countdown_s + self.record_s
+
+    @property
+    def recording(self) -> bool:
+        return not self.done and self._elapsed >= self.countdown_s
 
     def add(self, hand: RawHand | None, t: float) -> None:
         if self.done:
@@ -375,6 +382,9 @@ class TableSession:
         if self.done or hand is None or self._elapsed < self.countdown_s:
             return
         self.samples.append(hand)
+        img = np.asarray(hand.image_pts, dtype=float)
+        x, y = img[[0, 5, 9, 13, 17]].mean(axis=0)
+        self.points.append((float(x), float(y)))
 
     def message(self) -> str:
         """Ekranda gösterilen yönerge ve kalan süre (ASCII)."""
@@ -383,6 +393,32 @@ class TableSession:
             return f"MASA: elini mousepad'e koy - {left}"
         left = math.ceil(self.countdown_s + self.record_s - self._elapsed)
         return f"MASA: eli mousepad'in her yerinde gezdir - {left} sn ({len(self.samples)})"
+
+
+def draw_table_area(out: np.ndarray, points: Sequence[tuple[float, float]],
+                    grid: int = TABLE_GRID) -> None:
+    """Masa kalibrasyonunda taranan alanı çizer (yerinde): avuç izleri ve dış sınır.
+
+    Görüntü `grid`×`grid` hücreye bölünür; avucun geçtiği hücreler yarı saydam yeşil
+    boyanır, izler nokta, örneklerin dış sınırı (dışbükey zarf) çizgi olarak gösterilir.
+    """
+    if not points:
+        return
+    h, w = out.shape[:2]
+    px = np.array([(min(w - 1, max(0, round(x * w))), min(h - 1, max(0, round(y * h))))
+                   for x, y in points], dtype=np.int32)
+    overlay = out.copy()
+    cw, ch = w / grid, h / grid
+    cells = {(int(x // cw), int(y // ch)) for x, y in px}
+    for cx, cy in cells:
+        cv2.rectangle(overlay, (int(cx * cw), int(cy * ch)),
+                      (int((cx + 1) * cw) - 1, int((cy + 1) * ch) - 1), _GREEN, -1)
+    cv2.addWeighted(overlay, 0.25, out, 0.75, 0, dst=out)
+    for x, y in px[:: max(1, len(px) // 300)]:
+        cv2.circle(out, (int(x), int(y)), 2, _GREEN, -1)
+    if len(px) >= 3:
+        hull = cv2.convexHull(px)
+        cv2.polylines(out, [hull], True, _YELLOW, 2)
 
 
 def draw_tap_prompt(out: np.ndarray, ts: TapState) -> None:
@@ -664,6 +700,7 @@ def run(source: LiveSource, calib_path: Path) -> None:
     session: CalibrationSession | GuidedCalibration | None = None
     tap: TapSession | None = None
     table: TableSession | None = None
+    table_points: list[tuple[float, float]] = []   # son masa kalibrasyonunun alanı
     calib: HandCalibration | None = None     # geçerli kalibrasyon; ilk ihtiyaçta dosyadan
     history: deque[tuple[float, float | None, float | None]] = deque()
     message = ""
@@ -709,6 +746,7 @@ def run(source: LiveSource, calib_path: Path) -> None:
                     message, message_until, calib = _finish_table(
                         table, source, calib, calib_path, frame.t)
                     _log(f"masa bitti: ornek={len(table.samples)} -> {message}")
+                    table_points = table.points
                     table = None
                 else:
                     calib_state = CalibState(None, 0.0, 0.0, 0, table.message())
@@ -724,6 +762,10 @@ def run(source: LiveSource, calib_path: Path) -> None:
             draw_lift_graph(out, history)
             if tap_state is not None:
                 draw_tap_prompt(out, tap_state)
+            if table is not None:
+                draw_table_area(out, table.points)
+            elif table_points and message:
+                draw_table_area(out, table_points)   # sonuç mesajı süresince alan kalır
             cv2.imshow(WINDOW_NAME, out)
             if not shown:
                 shown = True

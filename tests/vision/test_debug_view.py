@@ -775,7 +775,7 @@ def test_table_session_countdown_then_records():
     from tkt.vision.debug_view import TableSession
 
     ts = TableSession(countdown_s=1.0, record_s=2.0)
-    hands = [object()] * 40
+    hands = [SimpleNamespace(image_pts=np.full((21, 2), 0.5))] * 40
     for i, h in enumerate(hands):          # 10 Hz, 4 sn
         ts.add(h if i != 15 else None, 10.0 + i / 10)
     # geri sayımda (t < 1 sn) örnek yok; 1–3 sn arası 20 kare, biri el yok
@@ -789,3 +789,23 @@ def test_table_session_validates():
 
     with pytest.raises(ValueError):
         TableSession(record_s=0)
+
+
+def test_table_session_collects_palm_points():
+    from tkt.vision.debug_view import TableSession
+
+    hand = SimpleNamespace(image_pts=np.tile([0.25, 0.75], (21, 1)))
+    ts = TableSession(countdown_s=0.0, record_s=1.0)
+    ts.add(hand, 0.0)
+    ts.add(hand, 0.5)
+    assert ts.recording
+    assert ts.points == [pytest.approx((0.25, 0.75))] * 2
+
+
+def test_draw_table_area_marks_visited_cells():
+    out = np.zeros((80, 80, 3), np.uint8)
+    dv.draw_table_area(out, [])
+    assert not out.any()
+    dv.draw_table_area(out, [(0.1, 0.1), (0.15, 0.12), (0.12, 0.2)], grid=4)
+    assert out[5:15, 5:15].any()          # ziyaret edilen sol üst hücre boyandı
+    assert not out[60:80, 60:80].any()    # sağ alt hücreye dokunulmadı
