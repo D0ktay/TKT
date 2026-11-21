@@ -5,13 +5,18 @@ Bu dosya kilitlidir. Değişiklik prosedürü PART1 1.3'te: ayrı `core` PR'ı v
 
 Koordinatlar kullanıcının bakış açısındadır: `x` 0 sol, 1 sağ; `y` 0 uzak kenar
 (kamera tarafı), 1 yakın kenar (kullanıcı tarafı).
+
+Şema 2: `HandFrame.pinch` eklendi (isteğe bağlı, varsayılan None). Şema 1 kayıtları
+okunurken `pinch=None` ile şema 2'ye dönüştürülür (`core/io.py`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Okunabilen kayıt şemaları; eskiler okunurken güncel sürüme dönüştürülür.
+READABLE_SCHEMAS = (1, 2)
 FINGERS = ("index", "middle", "ring", "pinky")
 
 
@@ -33,6 +38,10 @@ class HandFrame:
     palm: tuple[float, float]   # el merkezi, 0–1
     hand_size: float            # bilek–orta parmak kökü mesafesi (görüntü genişliğine oranlı)
     confidence: float           # 0–1
+    # Şema 2, isteğe bağlı: başparmak ucu ile her parmak ucu arası mesafe, anahtarlar FINGERS.
+    # 0 uçlar değiyor, açıldıkça artar (>= 0; ölçeği vision belirler). Ölçülmüyorsa
+    # (Sürüm C açık değil) veya present=False ise None.
+    pinch: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
