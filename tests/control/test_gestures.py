@@ -234,7 +234,7 @@ def test_unreliable_frames_release_at_deadline_from_last_reliable_frame(rig):
     assert engine.mode is Mode.POINTER
     assert engine.left_down
     assert backend_events(backend) == []
-    assert pointer.mock_calls == []
+    assert pointer.mock_calls == [call.rollback_at(80, 0.25)]
 
     engine.process(make_frame(t=0.4375, confidence=0.5))
     assert not engine.left_down
@@ -243,7 +243,7 @@ def test_unreliable_frames_release_at_deadline_from_last_reliable_frame(rig):
     assert not engine.left_down
     backend.release_all.assert_called_once()
     assert backend_events(backend) == [("button", "left", False)]
-    assert pointer.mock_calls == [call.reset()]
+    assert pointer.mock_calls == [call.rollback_at(80, 0.25), call.reset()]
 
 
 def test_low_confidence_does_not_count_toward_lock(rig):
@@ -264,7 +264,8 @@ def test_brief_loss_rebases_pointer_without_releasing(rig):
     engine.process(make_frame(t=0.25, present=False))
     engine.process(pose(0.34375, "index", index_pos=(0.8, 0.7)))
     assert engine.mode is Mode.POINTER
-    assert pointer.mock_calls == [call.rebase(), call.update((0.8, 0.7), 0.2, 0.34375)]
+    assert pointer.mock_calls == [call.rollback_at(80, 0.25), call.rebase(),
+                                  call.update((0.8, 0.7), 0.2, 0.34375)]
     assert backend_events(backend) == []
 
 
@@ -275,7 +276,7 @@ def test_recovery_after_loss_timeout_requires_a_new_mode_lock(rig):
     engine.process(make_frame(t=0.25, present=False))
     engine.process(pose(0.375, "index"))
     assert engine.mode is Mode.WAIT
-    assert pointer.mock_calls == [call.reset()]
+    assert pointer.mock_calls == [call.rollback_at(80, 0.25), call.reset()]
     backend.release_all.assert_called_once()
     assert backend_events(backend) == []
 
@@ -589,3 +590,24 @@ def test_tap_palm_motion_uses_source_pixel_aspect_ratio(size):
 
     click = [("button", "left", True), ("button", "left", False)]
     assert backend_events(backend) == (click if size[0] > size[1] else [])
+
+
+def test_hand_loss_rolls_back_recent_pointer_motion(rig):
+    """El kalkınca/kaybolunca (güven düşük) son rollback_ms hareketi geri alınır, bir kez."""
+    engine, backend, pointer, _ = rig
+    lock_pointer(engine)
+    backend.events.clear()
+    pointer.reset_mock()
+    pointer.rollback_at.return_value = (5, -3)
+    engine.process(make_frame(t=0.25, confidence=0.0))
+    engine.process(make_frame(t=0.28, confidence=0.0))
+    assert pointer.rollback_at.call_args_list == [call(80, 0.25)]
+    assert backend_events(backend) == [("move", 5, -3)]
+
+
+def test_hand_loss_outside_pointer_mode_does_not_roll_back(rig):
+    engine, backend, pointer, _ = rig
+    engine.process(pose(0, "index"))         # WAIT, henüz POINTER değil
+    pointer.reset_mock()
+    engine.process(make_frame(t=0.05, present=False))
+    assert pointer.rollback_at.call_count == 0

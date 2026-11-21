@@ -12,6 +12,8 @@ import statistics
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
+import numpy as np
+
 from tkt.vision.tracker import RawHand
 
 
@@ -23,6 +25,16 @@ class HandCalibration:
     thumb_open: float
     tap_ref: dict[str, float] | None   # parmak adı → tap tepe değeri (Faz 2)
     angle_sign: float = 1.0            # kalkış yönü, tap kalibrasyonundan
+    # Masa modeli: el masadayken avuç uzunluğu ve genişliğinin (log) avuç konumuna göre
+    # ikinci derece katsayıları ("length", "width" → 6 sayı). None: kalkış algılama kapalı.
+    table: dict[str, list[float]] | None = None
+
+
+# Masa modeli: anahtarlar ve terim sayısı (1, x, y, x², y², xy).
+TABLE_KEYS: tuple[str, ...] = ("length", "width")
+TABLE_TERMS = 6
+# fit_table: en az bu kadar örnek (kamera ~30 fps'de ~2 sn).
+TABLE_MIN_SAMPLES = 60
 
 
 # Kalibrasyon yokken kullanılır. Kaba değerlerdir; ilk kayıtlar bununla alınır, `fit_hand`
@@ -48,6 +60,7 @@ def _floats(d: object, key: str) -> dict[str, float]:
 
 def _from_dict(d: dict) -> HandCalibration:
     tap_ref = d.get("tap_ref")
+    table = d.get("table")
     return HandCalibration(
         open_ref=_floats(d["open_ref"], "open_ref"),
         fist_ref=_floats(d["fist_ref"], "fist_ref"),
@@ -55,7 +68,22 @@ def _from_dict(d: dict) -> HandCalibration:
         thumb_open=float(d["thumb_open"]),
         tap_ref=None if tap_ref is None else _floats(tap_ref, "tap_ref"),
         angle_sign=float(d.get("angle_sign", 1.0)),
+        table=None if table is None else _table(table),
     )
+
+
+def _table(d: object) -> dict[str, list[float]]:
+    if not isinstance(d, dict):
+        raise ValueError("kalibrasyon: 'table' sözlük olmalı")
+    out: dict[str, list[float]] = {}
+    for key in TABLE_KEYS:
+        v = d.get(key)
+        if not isinstance(v, list) or len(v) != TABLE_TERMS:
+            raise ValueError(f"kalibrasyon: table[{key!r}] {TABLE_TERMS} sayılık liste olmalı")
+        out[key] = [float(x) for x in v]
+        if not all(math.isfinite(x) for x in out[key]):
+            raise ValueError(f"kalibrasyon: table[{key!r}] sonlu olmalı")
+    return out
 
 
 def load(path: Path) -> HandCalibration | None:
@@ -137,6 +165,29 @@ def fit_hand(open_s: list[RawHand], fist_s: list[RawHand],
         thumb_open=thumb_open,
         tap_ref=None,
     )
+
+
+def fit_table(samples: list[RawHand], aspect: float = 1.0) -> dict[str, list[float]]:
+    """El masada gezinirken toplanan örneklerden masa modeli (en küçük kareler).
+
+    Her örnekte `features.palm_shape` ile avuç uzunluğu ve genişliğinin logu ve konum
+    terimleri alınır; ikisi için de konuma göre ikinci derece yüzey uydurulur. Az örnek veya
+    el yeterince geniş bir alanda gezinmediyse (terimler doğrusal bağımlı) `ValueError`.
+    """
+    from tkt.vision.features import palm_shape
+
+    if len(samples) < TABLE_MIN_SAMPLES:
+        raise ValueError(f"fit_table: en az {TABLE_MIN_SAMPLES} örnek gerekli ({len(samples)})")
+    rows = [palm_shape(h, aspect) for h in samples]
+    terms = np.array([r[2] for r in rows])
+    if np.linalg.matrix_rank(terms) < TABLE_TERMS:
+        raise ValueError("fit_table: eli mousepad'in daha geniş bir alanında gezdirin")
+    out: dict[str, list[float]] = {}
+    for k, key in enumerate(TABLE_KEYS):
+        target = np.array([r[k] for r in rows])
+        coef, *_ = np.linalg.lstsq(terms, target, rcond=None)
+        out[key] = [float(c) for c in coef]
+    return out
 
 
 # Kalibrasyon adımları sırayla: açık el, yumruk, başparmak kapalı.

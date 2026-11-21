@@ -152,6 +152,10 @@ class GestureEngine:
             return
         if not self._hand_missing:
             self._hand_missing = True
+            # El kalkınca/çıkınca son kareler kaymış olabilir (tespit gecikmesi): taşımadaki
+            # gibi son `rollback_ms` hareketi geri al.
+            if self.mode is Mode.POINTER and not self._pointer_frozen:
+                self._send_move(self._pointer.rollback_at(self._rollback_ms, t))
             self._wait_until = None
             self._previous_index = None
             self._pointer_needs_rebase = True
