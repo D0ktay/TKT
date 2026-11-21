@@ -168,6 +168,63 @@ def test_lift_is_used_and_reset_on_absence():
     assert set(lift.updates[0][1]) == set(FINGERS)
 
 
+def calib_with_tap_ref():
+    from dataclasses import replace
+    return replace(DEFAULT, tap_ref={f: 1.0 for f in FINGERS})
+
+
+def test_set_calibration_reaches_build_frame(monkeypatch):
+    seen = []
+
+    def spy(hand, t, frame_id, calib, info, lift=None, prev_hand_size=None):
+        seen.append(calib)
+        return fake_build_frame(hand, t, frame_id, calib, info, lift, prev_hand_size)
+
+    monkeypatch.setattr(ls.features, "build_frame", spy)
+    new = calib_with_tap_ref()
+    src = LiveSource(FakeCamera(n=4), FakeTracker([True] * 4), DEFAULT, "right")
+    it = src.frames()
+    next(it)
+    next(it)
+    src.set_calibration(new)
+    list(it)
+    assert seen[:2] == [DEFAULT, DEFAULT]
+    assert seen[2:] == [new, new]
+
+
+def test_set_calibration_rebuilds_lift_when_tap_ref(monkeypatch):
+    built = []
+    monkeypatch.setattr(ls, "LiftEstimator", lambda c, cfg: built.append((c, cfg)) or FakeLift())
+    src = LiveSource(FakeCamera(n=2), FakeTracker([True] * 2), DEFAULT, "right", FakeLift())
+    src.lift_cfg = {"w_angle": 1.0}
+    new = calib_with_tap_ref()
+    src.set_calibration(new)
+    assert built == [(new, {"w_angle": 1.0})]
+    frames = list(src.frames())
+    assert frames[0].fingers["index"].lift == 0.25      # yeni lift kullanılıyor
+
+
+def test_set_calibration_without_tap_ref_drops_lift():
+    src = LiveSource(FakeCamera(n=2), FakeTracker([True] * 2), DEFAULT, "right", FakeLift())
+    src.set_calibration(DEFAULT)
+    assert src._lift is None
+    assert list(src.frames())[0].fingers["index"].lift is None
+
+
+def test_set_calibration_without_lift_stays_without_lift():
+    src = LiveSource(FakeCamera(n=1), FakeTracker([True]), DEFAULT, "right")
+    src.set_calibration(calib_with_tap_ref())
+    assert src._lift is None
+
+
+def test_set_calibration_creates_lift_for_config_built_source(monkeypatch):
+    monkeypatch.setattr(ls, "LiftEstimator", lambda c, cfg: FakeLift())
+    src = LiveSource(FakeCamera(n=1), FakeTracker([True]), DEFAULT, "right")
+    src.lift_cfg = {}
+    src.set_calibration(calib_with_tap_ref())
+    assert isinstance(src._lift, FakeLift)
+
+
 def test_no_lift_leaves_none():
     cam = FakeCamera(n=1)
     (frame,) = LiveSource(cam, FakeTracker([True]), DEFAULT, "right").frames()
@@ -233,6 +290,7 @@ def test_open_live_source_makes_lift_when_tap_ref(tmp_path, monkeypatch):
     monkeypatch.setattr(ls, "LiftEstimator", lambda c, cfg: ("lift", c, cfg))
     src = ls.open_live_source(cfg)
     assert src._lift == ("lift", calib, {"w_angle": 1.0})
+    assert src.lift_cfg == {"w_angle": 1.0}
 
 
 @pytest.mark.camera
