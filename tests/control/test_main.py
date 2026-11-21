@@ -2,7 +2,7 @@ import csv
 import sys
 from threading import Event
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from tests.control.conftest import make_frame
@@ -124,14 +124,46 @@ def test_live_defaults_to_pynput_and_hotkey_toggles_output(monkeypatch):
     ("args", "message"),
     [
         (["--source", "replay"], "--file gerekli"),
-        (["--backend", "native"], "native backend henüz desteklenmiyor"),
+        (["--backend", "native"], "native henüz yok (macos.py, V3 şeridi)"),
     ],
 )
-def test_argument_errors(args, message, capsys):
+def test_argument_errors(args, message, capsys, monkeypatch):
+    monkeypatch.setattr(app, "sys", SimpleNamespace(platform="darwin"))
     with pytest.raises(SystemExit) as error:
         app.main(args)
     assert error.value.code == 2
     assert message in capsys.readouterr().err
+
+
+def test_windows_native_backend_selection(monkeypatch):
+    source = SimpleNamespace(info=None, frames=lambda: iter([make_frame()]), close=Mock())
+    engine = Mock()
+    calls = Mock()
+    keyboard = SimpleNamespace(GlobalHotKeys=calls.hotkeys)
+
+    class FakeWindowsBackend:
+        def __init__(self, *, step_px, smooth):
+            calls.backend_init(step_px, smooth)
+
+        release_all = calls.release_all
+
+    monkeypatch.setattr(app, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(app, "_set_dpi_awareness", calls.dpi)
+    monkeypatch.setattr(app, "_open_source", lambda _: source)
+    monkeypatch.setattr(app, "WindowsBackend", FakeWindowsBackend)
+    monkeypatch.setattr(app, "GestureEngine", lambda *_: engine)
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", keyboard)
+
+    app.main(["--backend", "native", "--source", "synthetic"])
+
+    cfg = load_control_config()
+    assert calls.mock_calls[:2] == [call.dpi(), call.backend_init(cfg["scroll"]["step_px"], True)]
+    calls.hotkeys.assert_called_once()
+    calls.hotkeys.return_value.start.assert_called_once()
+    calls.hotkeys.return_value.stop.assert_called_once()
+    engine.process.assert_called_once()
+    calls.release_all.assert_called_once()
+    source.close.assert_called_once()
 
 
 def test_windows_dpi_awareness(monkeypatch):
