@@ -3,9 +3,11 @@ from unittest.mock import Mock, call
 import pytest
 from tests.control.conftest import make_frame
 
+from tkt.app.config import load_control_config
 from tkt.control import gestures
 from tkt.control.gestures import GestureEngine, Mode
 from tkt.control.os_input.dry_backend import DryBackend
+from tkt.control.sources import SyntheticSource
 from tkt.core.types import FINGERS, SourceInfo
 
 
@@ -14,7 +16,7 @@ def backend_events(backend):
 
 
 @pytest.fixture
-def rig(monkeypatch):
+def rig(monkeypatch, request):
     cfg = {
         "general": {"confidence_min": 0.75, "lost_release_ms": 250},
         "mode": {"lock_ms": 125, "curl_open": 0.25, "curl_closed": 0.625, "freeze_curl_rate": 4},
@@ -28,6 +30,9 @@ def rig(monkeypatch):
         "pointer": {"rollback_ms": 80},
         "scroll": {},
     }
+    if hasattr(request, "param"):
+        cfg["general"]["click_method"] = request.param
+        cfg["tap"] = load_control_config()["tap"]
     info = SourceInfo(schema=1, width=640, height=512, fps=60, hand="right")
     backend = DryBackend()
     monkeypatch.setattr(backend, "release_all", Mock(wraps=backend.release_all))
@@ -301,3 +306,114 @@ def test_brief_hand_loss_stops_scroll_and_rebases_on_return(rig):
     assert engine.mode is Mode.SCROLL
     assert scroll.mock_calls == [call.stop(), call.rebase(), call.update((0.5, 0.4), 0.2, 0.375)]
     assert backend.events == []
+
+
+@pytest.mark.parametrize("rig", ["tap"], indirect=True)
+def test_tap_takeoff_rolls_back_and_landing_rebases_pointer(rig):
+    engine, backend, pointer, scroll = rig
+    lock_pointer(engine)
+    pointer.reset_mock()
+    pointer.rollback.return_value = (-4, 2)
+
+    engine.process(pose(0.25, "index", lift=0.3))
+    assert backend_events(backend) == [("move", -4, 2)]
+    assert pointer.mock_calls == [call.rollback(80)]
+    scroll.stop.assert_called_once()
+
+    engine.process(pose(0.3125, "index", lift=0.8))
+    engine.process(pose(0.34375, "index", lift=None))
+    assert pointer.mock_calls == [call.rollback(80)]
+    assert backend_events(backend) == [("move", -4, 2)]
+
+    engine.process(pose(0.375, "index", lift=0))
+    assert pointer.mock_calls == [
+        call.rollback(80),
+        call.rebase(),
+        call.update((0.5, 0.4), 0.2, 0.375),
+    ]
+    assert backend_events(backend) == [
+        ("move", -4, 2),
+        ("button", "left", True),
+        ("button", "left", False),
+    ]
+
+
+@pytest.mark.parametrize("rig", ["tap"], indirect=True)
+@pytest.mark.parametrize("fingers", [("index",), ("index", "middle")])
+def test_scroll_requires_two_fingers_for_right_tap(rig, fingers):
+    engine, backend, _, scroll = rig
+    source = SyntheticSource().open(2).tap(fingers)
+    for frame in source.frames():
+        engine.process(frame)
+
+    expected = [("button", "right", True), ("button", "right", False)]
+    assert backend_events(backend) == (expected if len(fingers) == 2 else [])
+    scroll.stop.assert_called_once()
+    assert scroll.rebase.call_count == 2
+
+
+@pytest.mark.parametrize("rig", ["tap"], indirect=True)
+def test_leaving_scroll_mid_tap_does_not_restart_inertia(rig):
+    engine, backend, _, scroll = rig
+    engine.process(pose(0, "index", "middle"))
+    engine.process(pose(0.125, "index", "middle"))
+    engine.process(pose(0.25, "index", "middle", lift=0.8))
+    engine.process(pose(0.3125, lift=0.8))
+    engine.process(pose(0.375, lift=0))
+
+    assert engine.mode is Mode.NONE
+    scroll.stop.assert_called_once()
+    scroll.release.assert_not_called()
+    scroll.tick.assert_not_called()
+    assert backend_events(backend) == []
+
+
+@pytest.mark.parametrize(("method", "tap_count"), [("tap", 2), ("both", 2), ("thumb", 0)])
+def test_two_quick_taps_follow_click_method(method, tap_count):
+    source = SyntheticSource().open(1).tap().open(1, s=0.1).tap()
+    cfg = load_control_config()
+    cfg["general"]["click_method"] = method
+    backend = DryBackend()
+    engine = GestureEngine(cfg, backend, source.info)
+    for frame in source.frames():
+        engine.process(frame)
+
+    click = [("button", "left", True), ("button", "left", False)]
+    assert backend_events(backend) == click * tap_count
+
+
+@pytest.mark.parametrize(("rig", "thumb_click"), [("tap", False), ("both", True)], indirect=["rig"])
+@pytest.mark.parametrize("fingers", [("index",), ("index", "middle")])
+def test_thumb_click_with_tap_enabled(rig, thumb_click, fingers):
+    engine, backend, _, _ = rig
+    source = SyntheticSource().open(len(fingers), s=0.3).thumb(True).thumb(False)
+    for frame in source.frames():
+        engine.process(frame)
+    button = "left" if len(fingers) == 1 else "right"
+    expected = [("button", button, True), ("button", button, False)]
+    assert backend_events(backend) == (expected if thumb_click else [])
+
+
+@pytest.mark.parametrize("rig", ["tap"], indirect=True)
+def test_thumb_in_tap_mode_presses_only_after_drag_threshold(rig):
+    engine, backend, pointer, _ = rig
+    lock_pointer(engine)
+    engine.process(pose(0.25, "index", thumb_out=0))
+    engine.process(pose(0.3125, "index", thumb_out=0, index_pos=(0.504, 0.4)))
+    assert not engine.left_down
+    assert backend_events(backend) == []
+
+    engine.process(pose(0.375, "index", thumb_out=0, index_pos=(0.53, 0.4)))
+    assert engine.left_down
+    assert backend_events(backend) == [("button", "left", True)]
+    pointer.update.return_value = (4, 0)
+    engine.process(pose(0.4375, "index", thumb_out=0, index_pos=(0.54, 0.4)))
+    pointer.update.return_value = (0, 0)
+    engine.process(pose(0.5, "index"))
+    engine.process(pose(0.5625, "index"))
+    assert not engine.left_down
+    assert backend_events(backend) == [
+        ("button", "left", True),
+        ("move", 4, 0),
+        ("button", "left", False),
+    ]

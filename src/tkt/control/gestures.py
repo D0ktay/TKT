@@ -10,6 +10,7 @@ from typing import Any
 from tkt.control.os_input.base import InputBackend
 from tkt.control.pointer import PointerMotion
 from tkt.control.scroll import ScrollMotion
+from tkt.control.tap import TapDetector
 from tkt.core.types import FINGERS, Finger, HandFrame, SourceInfo
 
 
@@ -29,6 +30,7 @@ _MODES_BY_FINGERS = {
     ("index", "middle", "ring"): Mode.SWIPE,
     ("index", "middle", "ring", "pinky"): Mode.SWIPE,
 }
+_TAP_FINGERS = {Mode.POINTER: ("index",), Mode.SCROLL: ("index", "middle")}
 
 
 class GestureEngine:
@@ -42,6 +44,7 @@ class GestureEngine:
         general = cfg["general"]
         mode = cfg["mode"]
         thumb = cfg["thumb"]
+        self._click_method = general.get("click_method", "thumb")
         self._confidence_min = general["confidence_min"]
         self._lost_release_s = general["lost_release_ms"] / 1000
         self._lock_s = mode["lock_ms"] / 1000
@@ -58,6 +61,7 @@ class GestureEngine:
         self._backend = backend
         self._pointer = PointerMotion(cfg["pointer"], info)
         self._scroll = ScrollMotion(cfg["scroll"], info)
+        self._tap = TapDetector(cfg) if self._click_method in ("tap", "both") else None
         self._lock = RLock()
         self._reset_state()
 
@@ -84,8 +88,11 @@ class GestureEngine:
             self._update_mode(frame)
             if self.mode is not previous_mode:
                 self._change_mode(previous_mode, frame.t)
+            self._update_tap(frame)
             self._record_palm(frame)
             self._update_thumb(frame)
+            if self._tap_busy:
+                return
             if self.mode is Mode.POINTER:
                 self._move_pointer(index, frame.hand_size, frame.t, curling_fast)
             elif self.mode is Mode.SCROLL:
@@ -113,6 +120,9 @@ class GestureEngine:
         self._previous_index: tuple[float, float] | None = None
         self._pointer_frozen = False
         self._pointer_needs_rebase = True
+        self._tap_busy = False
+        if self._tap is not None:
+            self._tap.reset()
         self._thumb_closed = False
         self._thumb_change_at: float | None = None
         self._drag_origin: tuple[float, float] | None = None
@@ -129,6 +139,7 @@ class GestureEngine:
             self._pointer_needs_rebase = True
             self._thumb_change_at = None
             self._palm_history.clear()
+            self._cancel_active_tap()
             self._stop_scroll()
         if t >= self._lost_until:
             self.release()
@@ -159,13 +170,41 @@ class GestureEngine:
     def _change_mode(self, previous_mode: Mode, t: float) -> None:
         if self.left_down:
             self._release_left()
-        if previous_mode is Mode.SCROLL:
+        self._drag_origin = None
+        if previous_mode is Mode.SCROLL and not self._tap_busy:
             self._scroll.release(t)
             self._scroll_coasting = True
         elif self._scroll_coasting:
             self._stop_scroll()
+        self._cancel_active_tap()
         if self.mode is Mode.SCROLL:
             self._scroll.rebase()
+
+    def _cancel_active_tap(self) -> None:
+        if self._tap is not None and self._tap_busy:
+            self._tap.reset()
+            self._tap_busy = False
+
+    def _update_tap(self, frame: HandFrame) -> None:
+        watched = _TAP_FINGERS.get(self.mode)
+        if self._tap is None or watched is None or any(
+            frame.fingers[name].lift is None for name in watched
+        ):
+            return
+        update = self._tap.update(frame, watched)
+        if update.started:
+            self._send_move(self._pointer.rollback(self._rollback_ms))
+            self._stop_scroll()
+        if update.kind is not None and not self.left_down:
+            button = "left" if update.kind == "tap1" else "right"
+            self._backend.button(button, True)
+            self._backend.button(button, False)
+        if self._tap_busy and not update.busy:
+            self._pointer.rebase()
+            self._pointer_needs_rebase = False
+            if self.mode is Mode.SCROLL:
+                self._scroll.rebase()
+        self._tap_busy = update.busy
 
     def _record_palm(self, frame: HandFrame) -> None:
         self._palm_history.append((frame.t, frame.palm))
@@ -204,15 +243,26 @@ class GestureEngine:
         if not closed:
             if self.left_down:
                 self._release_left()
+            elif self._drag_origin is not None:
+                self._drag_origin = None
+                self._pointer_needs_rebase = True
         elif self.mode is Mode.POINTER:
             self._stop_scroll()
-            self._backend.button("left", True)
-            self.left_down = True
             self._drag_origin = frame.fingers["index"].img
-        elif self.mode is Mode.SCROLL and self._hand_is_still(frame):
+            if self._click_method != "tap":
+                self._press_left()
+        elif (
+            self.mode is Mode.SCROLL
+            and self._click_method != "tap"
+            and self._hand_is_still(frame)
+        ):
             self._stop_scroll()
             self._backend.button("right", True)
             self._backend.button("right", False)
+
+    def _press_left(self) -> None:
+        self._backend.button("left", True)
+        self.left_down = True
 
     def _release_left(self) -> None:
         self._backend.button("left", False)
@@ -235,7 +285,7 @@ class GestureEngine:
         if curling_fast and not self._pointer_frozen:
             self._pointer_frozen = True
             self._pointer_needs_rebase = True
-            if not self.left_down:
+            if not self.left_down and not self._tap_busy:
                 self._send_move(self._pointer.rollback(self._rollback_ms))
         return curling_fast
 
@@ -251,6 +301,8 @@ class GestureEngine:
             drag_distance = self._image_distance(index.img, self._drag_origin)
             if drag_distance < self._drag_threshold * hand_size:
                 return
+            if not self.left_down:
+                self._press_left()
             self._drag_origin = None
             self._pointer_needs_rebase = True
         if self._pointer_needs_rebase:
