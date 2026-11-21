@@ -1,0 +1,49 @@
+[general]
+panic_hotkey = "<ctrl>+<alt>+p"
+click_method = "thumb"      # thumb | tap | both
+confidence_min = 0.5
+lost_release_ms = 300
+
+[mode]
+lock_ms = 70
+curl_open = 0.35
+curl_closed = 0.55
+freeze_curl_rate = 3.0      # 1/sn; işaret curl'ü bundan hızlı artarsa imleç donar
+
+[thumb]
+closed = 0.30
+open = 0.50
+debounce_ms = 30
+drag_threshold = 0.03       # el boyu
+still_ms = 150              # sağ tık için elin durgun olması gereken süre
+
+[pointer]
+min_cutoff = 1.0
+beta = 0.02
+gain_min = 500              # ekran pikseli / el boyu
+gain_max = 2500
+speed_lo = 0.3              # el boyu / sn
+speed_hi = 3.0
+rollback_ms = 100
+gap_reset_ms = 100
+
+[scroll]
+natural = true
+gain = 1500
+axis_lock = 0.5             # baskın olmayan eksen bu oranın altındaysa sıfırlanır
+step_px = 40                # pynput için: bir adım kaç piksel
+inertia_ms = 300
+inertia_min_speed = 200     # piksel / sn
+
+[tap]
+lift_start = 0.25
+lift_up = 0.50
+min_ms = 50
+max_ms = 300
+pair_ms = 80
+max_palm_move = 0.03        # el boyu
+cooldown_ms = 100
+
+[swipe]
+distance = 0.5              # el boyu
+window_ms = 500
