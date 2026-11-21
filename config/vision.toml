@@ -1,7 +1,7 @@
 [camera]
 index = 0
-width = 1280
-height = 720
+width = 640               # LogiInsight NIR akışı: 640x512 isteğinde 60 fps (1280x1024 yalnızca 15 fps)
+height = 512
 fps = 60
 rotate_180 = true
 backend = "auto"          # auto | avfoundation | dshow | pyav
