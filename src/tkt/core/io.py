@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from types import TracebackType
 from typing import IO, Any
@@ -23,9 +24,8 @@ from tkt.core.types import FINGERS, SCHEMA_VERSION, Finger, HandFrame, SourceInf
 
 PROMPT_KINDS = ("tap1", "tap2")
 
-# Dosya boyutunu küçük tutmak için yuvarlama. 1e-5 görüntü birimi 1280 pikselde 0,013 pikseldir.
+# Zaman damgaları mikrosaniye çözünürlüğünde yazılır.
 _T_DIGITS = 6
-_VAL_DIGITS = 5
 
 
 class SchemaError(ValueError):
@@ -45,13 +45,16 @@ class Prompt:
 # --------------------------------------------------------------------------- dönüşümler
 
 
-def _r(x: float) -> float:
-    return round(float(x), _VAL_DIGITS)
+def _finite_float(value: Any, field: str) -> float:
+    result = float(value)
+    if not isfinite(result):
+        raise ValueError(f"{field}: sonlu sayı bekleniyordu")
+    return result
 
 
-def _pair(v: Any) -> tuple[float, float]:
+def _pair(v: Any, field: str) -> tuple[float, float]:
     a, b = v
-    return (float(a), float(b))
+    return (_finite_float(a, field), _finite_float(b, field))
 
 
 def info_to_header(info: SourceInfo) -> dict[str, Any]:
@@ -72,43 +75,59 @@ def header_to_info(d: dict[str, Any], source: str = "<kayıt>") -> SourceInfo:
     if not isinstance(d, dict) or d.get("type") != "header":
         raise SchemaError(f"{source}: ilk satır başlık değil (type='header' bekleniyordu)")
     schema = d.get("schema")
-    if schema != SCHEMA_VERSION:
+    if type(schema) is not int or schema != SCHEMA_VERSION:
         raise SchemaError(
             f"{source}: şema sürümü {schema!r}, desteklenen {SCHEMA_VERSION}. "
             "Kaydı güncel araçla yeniden üretin."
         )
     try:
+        for field in ("width", "height"):
+            value = d[field]
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{field}: pozitif tamsayı bekleniyordu")
+        fps = d["fps"]
+        if type(fps) not in (int, float):
+            raise ValueError("fps: pozitif ve sonlu sayı bekleniyordu")
+        fps = _finite_float(fps, "fps")
+        if fps <= 0:
+            raise ValueError("fps: pozitif sayı bekleniyordu")
+        hand = d["hand"]
+        if hand not in ("right", "left"):
+            raise ValueError("hand: 'right' veya 'left' bekleniyordu")
         return SourceInfo(
-            schema=int(schema),
-            width=int(d["width"]),
-            height=int(d["height"]),
-            fps=float(d["fps"]),
-            hand=str(d["hand"]),
+            schema=schema,
+            width=d["width"],
+            height=d["height"],
+            fps=fps,
+            hand=hand,
             note=str(d.get("note", "")),
         )
-    except (KeyError, TypeError, ValueError) as e:
+    except (KeyError, TypeError, ValueError, OverflowError) as e:
         raise SchemaError(f"{source}: başlık eksik veya bozuk: {e}") from e
 
 
 def frame_to_dict(frame: HandFrame) -> dict[str, Any]:
     """`HandFrame`'i kayıt satırı sözlüğüne çevirir."""
+    # JSON'un float gösterimi, jest eşiklerine yakın değerleri de aynen korur.
     fingers: dict[str, Any] = {}
     for name, f in frame.fingers.items():
         fingers[name] = {
-            "img": [_r(f.img[0]), _r(f.img[1])],
-            "surface": None if f.surface is None else [_r(f.surface[0]), _r(f.surface[1])],
-            "curl": _r(f.curl),
-            "lift": None if f.lift is None else _r(f.lift),
+            "img": [float(f.img[0]), float(f.img[1])],
+            "surface": (
+                None if f.surface is None else [float(f.surface[0]), float(f.surface[1])]
+            ),
+            "curl": float(f.curl),
+            "lift": None if f.lift is None else float(f.lift),
         }
     return {
         "t": round(float(frame.t), _T_DIGITS),
         "frame_id": int(frame.frame_id),
         "present": bool(frame.present),
         "fingers": fingers,
-        "thumb_out": _r(frame.thumb_out),
-        "palm": [_r(frame.palm[0]), _r(frame.palm[1])],
-        "hand_size": _r(frame.hand_size),
-        "confidence": _r(frame.confidence),
+        "thumb_out": float(frame.thumb_out),
+        "palm": [float(frame.palm[0]), float(frame.palm[1])],
+        "hand_size": float(frame.hand_size),
+        "confidence": float(frame.confidence),
     }
 
 
@@ -118,27 +137,42 @@ def frame_from_dict(d: dict[str, Any]) -> HandFrame:
     `present=False` satırlarında eksik alanlar sıfırla doldurulur; bu alanlar okunmaz.
     """
     present = bool(d["present"])
+    finger_rows = d.get("fingers")
+    if finger_rows is None:
+        finger_rows = {}
+    if not isinstance(finger_rows, dict):
+        raise ValueError("fingers: nesne bekleniyordu")
     fingers: dict[str, Finger] = {}
-    for name, f in (d.get("fingers") or {}).items():
+    for name, f in finger_rows.items():
         if name not in FINGERS:
             raise ValueError(f"bilinmeyen parmak adı: {name!r}")
+        if not isinstance(f, dict):
+            raise ValueError(f"fingers.{name}: nesne bekleniyordu")
         surface = f.get("surface")
         lift = f.get("lift")
         fingers[name] = Finger(
-            img=_pair(f["img"]),
-            surface=None if surface is None else _pair(surface),
-            curl=float(f["curl"]),
-            lift=None if lift is None else float(lift),
+            img=_pair(f["img"], f"{name}.img"),
+            surface=None if surface is None else _pair(surface, f"{name}.surface"),
+            curl=_finite_float(f["curl"], f"{name}.curl"),
+            lift=None if lift is None else _finite_float(lift, f"{name}.lift"),
         )
+    if present:
+        missing = [name for name in FINGERS if name not in fingers]
+        if missing:
+            raise ValueError(f"eksik parmaklar: {', '.join(missing)}")
+
+    confidence = _finite_float(d.get("confidence", 0.0), "confidence")
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError("confidence: 0–1 arasında olmalı")
     return HandFrame(
-        t=float(d["t"]),
+        t=_finite_float(d["t"], "t"),
         frame_id=int(d["frame_id"]),
         present=present,
         fingers=fingers if present else {},
-        thumb_out=float(d.get("thumb_out", 0.0)),
-        palm=_pair(d.get("palm", (0.0, 0.0))),
-        hand_size=float(d.get("hand_size", 0.0)),
-        confidence=float(d.get("confidence", 0.0)),
+        thumb_out=_finite_float(d.get("thumb_out", 0.0), "thumb_out"),
+        palm=_pair(d.get("palm", (0.0, 0.0)), "palm"),
+        hand_size=_finite_float(d.get("hand_size", 0.0), "hand_size"),
+        confidence=confidence,
     )
 
 
@@ -205,37 +239,37 @@ def write_recording(path: str | Path, info: SourceInfo, frames: Iterable[HandFra
 # --------------------------------------------------------------------------- kayıt okuma
 
 
+def _parse_recording_header(first: str, path: Path) -> SourceInfo:
+    if not first.strip():
+        raise SchemaError(f"{path}: dosya boş")
+    try:
+        d = json.loads(first)
+    except json.JSONDecodeError as e:
+        raise SchemaError(f"{path}: başlık JSON değil: {e}") from e
+    # header_to_info ham kayıt dönüştürücüsü tarafından da kullanılır.
+    if isinstance(d, dict) and d.get("raw") is True:
+        raise SchemaError(f"{path}: ham kayıt; --from-raw ile dönüştürün")
+    return header_to_info(d, str(path))
+
+
 def read_header(path: str | Path) -> SourceInfo:
     """Yalnızca başlığı okur."""
     p = Path(path)
     with p.open("r", encoding="utf-8") as fh:
-        first = fh.readline()
-    if not first.strip():
-        raise SchemaError(f"{p}: dosya boş")
-    try:
-        d = json.loads(first)
-    except json.JSONDecodeError as e:
-        raise SchemaError(f"{p}: başlık JSON değil: {e}") from e
-    return header_to_info(d, str(p))
+        return _parse_recording_header(fh.readline(), p)
 
 
 def iter_frames(path: str | Path) -> Iterator[HandFrame]:
     """Kareleri sırayla üretir. Başlığı doğrular, boş satırları atlar."""
     p = Path(path)
     with p.open("r", encoding="utf-8") as fh:
-        first = fh.readline()
-        if not first.strip():
-            raise SchemaError(f"{p}: dosya boş")
-        try:
-            header_to_info(json.loads(first), str(p))
-        except json.JSONDecodeError as e:
-            raise SchemaError(f"{p}: başlık JSON değil: {e}") from e
+        _parse_recording_header(fh.readline(), p)
         for lineno, line in enumerate(fh, start=2):
             if not line.strip():
                 continue
             try:
                 yield frame_from_dict(json.loads(line))
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            except (KeyError, TypeError, ValueError, OverflowError) as e:
                 raise RecordFormatError(f"{p}:{lineno}: kare okunamadı: {e}") from e
 
 
