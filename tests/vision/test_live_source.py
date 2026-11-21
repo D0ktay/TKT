@@ -128,7 +128,14 @@ def test_prev_hand_size_passed_and_reset_when_absent():
     assert sizes == [-1.0, 0.0, 0.0, -1.0]
 
 
-def test_processing_time_and_fps_exposed():
+def test_processing_time_and_fps_exposed(monkeypatch):
+    # Windows'ta monotonic saat ~15 ms çözünürlüklü; hızlı sahte karelerde süre 0 görünür.
+    import itertools
+
+    import tkt.vision.live_source as ls
+
+    clock = itertools.count(1000.0, 0.01)
+    monkeypatch.setattr(ls.time, "monotonic", lambda: next(clock))
     cam = FakeCamera(n=5)
     src = LiveSource(cam, FakeTracker([True] * 5), DEFAULT, "right")
     assert src.last_process_ms == 0.0 and src.process_fps() == 0.0
