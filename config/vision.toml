@@ -1,0 +1,22 @@
+[camera]
+index = 0
+width = 640               # LogiInsight NIR akışı: 640x512 isteğinde 60 fps (1280x1024 yalnızca 15 fps)
+height = 512
+fps = 60
+rotate_180 = true
+backend = "auto"          # auto | avfoundation | dshow | pyav
+
+[tracker]
+model = "models/hand_landmarker.task"
+min_detection = 0.5
+min_tracking = 0.5
+
+[hand]
+side = "right"
+calibration = "~/.tkt/calibration.json"
+
+[lift]
+w_angle = 1.0
+w_length = 1.0
+baseline_s = 1.0
+curl_rate_suppress = 3.0  # 1/sn; curl bundan hızlı artıyorsa lift bastırılır
