@@ -20,6 +20,7 @@ from tkt.vision.tracker import RawHand
 WRIST = 0
 THUMB_TIP = 4
 INDEX_MCP = 5
+INDEX_PIP = 6
 MIDDLE_MCP = 9
 
 # Parmak adı → (kök, orta eklem, uç eklem, uç) nokta numaraları.
@@ -79,21 +80,21 @@ def curl_raw(hand: RawHand, finger: str, aspect: float = 1.0) -> float:
     return _flexion(p[mcp], p[pip], p[dip]) + _flexion(p[pip], p[dip], p[tip])
 
 
-def _world_hand_size(hand: RawHand) -> float:
-    p = np.asarray(hand.world_pts, dtype=float)
-    return float(np.linalg.norm(p[MIDDLE_MCP] - p[WRIST]))
+def thumb_raw(hand: RawHand, aspect: float = 1.0) -> float:
+    """Görüntüde başparmak ucu ile işaret orta eklemi arası mesafe, el boyuna oranlı (2B).
 
+    El boyu: görüntüde bilek (0) ile orta parmak kökü (9) arası. `aspect` = görüntü
+    genişliği / yüksekliği; mesafeler piksel uzayında ölçülür.
 
-def thumb_raw(hand: RawHand) -> float:
-    """Başparmak ucu ile işaret kökü arası 3D mesafe, el boyuna oranlı.
-
-    El boyu: dünya noktalarında bilek (0) ile orta parmak kökü (9) arası mesafe.
+    Dünya (3B) noktaları ve işaret kökü yerine görüntü noktaları ve işaret orta eklemi
+    kullanılır: kayıtlarda bu ölçünün açık-kapalı aralığı kare-kare titremesine göre ~1,6 kat
+    daha geniş (2026-11-21).
     """
-    p = np.asarray(hand.world_pts, dtype=float)
-    size = _world_hand_size(hand)
+    p = np.asarray(hand.image_pts, dtype=float) * (float(aspect), 1.0)
+    size = float(np.linalg.norm(p[MIDDLE_MCP] - p[WRIST]))
     if size < _EPS:
         return 0.0
-    return float(np.linalg.norm(p[THUMB_TIP] - p[INDEX_MCP])) / size
+    return float(np.linalg.norm(p[THUMB_TIP] - p[INDEX_PIP])) / size
 
 
 def _normalize(raw: float, lo: float, hi: float) -> float:
@@ -170,7 +171,7 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
             lift=lift_v,
         )
 
-    thumb_out = _normalize(thumb_raw(hand), calib.thumb_closed, calib.thumb_open)
+    thumb_out = _normalize(thumb_raw(hand, aspect), calib.thumb_closed, calib.thumb_open)
     palm_xy = img[list(PALM_POINTS)].mean(axis=0)
     hand_size = _hand_size_img(img, info)
 

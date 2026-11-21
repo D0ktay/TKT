@@ -151,15 +151,27 @@ def test_degenerate_calibration_does_not_divide_by_zero():
 # --------------------------------------------------------------------------- thumb
 
 
-def test_thumb_raw_is_distance_over_hand_size():
+def test_thumb_raw_is_image_distance_to_index_pip_over_hand_size():
     hand = make_hand(thumb_dist=0.045)
-    hand_size = 0.09  # bilek–orta kök
-    assert thumb_raw(hand) == pytest.approx(0.045 / hand_size, rel=1e-6)
+    # Görüntüde uç işaret kökünün 0,045 solunda, işaret orta eklemi kökün 0,04 önünde;
+    # el boyu (bilek–orta kök) 0,09. aspect ile x piksel uzayına ölçeklenir.
+    assert thumb_raw(hand) == pytest.approx(math.hypot(0.045, 0.04) / 0.09, rel=1e-6)
+    assert thumb_raw(hand, ASPECT) == pytest.approx(
+        math.hypot(0.045 * ASPECT, 0.04) / 0.09, rel=1e-6)
+
+
+def test_thumb_raw_uses_image_points_not_world():
+    hand = make_hand(thumb_dist=0.05)
+    broken = RawHand(image_pts=hand.image_pts, world_pts=hand.world_pts * 0.0,
+                     score=hand.score)
+    assert thumb_raw(broken) == pytest.approx(thumb_raw(hand), rel=1e-12)
 
 
 def test_thumb_raw_scale_invariant():
     hand = make_hand(thumb_dist=0.05)
-    big = RawHand(image_pts=hand.image_pts, world_pts=hand.world_pts * 1.3, score=hand.score)
+    img = hand.image_pts
+    big = RawHand(image_pts=(img - img[0]) * 1.3 + img[0], world_pts=hand.world_pts,
+                  score=hand.score)
     assert thumb_raw(big) == pytest.approx(thumb_raw(hand), rel=1e-9)
 
 

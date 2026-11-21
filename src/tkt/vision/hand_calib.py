@@ -29,14 +29,13 @@ class HandCalibration:
 # kişiye göre yeniler.
 # - curl_raw (orta + uç eklem bükülmesi, radyan, görüntü noktaları): açık elde eklemler
 #   neredeyse düz (~0,2); yumrukta ~3,0 (kayıtta kıvrık parmak 2,6–2,9 ölçüldü).
-# - thumb_raw (başparmak ucu–işaret kökü / bilek–orta kök, dünya noktaları): ele yapışık
-#   başparmağın ucu işaret parmağının ilk boğumu yanındadır (~2–3 cm / ~9 cm ≈ 0,35);
-#   serbest başparmakta uç kökten ~7 cm uzaktadır (≈ 0,8).
+# - thumb_raw (görüntüde başparmak ucu–işaret orta eklemi / bilek–orta kök): kayıtlarda
+#   ele yapışık başparmak ~0,35–0,5, açık ~0,9–1,4.
 DEFAULT: HandCalibration = HandCalibration(
     open_ref={"index": 0.2, "middle": 0.2, "ring": 0.2, "pinky": 0.2},
     fist_ref={"index": 3.0, "middle": 3.0, "ring": 3.0, "pinky": 3.0},
-    thumb_closed=0.35,
-    thumb_open=0.8,
+    thumb_closed=0.45,
+    thumb_open=1.1,
     tap_ref=None,
 )
 
@@ -123,8 +122,8 @@ def fit_hand(open_s: list[RawHand], fist_s: list[RawHand],
         open_ref[finger] = o
         fist_ref[finger] = f
 
-    thumb_open = _median([thumb_raw(h) for h in open_s])
-    thumb_closed = _median([thumb_raw(h) for h in thumb_closed_s])
+    thumb_open = _median([thumb_raw(h, aspect) for h in open_s])
+    thumb_closed = _median([thumb_raw(h, aspect) for h in thumb_closed_s])
     if not thumb_open > thumb_closed:
         raise ValueError(
             f"fit_hand: açık başparmak ({thumb_open:.3f}) kapalıdan ({thumb_closed:.3f}) "
