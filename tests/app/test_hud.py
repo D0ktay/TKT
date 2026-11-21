@@ -103,3 +103,11 @@ def test_hud_draws_and_quits_on_q():
         h.show(next(it), engine(Mode.POINTER), 0.0, False)
     assert shown == [(hud.WINDOW_NAME, (48, 64, 3))] * 2
     assert img.sum() == 0                 # girdi görüntü değişmez
+
+
+def test_status_dictation_shown_even_when_lifted_and_action_labels():
+    clock = Clock()
+    tap = ActionTap(DryBackend(), clock)
+    tap.system_action("dictation_submit")
+    st = status(frame(confidence=0.0), engine(Mode.DICTATE), tap, 0.1, 0.5, False)
+    assert st.label.startswith("DIKTE") and st.action == "GONDER (Enter)"

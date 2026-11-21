@@ -286,3 +286,14 @@ def test_dictation_uses_menu_toggle(quartz, monkeypatch, name, start):
     MacBackend().system_action(name)
     assert seen == [start]
     assert quartz.posted == []
+
+
+def test_dictation_submit_stops_then_presses_return(quartz, monkeypatch):
+    from tkt.control.os_input import dictation, mac_dictation
+
+    seen = []
+    monkeypatch.setattr(mac_dictation, "toggle", lambda s: seen.append(s))
+    monkeypatch.setattr(dictation, "submit_later", lambda stop, enter: (stop(), enter()))
+    MacBackend().system_action("dictation_submit")
+    assert seen == [False]
+    assert [(e.keycode, e.down) for e in quartz.posted] == [(36, True), (36, False)]

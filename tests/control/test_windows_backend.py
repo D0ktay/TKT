@@ -151,3 +151,14 @@ def test_latency_excludes_accumulated_scroll(monkeypatch, user32):
     assert timed.sent_t is None
     timed.scroll(20, 0)
     assert timed.sent_t == pytest.approx(10.02)
+
+
+def test_dictation_submit_win_h_then_enter(user32, monkeypatch):
+    from tkt.control.os_input import dictation
+
+    monkeypatch.setattr(dictation, "submit_later", lambda stop, enter: (stop(), enter()))
+    backend = windows.WindowsBackend(step_px=40)
+    backend.system_action("dictation_submit")
+    packets = [send.args[1].contents for send in user32.SendInput.call_args_list]
+    keys = [(p.data.ki.wVk, p.data.ki.dwFlags & 2) for p in packets]
+    assert keys == [(0x5B, 0), (0x48, 0), (0x48, 2), (0x5B, 2), (0x0D, 0), (0x0D, 2)]

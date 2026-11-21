@@ -626,7 +626,7 @@ def test_pinky_only_starts_dictation_and_fist_stops_it(rig):
     engine.process(pose(0.25))                              # yumruk
     assert engine.mode is Mode.NONE
     assert backend_events(backend) == [("system", "dictation_start"),
-                                       ("system", "dictation_stop")]
+                                       ("system", "dictation_submit")]
 
 
 def test_release_stops_dictation(rig):
@@ -637,3 +637,26 @@ def test_release_stops_dictation(rig):
     assert backend_events(backend)[-1] == ("system", "dictation_stop")
     engine.release()                                        # ikinci kez durdurmaz
     assert backend_events(backend).count(("system", "dictation_stop")) == 1
+
+
+def test_dictation_works_with_hand_lifted(rig):
+    """Güven 0 (el masadan kalkık) iken de serçe dikteyi açar, yumruk gönderir."""
+    engine, backend, _, _ = rig
+    engine.process(pose(0, "pinky", confidence=0.0))
+    engine.process(pose(0.125, "pinky", confidence=0.0))
+    assert engine.mode is Mode.DICTATE
+    engine.process(pose(0.5, "pinky", confidence=0.0))      # 300 ms+ havada: kapanmaz
+    assert engine.mode is Mode.DICTATE
+    engine.process(pose(0.6, confidence=0.0))               # havada yumruk
+    assert backend_events(backend) == [("system", "dictation_start"),
+                                       ("system", "dictation_submit")]
+
+
+def test_low_confidence_pointer_pose_still_counts_as_missing(rig):
+    engine, backend, pointer, _ = rig
+    lock_pointer(engine)
+    pointer.reset_mock()
+    engine.process(pose(0.25, "index", confidence=0.0, index_pos=(0.9, 0.9)))
+    pointer.update.assert_not_called()
+    engine.process(pose(0.5, "pinky", confidence=0.0))      # imleç modu kilitli: dikte değil
+    assert engine.mode is not Mode.DICTATE

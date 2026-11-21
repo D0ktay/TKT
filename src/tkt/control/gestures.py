@@ -77,7 +77,8 @@ class GestureEngine:
     def process(self, frame: HandFrame) -> None:
         """Bir el karesini işle."""
         with self._lock:
-            if not frame.present or frame.confidence < self._confidence_min:
+            reliable = frame.present and frame.confidence >= self._confidence_min
+            if not reliable and not self._dictation_frame(frame):
                 self._process_missing_hand(frame.t)
                 return
 
@@ -178,6 +179,22 @@ class GestureEngine:
             self._cancel_active_tap()
             self._stop_scroll()
 
+    def _dictation_frame(self, frame: HandFrame) -> bool:
+        """Güveni düşük (ör. el masadan kalkık) ama görünen kare dikte için işlensin mi.
+
+        El havadayken de dikte açılıp kapanabilsin: dikte modundayken (yumruğu görmek için)
+        veya mod boştayken yalnız serçe açıksa. Diğer modlarda düşük güvenli kare imleci
+        oynatmasın diye "el yok" sayılmaya devam eder.
+        """
+        if not frame.present or not frame.fingers:
+            return False
+        if self.mode is Mode.DICTATE:
+            return True
+        if self.mode not in (Mode.NONE, Mode.WAIT):
+            return False
+        opened = tuple(n for n in FINGERS if frame.fingers[n].curl < self._curl_open)
+        return _MODES_BY_FINGERS.get(opened) is Mode.DICTATE
+
     def _loss_expired(self, t: float) -> bool:
         last = self._last_reliable_t
         return last is not None and t >= last + self._lost_release_s
@@ -206,7 +223,8 @@ class GestureEngine:
 
     def _change_mode(self, previous_mode: Mode, t: float) -> None:
         if previous_mode is Mode.DICTATE:
-            self._backend.system_action("dictation_stop")
+            # Dikte modundan yalnız yumrukla çıkılır: söyleneni gönder (dikte dur + Enter).
+            self._backend.system_action("dictation_submit")
         if self.mode is Mode.DICTATE:
             self._backend.system_action("dictation_start")
         self._reset_swipe()

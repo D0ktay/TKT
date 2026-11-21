@@ -46,6 +46,13 @@ _MODE_LABELS = {
 }
 
 
+_ACTION_LABELS = {
+    "dictation_start": "DIKTE ACILDI",
+    "dictation_stop": "DIKTE KAPANDI",
+    "dictation_submit": "GONDER (Enter)",
+}
+
+
 class HudClosed(Exception):
     """Kullanıcı HUD penceresinde q/ESC'ye bastı."""
 
@@ -91,7 +98,7 @@ class ActionTap:
 
     def system_action(self, name: str) -> None:
         self._backend.system_action(name)
-        self._set(f"SISTEM: {name}")
+        self._set(_ACTION_LABELS.get(name, f"SISTEM: {name}"))
 
     def release_all(self) -> None:
         self._backend.release_all()
@@ -128,6 +135,9 @@ def status(frame: HandFrame, engine: GestureEngine, tap: ActionTap, now: float,
         return Status("DURAKLATILDI (Ctrl+Alt+P)", _ORANGE, action, fingers)
     if not frame.present:
         return Status("EL YOK", _RED, action, fingers)
+    if engine.mode is Mode.DICTATE:            # el havadayken de dikte sürer
+        label, color = _MODE_LABELS[Mode.DICTATE]
+        return Status(label, color, action, fingers)
     if frame.confidence <= 0.0:
         return Status("EL KALKIK", _ORANGE, action, fingers)
     if frame.confidence < confidence_min:

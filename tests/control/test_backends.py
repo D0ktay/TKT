@@ -166,3 +166,33 @@ def test_mac_dictation_toggle_runs_osascript_without_blocking():
     assert a1[:2] == ["osascript", "-e"] and a1[3] == "start" and a2[3] == "stop"
     assert "Dikte" in a1[2] and "Dictation" in a1[2]
     assert kw1["stdout"] is not None and kw1["stderr"] is not None
+
+
+def test_dictation_submit_stops_then_waits_then_enter():
+    from tkt.control.os_input import dictation
+
+    log = []
+
+    class Proc:
+        def wait(self, timeout):
+            log.append(("wait", timeout))
+
+    dictation.submit_later(lambda: log.append("stop") or Proc(), lambda: log.append("enter"),
+                           delay=0.6, background=False, sleep=lambda s: log.append(("sleep", s)))
+    assert log == ["stop", ("wait", dictation.STOP_WAIT_S), ("sleep", 0.6), "enter"]
+
+
+def test_pynput_dictation_submit_presses_enter_after_stop(pynput_backend, monkeypatch):
+    from tkt.control.os_input import dictation, mac_dictation
+
+    backend, _, keyboard = pynput_backend
+    monkeypatch.setattr(backend._keys, "enter", "enter", raising=False)
+    seen = []
+    monkeypatch.setattr(mac_dictation, "toggle", lambda s: seen.append(s))
+    monkeypatch.setattr(dictation, "submit_later",
+                        lambda stop, enter: (stop(), enter()))
+    monkeypatch.setattr(
+        "tkt.control.os_input.pynput_backend.sys", SimpleNamespace(platform="darwin"))
+    backend.system_action("dictation_submit")
+    assert seen == [False]
+    assert keyboard.mock_calls == [call.press("enter"), call.release("enter")]
