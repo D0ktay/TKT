@@ -143,8 +143,24 @@ def test_pynput_dictation_shortcuts(pynput_backend, monkeypatch, action):
     monkeypatch.setattr("tkt.control.os_input.pynput_backend.time.sleep", lambda s: None)
     monkeypatch.setattr(
         "tkt.control.os_input.pynput_backend.sys", SimpleNamespace(platform="darwin"))
+    posted = []
+    fake_q = SimpleNamespace(
+        kCGEventSourceStateHIDSystemState=1, kCGEventFlagsChanged=12,
+        kCGKeyboardEventKeycode=9, kCGEventFlagMaskControl=0x40000, kCGHIDEventTap=0,
+        CGEventSourceCreate=lambda state: "src",
+        CGEventCreate=lambda src: SimpleNamespace(fields={}),
+        CGEventSetType=lambda e, k: setattr(e, "kind", k),
+        CGEventSetIntegerValueField=lambda e, f, v: e.fields.__setitem__(f, v),
+        CGEventSetFlags=lambda e, fl: setattr(e, "flags", fl),
+        CGEventPost=lambda tap, e: posted.append(e),
+    )
+    monkeypatch.setitem(sys.modules, "Quartz", fake_q)
     backend.system_action(action)
-    assert keyboard.mock_calls == [call.press("ctrl"), call.release("ctrl")] * 2
+    assert keyboard.mock_calls == []          # macOS'ta pynput klavyesi kullanılmaz
+    assert [(e.kind, e.fields[9], e.flags) for e in posted] == [
+        (12, 59, 0x40001), (12, 59, 0)] * 2
+    assert backend.events_sent == 4
+    backend.events_sent = 0
     keyboard.reset_mock()
     monkeypatch.setattr(
         "tkt.control.os_input.pynput_backend.sys", SimpleNamespace(platform="win32"))

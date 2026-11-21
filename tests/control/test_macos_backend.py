@@ -19,6 +19,9 @@ class FakeQuartz:
     kCGScrollEventUnitPixel = 0
     kCGHIDEventTap = 0
     kCGEventFlagMaskControl = 0x40000
+    kCGEventFlagsChanged = 12
+    kCGKeyboardEventKeycode = 9
+    kCGEventSourceStateHIDSystemState = 1
 
     def __init__(self, pos=(100.0, 100.0), displays=((0, 0, 1000, 800),)):
         self.pos = pos
@@ -27,6 +30,12 @@ class FakeQuartz:
 
     def CGEventCreate(self, source):
         return SimpleNamespace(kind="probe", pos=self.pos, fields={})
+
+    def CGEventSourceCreate(self, state):
+        return ("source", state)
+
+    def CGEventSetType(self, event, kind):
+        event.kind = kind
 
     def CGEventGetLocation(self, event):
         return SimpleNamespace(x=self.pos[0], y=self.pos[1])
@@ -272,5 +281,7 @@ def test_failed_mouse_up_stays_pressed_for_release_retry(monkeypatch, quartz):
 def test_dictation_double_taps_control(quartz, monkeypatch, name):
     monkeypatch.setattr("tkt.control.os_input.macos.time.sleep", lambda s: None)
     MacBackend().system_action(name)
-    assert [(e.keycode, e.down) for e in quartz.posted] == [(59, True), (59, False)] * 2
-    assert [e.flags for e in quartz.posted] == [quartz.kCGEventFlagMaskControl, 0] * 2
+    posted = quartz.posted
+    assert [e.kind for e in posted] == [quartz.kCGEventFlagsChanged] * 4
+    assert [e.fields[quartz.kCGKeyboardEventKeycode] for e in posted] == [59] * 4
+    assert [e.flags for e in posted] == [quartz.kCGEventFlagMaskControl | 1, 0] * 2

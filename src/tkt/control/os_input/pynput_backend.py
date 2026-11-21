@@ -7,8 +7,6 @@ from math import isfinite, trunc
 
 # Sistem diktesini aç/kapat eylemleri (ikisi de aynı kısayolu gönderir).
 DICTATION_ACTIONS = ("dictation_start", "dictation_stop")
-# macOS "Control tuşuna iki kez bas" kısayolunda iki basış arası (sn).
-DICTATION_TAP_GAP_S = 0.05
 
 
 class PynputBackend:
@@ -82,11 +80,17 @@ class PynputBackend:
     def _dictation_toggle(self) -> None:
         """Sistem diktesini aç/kapat: macOS Control'e iki kez, Windows Win+H."""
         if sys.platform == "darwin":
-            for i in range(2):
-                if i:
-                    time.sleep(DICTATION_TAP_GAP_S)
-                self._key(self._keys.ctrl, True)
-                self._key(self._keys.ctrl, False)
+            # pynput Control'ü sıradan tuş olayı olarak gönderir; macOS çift basışı
+            # algılamaz. Bayrak değişimi olayları Quartz ile gönderilir.
+            import Quartz  # type: ignore[import-not-found]
+
+            from tkt.control.os_input.macos import post_control_double_tap
+
+            def post(event) -> None:
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+                self.events_sent += 1
+
+            post_control_double_tap(Quartz, post, time.sleep)
         elif sys.platform == "win32":
             with ExitStack() as releases:
                 for k in (self._keys.cmd, "h"):
