@@ -24,6 +24,17 @@ from tkt.vision.tracker import HandTracker, RawHand
 # process_fps() bu kadar saniyelik pencerede sayar.
 _FPS_WINDOW_S = 2.0
 
+# LiftEstimator'ın config'ten okuduğu anahtarlar ([lift]); doğrudan verilen tahmincinin
+# ayarlarını set_calibration'da korumak için kullanılır.
+_LIFT_KEYS = ("w_angle", "w_length", "baseline_s", "curl_rate_suppress")
+
+
+def _lift_settings(lift: object) -> dict[str, float] | None:
+    """Tahmincinin [lift] ayarlarını okur; eksikse (sahte tahminci) None."""
+    if lift is None or not all(hasattr(lift, k) for k in _LIFT_KEYS):
+        return None
+    return {k: getattr(lift, k) for k in _LIFT_KEYS}
+
 
 class LiveSource:
     """HandFrameSource: kamera + tracker + ölçümler. El yokken de kare üretir.
@@ -46,6 +57,8 @@ class LiveSource:
         self._lift = lift
         # `set_calibration` lift'i yeniden kurarken bunu kullanır; open_live_source doldurur.
         self.lift_cfg: Mapping | None = None
+        # lift_cfg yoksa kurulumda verilen tahmincinin ayarları kullanılır.
+        self._lift_settings = _lift_settings(lift)
         self._calib_lock = threading.Lock()
         self._closed = False
         self._proc_times: deque[float] = deque()
@@ -83,12 +96,16 @@ class LiveSource:
         """Sonraki karelerden itibaren yeni kalibrasyonu kullanır (başka thread'den çağrılabilir).
 
         Lift varsa ve `calib.tap_ref` doluysa LiftEstimator yeni kalibrasyonla yeniden kurulur;
-        `tap_ref` yoksa lift kapanır (None). Config'ten kurulmuş kaynakta (`lift_cfg` dolu)
-        ilk kalibrasyonda lift yoksa da `tap_ref` gelince kurulur.
+        `tap_ref` yoksa lift kapanır (None). Lift ayarları `lift_cfg`'den, o yoksa kurulumda
+        verilen tahmincinin ayarlarından alınır; ayar bilinen kaynakta lift kapalıyken de
+        `tap_ref` gelince kurulur.
         """
+        cfg = self.lift_cfg if self.lift_cfg is not None else self._lift_settings
         lift = None
-        if calib.tap_ref is not None and (self._lift is not None or self.lift_cfg is not None):
-            lift = LiftEstimator(calib, self.lift_cfg if self.lift_cfg is not None else {})
+        if calib.tap_ref is not None and cfg is not None:
+            lift = LiftEstimator(calib, cfg)
+        elif calib.tap_ref is not None and self._lift is not None:
+            raise ValueError("lift ayarları bilinmiyor: LiveSource.lift_cfg verin")
         with self._calib_lock:
             self._calib = calib
             self._lift = lift
@@ -157,19 +174,22 @@ def open_live_source(config_path: str | Path = "config/vision.toml") -> LiveSour
 
     # Model yoksa kamerayı açmadan hata ver.
     tracker = HandTracker(trk_cfg["model"], trk_cfg["min_detection"], trk_cfg["min_tracking"])
-    camera = Camera(
-        cam_cfg["index"], cam_cfg["width"], cam_cfg["height"], cam_cfg["fps"],
-        cam_cfg.get("rotate_180", True), cam_cfg.get("backend", "auto"))
-
-    calib_path = Path(hand_cfg["calibration"]).expanduser()
-    calib = hand_calib.load(calib_path) or hand_calib.DEFAULT
-    lift = LiftEstimator(calib, cfg["lift"]) if calib.tap_ref is not None else None
-
+    camera: Camera | None = None
     try:
+        camera = Camera(
+            cam_cfg["index"], cam_cfg["width"], cam_cfg["height"], cam_cfg["fps"],
+            cam_cfg.get("rotate_180", True), cam_cfg.get("backend", "auto"))
+
+        calib_path = Path(hand_cfg["calibration"]).expanduser()
+        calib = hand_calib.load(calib_path) or hand_calib.DEFAULT
+        lift = LiftEstimator(calib, cfg["lift"]) if calib.tap_ref is not None else None
+
         source = LiveSource(camera, tracker, calib, hand_cfg["side"], lift)
         source.lift_cfg = cfg["lift"]
         return source
     except BaseException:
-        camera.close()
+        # Kurulum yarıda kaldı: sahiplik henüz kimseye geçmedi, açılanları kapat.
+        if camera is not None:
+            camera.close()
         tracker.close()
         raise

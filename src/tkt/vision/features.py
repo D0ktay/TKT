@@ -166,7 +166,10 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
     palm_xy = img[list(PALM_POINTS)].mean(axis=0)
     hand_size = _hand_size_img(img, info)
 
-    confidence = min(1.0, max(0.0, float(hand.score)))
+    # Güven: el bulunduysa taban 1.0; yalnızca geometrik cezalar uygulanır (kenar,
+    # hand_size sıçraması). `hand.score` kullanılmaz: MediaPipe el varlığı skoru vermez ve
+    # sağ/sol skoru aynı geometride 0.5–1.0 arasında oynar (bkz. RawHand).
+    confidence = 1.0
     confidence *= _edge_factor(img, info)
     if prev_hand_size is not None and prev_hand_size > _EPS:
         if abs(hand_size / prev_hand_size - 1.0) > HAND_SIZE_JUMP:

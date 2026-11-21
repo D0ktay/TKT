@@ -25,9 +25,18 @@ DEFAULT_MODEL_PATH = "models/hand_landmarker.task"
 
 @dataclass(frozen=True)
 class RawHand:
+    """Tek karede bulunan elin ham noktaları.
+
+    `score`: el varlığı. MediaPipe Tasks 0.10.21 `HandLandmarkerResult` el varlığı skoru
+    vermez (yalnızca `min_hand_presence_confidence` eşiğinde kullanır); bulunan el için
+    tracker 1.0 yazar. MediaPipe'ın sağ/sol (handedness) skoru kullanılmaz, çünkü aynı
+    geometride 0.5–1.0 arasında oynar. Eski kayıtlarda bu alan handedness skoru taşıyabilir;
+    `features.build_frame` güveni hesaplarken bu alanı okumaz.
+    """
+
     image_pts: np.ndarray    # (21, 2), 0–1, kullanıcı bakışı
     world_pts: np.ndarray    # (21, 3), metre
-    score: float
+    score: float             # el bulunduysa 1.0 (bkz. sınıf açıklaması)
 
 
 class HandTracker:
@@ -75,10 +84,8 @@ class HandTracker:
         wl = result.hand_world_landmarks[0]
         image_pts = np.array([[p.x, p.y] for p in lm], dtype=np.float64)
         world_pts = np.array([[p.x, p.y, p.z] for p in wl], dtype=np.float64)
-        score = 1.0
-        if result.handedness and result.handedness[0]:
-            score = float(result.handedness[0][0].score)
-        return RawHand(image_pts=image_pts, world_pts=world_pts, score=score)
+        # El varlığı skoru sonuçta yok; handedness skoru el varlığı değildir (bkz. RawHand).
+        return RawHand(image_pts=image_pts, world_pts=world_pts, score=1.0)
 
     def close(self) -> None:
         landmarker, self._landmarker = self._landmarker, None

@@ -19,11 +19,11 @@ class _Cat:
 
 
 class _Result:
-    def __init__(self, present):
+    def __init__(self, present, handedness_score=0.9):
         if present:
             self.hand_landmarks = [[_P(i / 40, i / 50) for i in range(21)]]
             self.hand_world_landmarks = [[_P(i / 100, i / 200, -i / 300) for i in range(21)]]
-            self.handedness = [[_Cat(0.9)]]
+            self.handedness = [[_Cat(handedness_score)]]
         else:
             self.hand_landmarks, self.hand_world_landmarks, self.handedness = [], [], []
 
@@ -68,8 +68,15 @@ def test_process_returns_rawhand_shapes():
     h = t.process(IMG, 1.0)
     assert isinstance(h, RawHand)
     assert h.image_pts.shape == (21, 2) and h.world_pts.shape == (21, 3)
-    assert h.score == pytest.approx(0.9)
+    assert h.score == 1.0          # el bulundu; handedness skoru kullanılmaz
     assert h.image_pts[20, 0] == pytest.approx(0.5)
+
+
+def test_score_does_not_depend_on_handedness():
+    # Aynı geometri, MediaPipe sağ/sol skoru 0.51 ve 0.99: el varlığı aynı.
+    t = make_tracker([_Result(True, 0.51), _Result(True, 0.99)])
+    a, b = t.process(IMG, 1.0), t.process(IMG, 1.1)
+    assert a.score == b.score == 1.0
 
 
 def test_no_hand_returns_none():

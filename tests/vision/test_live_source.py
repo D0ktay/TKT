@@ -293,6 +293,71 @@ def test_open_live_source_makes_lift_when_tap_ref(tmp_path, monkeypatch):
     assert src.lift_cfg == {"w_angle": 1.0}
 
 
+def test_set_calibration_keeps_lift_settings_of_given_estimator():
+    from dataclasses import replace
+
+    from tkt.vision.lift import LiftEstimator
+
+    cfg = {"w_angle": 2.0, "w_length": 0.5, "baseline_s": 1.5, "curl_rate_suppress": 4.0}
+    est = LiftEstimator(calib_with_tap_ref(), cfg)
+    src = LiveSource(FakeCamera(n=1), FakeTracker([True]), calib_with_tap_ref(), "right", est)
+    assert src.lift_cfg is None                      # config'ten değil, doğrudan kuruldu
+    new = replace(DEFAULT, tap_ref={f: 2.0 for f in FINGERS})
+    src.set_calibration(new)                         # önceden: KeyError('w_angle')
+    lift = src._lift
+    assert isinstance(lift, LiftEstimator) and lift is not est
+    assert (lift.w_angle, lift.w_length, lift.baseline_s, lift.curl_rate_suppress) == \
+        (2.0, 0.5, 1.5, 4.0)
+    assert lift.tap_ref == {f: 2.0 for f in FINGERS}
+    src.set_calibration(DEFAULT)                     # tap_ref yok → lift kapanır
+    assert src._lift is None
+    src.set_calibration(new)                         # ayarlar korunur, lift geri gelir
+    assert isinstance(src._lift, LiftEstimator) and src._lift.w_angle == 2.0
+
+
+def _write_cfg(tmp_path):
+    cfg = tmp_path / "v.toml"
+    cfg.write_text(
+        '[camera]\nindex = 0\nwidth = 640\nheight = 512\nfps = 60\n[tracker]\nmodel = "m"\n'
+        'min_detection = 0.5\nmin_tracking = 0.5\n[hand]\nside = "right"\ncalibration = "c"\n'
+        '[lift]\nw_angle = 1.0\n', encoding="utf-8")
+    return cfg
+
+
+def test_open_live_source_bad_calibration_closes_tracker_and_camera(tmp_path, monkeypatch):
+    made = {}
+
+    def cam(*a):
+        made["cam"] = FakeCamera(n=1)
+        return made["cam"]
+
+    def trk(*a):
+        made["trk"] = FakeTracker([])
+        return made["trk"]
+
+    def bad_load(p):
+        raise ValueError("kalibrasyon okunamadı")
+
+    monkeypatch.setattr(ls, "Camera", cam)
+    monkeypatch.setattr(ls, "HandTracker", trk)
+    monkeypatch.setattr(ls.hand_calib, "load", bad_load)
+    with pytest.raises(ValueError):
+        ls.open_live_source(_write_cfg(tmp_path))
+    assert made["trk"].closed
+    assert made.get("cam") is None or made["cam"].closed
+
+
+def test_open_live_source_bad_lift_config_closes_tracker_and_camera(tmp_path, monkeypatch):
+    made = {}
+    monkeypatch.setattr(ls, "Camera", lambda *a: made.setdefault("cam", FakeCamera(n=1)))
+    monkeypatch.setattr(ls, "HandTracker", lambda *a: made.setdefault("trk", FakeTracker([])))
+    monkeypatch.setattr(ls.hand_calib, "load", lambda p: calib_with_tap_ref())
+    with pytest.raises(KeyError):                    # [lift] eksik anahtar (w_length ...)
+        ls.open_live_source(_write_cfg(tmp_path))
+    assert made["trk"].closed
+    assert made.get("cam") is None or made["cam"].closed
+
+
 @pytest.mark.camera
 def test_real_live_source_opens():
     src = ls.open_live_source("config/vision.toml")
