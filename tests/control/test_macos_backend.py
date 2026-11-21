@@ -19,6 +19,9 @@ class FakeQuartz:
     kCGScrollEventUnitPixel = 0
     kCGHIDEventTap = 0
     kCGEventFlagMaskControl = 0x40000
+    kCGEventFlagsChanged = 12
+    kCGKeyboardEventKeycode = 9
+    kCGEventSourceStateHIDSystemState = 1
 
     def __init__(self, pos=(100.0, 100.0), displays=((0, 0, 1000, 800),)):
         self.pos = pos
@@ -27,6 +30,12 @@ class FakeQuartz:
 
     def CGEventCreate(self, source):
         return SimpleNamespace(kind="probe", pos=self.pos, fields={})
+
+    def CGEventSourceCreate(self, state):
+        return ("source", state)
+
+    def CGEventSetType(self, event, kind):
+        event.kind = kind
 
     def CGEventGetLocation(self, event):
         return SimpleNamespace(x=self.pos[0], y=self.pos[1])
@@ -266,3 +275,25 @@ def test_failed_mouse_up_stays_pressed_for_release_retry(monkeypatch, quartz):
         quartz.kCGEventRightMouseUp,
         quartz.kCGEventLeftMouseUp,
     ]
+
+
+@pytest.mark.parametrize(("name", "start"), [("dictation_start", True), ("dictation_stop", False)])
+def test_dictation_uses_menu_toggle(quartz, monkeypatch, name, start):
+    from tkt.control.os_input import mac_dictation
+
+    seen = []
+    monkeypatch.setattr(mac_dictation, "toggle", lambda s: seen.append(s))
+    MacBackend().system_action(name)
+    assert seen == [start]
+    assert quartz.posted == []
+
+
+def test_dictation_submit_stops_then_presses_return(quartz, monkeypatch):
+    from tkt.control.os_input import dictation, mac_dictation
+
+    seen = []
+    monkeypatch.setattr(mac_dictation, "toggle", lambda s: seen.append(s))
+    monkeypatch.setattr(dictation, "submit_later", lambda stop, enter: (stop(), enter()))
+    MacBackend().system_action("dictation_submit")
+    assert seen == [False]
+    assert [(e.keycode, e.down) for e in quartz.posted] == [(36, True), (36, False)]

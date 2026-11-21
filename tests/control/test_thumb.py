@@ -69,10 +69,12 @@ def test_pointer_waits_for_drag_threshold_then_rebases_and_moves_with_button_hel
     engine.process(pose(0.28125, "index", thumb_out=0))
     engine.process(pose(0.3125, "index", thumb_out=0, index_pos=(0.506, 0.407)))
     assert backend_events(backend) == [("button", "left", True)]
-    assert pointer.mock_calls == []
+    # Basarken başparmak kayması geri alınır; sonra sürükleme eşiği beklenir.
+    assert pointer.mock_calls == [call.rollback(80)]
 
     engine.process(pose(0.34375, "index", thumb_out=0, index_pos=(0.52, 0.4)))
-    assert pointer.mock_calls == [call.rebase(), call.update((0.52, 0.4), 0.2, 0.34375)]
+    assert pointer.mock_calls == [call.rollback(80), call.rebase(),
+                                  call.update((0.52, 0.4), 0.2, 0.34375)]
     pointer.update.return_value = (3, -5)
     engine.process(pose(0.375, "index", thumb_out=0, index_pos=(0.53, 0.39)))
     assert engine.left_down
@@ -89,7 +91,9 @@ def test_releasing_without_drag_rebases_to_avoid_a_pointer_jump(rig):
     engine.process(pose(0.3125, "index", thumb_out=1, index_pos=(0.505, 0.4)))
     engine.process(pose(0.34375, "index", thumb_out=1, index_pos=(0.505, 0.4)))
 
-    assert pointer.mock_calls == [call.rebase(), call.update((0.505, 0.4), 0.2, 0.34375)]
+    # Bırakmadan önce başparmak açılırken oluşan kayma geri alınır.
+    assert pointer.mock_calls == [call.rollback(80), call.rebase(),
+                                  call.update((0.505, 0.4), 0.2, 0.34375)]
     assert backend_events(backend) == [("button", "left", True), ("button", "left", False)]
 
 
@@ -102,7 +106,8 @@ def test_fast_curl_cannot_move_pointer_while_waiting_for_drag_threshold(rig):
 
     engine.process(pose(0.3125, thumb_out=0))
 
-    pointer.rollback.assert_not_called()
+    # Yalnızca basma anındaki geri alma; tuş basılıyken hızlı kıvırma geri almaz.
+    pointer.rollback.assert_called_once_with(80)
     assert backend_events(backend) == [("button", "left", True), ("button", "left", False)]
 
 
@@ -191,3 +196,30 @@ def test_tap_lift_does_not_undo_or_freeze_active_thumb_drag():
     assert engine.left_down
     assert [event.kind for event in backend.events] == ["button", "move", "move", "move"]
     assert all(event.args[0] > 0 for event in backend.events[1:])
+
+
+def test_fast_thumb_motion_freezes_pointer_without_rollback(rig):
+    """Başparmak hızlı oynarken imleç donar; tık olmadıkça geri alma yapılmaz."""
+    engine, backend, pointer, _ = rig
+    lock_pointer(engine)
+    pointer.reset_mock()
+    pointer.update.return_value = (2, 0)
+    engine.process(pose(0.25, "index", thumb_out=0.4, index_pos=(0.6, 0.4)))   # 1→0,4: 4,8/sn
+    assert pointer.update.call_count == 0
+    engine.process(pose(0.28125, "index", thumb_out=0.4, index_pos=(0.61, 0.4)))
+    assert pointer.mock_calls == [call.rebase(), call.update((0.61, 0.4), 0.2, 0.28125)]
+    pointer.rollback.assert_not_called()
+    assert backend_events(backend) == [("move", 2, 0)]
+
+
+def test_middle_opening_in_pointer_mode_freezes_and_rolls_back(rig):
+    engine, backend, pointer, _ = rig
+    lock_pointer(engine)
+    pointer.reset_mock()
+    pointer.rollback.return_value = (-3, 1)
+    engine.process(pose(0.25, "index", "middle"))
+    assert engine.mode is Mode.POINTER            # mod kilitli kalır
+    assert pointer.mock_calls == [call.rollback(80)]
+    assert backend_events(backend) == [("move", -3, 1)]
+    engine.process(pose(0.28125, "index", "middle", index_pos=(0.7, 0.4)))
+    assert pointer.mock_calls[-2:] == [call.rebase(), call.update((0.7, 0.4), 0.2, 0.28125)]

@@ -24,6 +24,7 @@ def rig(monkeypatch, request):
             "closed": 0.25,
             "open": 0.5,
             "debounce_ms": 31.25,
+            "freeze_rate": 4.0,
             "drag_threshold": 0.05,
             "still_ms": 125,
         },
@@ -611,3 +612,51 @@ def test_hand_loss_outside_pointer_mode_does_not_roll_back(rig):
     pointer.reset_mock()
     engine.process(make_frame(t=0.05, present=False))
     assert pointer.rollback_at.call_count == 0
+
+
+def test_pinky_only_starts_dictation_and_fist_stops_it(rig):
+    engine, backend, _, _ = rig
+    engine.process(pose(0, "pinky"))
+    engine.process(pose(0.125, "pinky"))
+    assert engine.mode is Mode.DICTATE
+    assert backend_events(backend) == [("system", "dictation_start")]
+    engine.process(pose(0.15625, "pinky", thumb_out=0))    # başparmak tık üretmez
+    engine.process(pose(0.1875, "pinky", thumb_out=0))
+    assert not engine.left_down
+    engine.process(pose(0.25))                              # yumruk
+    assert engine.mode is Mode.NONE
+    assert backend_events(backend) == [("system", "dictation_start"),
+                                       ("system", "dictation_submit")]
+
+
+def test_release_stops_dictation(rig):
+    engine, backend, _, _ = rig
+    engine.process(pose(0, "pinky"))
+    engine.process(pose(0.125, "pinky"))
+    engine.release()
+    assert backend_events(backend)[-1] == ("system", "dictation_stop")
+    engine.release()                                        # ikinci kez durdurmaz
+    assert backend_events(backend).count(("system", "dictation_stop")) == 1
+
+
+def test_dictation_works_with_hand_lifted(rig):
+    """Güven 0 (el masadan kalkık) iken de serçe dikteyi açar, yumruk gönderir."""
+    engine, backend, _, _ = rig
+    engine.process(pose(0, "pinky", confidence=0.0))
+    engine.process(pose(0.125, "pinky", confidence=0.0))
+    assert engine.mode is Mode.DICTATE
+    engine.process(pose(0.5, "pinky", confidence=0.0))      # 300 ms+ havada: kapanmaz
+    assert engine.mode is Mode.DICTATE
+    engine.process(pose(0.6, confidence=0.0))               # havada yumruk
+    assert backend_events(backend) == [("system", "dictation_start"),
+                                       ("system", "dictation_submit")]
+
+
+def test_low_confidence_pointer_pose_still_counts_as_missing(rig):
+    engine, backend, pointer, _ = rig
+    lock_pointer(engine)
+    pointer.reset_mock()
+    engine.process(pose(0.25, "index", confidence=0.0, index_pos=(0.9, 0.9)))
+    pointer.update.assert_not_called()
+    engine.process(pose(0.5, "pinky", confidence=0.0))      # imleç modu kilitli: dikte değil
+    assert engine.mode is not Mode.DICTATE

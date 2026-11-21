@@ -22,6 +22,7 @@ class Mode(Enum):
     POINTER = 2
     SCROLL = 3
     SWIPE = 4
+    DICTATE = 5
 
 
 _MODES_BY_FINGERS = {
@@ -29,6 +30,8 @@ _MODES_BY_FINGERS = {
     ("index", "middle"): Mode.SCROLL,
     ("index", "middle", "ring"): Mode.SWIPE,
     ("index", "middle", "ring", "pinky"): Mode.SWIPE,
+    # Yalnız serçe açık (başparmak serbest, "telefon" işareti): sistem diktesi.
+    ("pinky",): Mode.DICTATE,
 }
 _TAP_FINGERS = {Mode.POINTER: ("index",), Mode.SCROLL: ("index", "middle")}
 
@@ -55,6 +58,7 @@ class GestureEngine:
         self._thumb_close_threshold = thumb["closed"]
         self._thumb_open_threshold = thumb["open"]
         self._thumb_debounce_s = thumb["debounce_ms"] / 1000
+        self._thumb_freeze_rate = thumb["freeze_rate"]
         self._drag_threshold = thumb["drag_threshold"]
         self._still_s = thumb["still_ms"] / 1000
         self._swipe_distance = swipe["distance"]
@@ -73,7 +77,8 @@ class GestureEngine:
     def process(self, frame: HandFrame) -> None:
         """Bir el karesini işle."""
         with self._lock:
-            if not frame.present or frame.confidence < self._confidence_min:
+            reliable = frame.present and frame.confidence >= self._confidence_min
+            if not reliable and not self._dictation_frame(frame):
                 self._process_missing_hand(frame.t)
                 return
 
@@ -90,6 +95,7 @@ class GestureEngine:
             self._last_reliable_t = frame.t
             # Hızlı kıvrılma aynı karede modu kapatsa bile geri almayı gönder.
             curling_fast = self._check_curl_rate(index.curl, frame.t)
+            settling = self._check_settle_rate(frame)
             previous_mode = self.mode
             self._update_mode(frame)
             if self.mode is not previous_mode:
@@ -103,7 +109,9 @@ class GestureEngine:
                 self._scroll_needs_rebase = True
             if self._tap_busy:
                 return
-            if self.mode is Mode.POINTER:
+            if self.mode is Mode.POINTER and settling:
+                self._pointer_needs_rebase = True
+            elif self.mode is Mode.POINTER:
                 self._move_pointer(index, frame.hand_size, frame.t, curling_fast)
             elif self.mode is Mode.SCROLL and scroll_pos is not None:
                 if self._scroll_needs_rebase:
@@ -115,8 +123,10 @@ class GestureEngine:
                 self._send_scroll(self._scroll.tick(frame.t))
 
     def release(self) -> None:
-        """Tuşları bırak ve jest durumunu sıfırla."""
+        """Tuşları bırak, dikteyi durdur ve jest durumunu sıfırla."""
         with self._lock:
+            if self.mode is Mode.DICTATE:
+                self._backend.system_action("dictation_stop")
             self._backend.release_all()
             self._pointer.reset()
             self._stop_scroll()
@@ -130,6 +140,8 @@ class GestureEngine:
         self._last_reliable_t: float | None = None
         self._hand_missing = False
         self._previous_index: tuple[float, float] | None = None
+        self._previous_settle: tuple[float, float, float] | None = None
+        self._settling = False
         self._pointer_frozen = False
         self._pointer_needs_rebase = True
         self._tap_busy = False
@@ -158,12 +170,30 @@ class GestureEngine:
                 self._send_move(self._pointer.rollback_at(self._rollback_ms, t))
             self._wait_until = None
             self._previous_index = None
+            self._previous_settle = None
+            self._settling = False
             self._pointer_needs_rebase = True
             self._thumb_change_at = None
             self._still_history.clear()
             self._swipe_history.clear()
             self._cancel_active_tap()
             self._stop_scroll()
+
+    def _dictation_frame(self, frame: HandFrame) -> bool:
+        """Güveni düşük (ör. el masadan kalkık) ama görünen kare dikte için işlensin mi.
+
+        El havadayken de dikte açılıp kapanabilsin: dikte modundayken (yumruğu görmek için)
+        veya mod boştayken yalnız serçe açıksa. Diğer modlarda düşük güvenli kare imleci
+        oynatmasın diye "el yok" sayılmaya devam eder.
+        """
+        if not frame.present or not frame.fingers:
+            return False
+        if self.mode is Mode.DICTATE:
+            return True
+        if self.mode not in (Mode.NONE, Mode.WAIT):
+            return False
+        opened = tuple(n for n in FINGERS if frame.fingers[n].curl < self._curl_open)
+        return _MODES_BY_FINGERS.get(opened) is Mode.DICTATE
 
     def _loss_expired(self, t: float) -> bool:
         last = self._last_reliable_t
@@ -192,6 +222,11 @@ class GestureEngine:
         self._open_fingers = opened
 
     def _change_mode(self, previous_mode: Mode, t: float) -> None:
+        if previous_mode is Mode.DICTATE:
+            # Dikte modundan yalnız yumrukla çıkılır: söyleneni gönder (dikte dur + Enter).
+            self._backend.system_action("dictation_submit")
+        if self.mode is Mode.DICTATE:
+            self._backend.system_action("dictation_start")
         self._reset_swipe()
         if self.left_down:
             self._release_left()
@@ -330,10 +365,16 @@ class GestureEngine:
             self._backend.button("right", False)
 
     def _press_left(self) -> None:
+        if self.mode is Mode.POINTER:
+            # Başparmak kapanırken el kaymış olabilir: tık, kaymadan önceki yerde olsun.
+            self._send_move(self._pointer.rollback(self._rollback_ms))
         self._backend.button("left", True)
         self.left_down = True
 
     def _release_left(self) -> None:
+        if self.mode is Mode.POINTER:
+            # Başparmak açılırken el kaymış olabilir: bırakma, kaymadan önceki yerde olsun.
+            self._send_move(self._pointer.rollback(self._rollback_ms))
         self._backend.button("left", False)
         self.left_down = False
         if self._drag_origin is not None:
@@ -357,6 +398,32 @@ class GestureEngine:
             if not self.left_down and not self._tap_busy:
                 self._send_move(self._pointer.rollback(self._rollback_ms))
         return curling_fast
+
+    def _check_settle_rate(self, frame: HandFrame) -> bool:
+        """İmleç modunda başparmak hızlı oynuyor veya orta parmak hızla açılıyorsa True.
+
+        Bu sürede imleç donar (el tıklarken/mod değiştirirken kayıyor). Orta parmak
+        açılmaya başlayınca son `rollback_ms` hareket de geri alınır; başparmakta geri alma
+        tuş basılıp bırakılırken yapılır (normal harekette yanlış geri alma olmasın).
+        """
+        previous = self._previous_settle
+        middle = frame.fingers["middle"].curl
+        self._previous_settle = (frame.thumb_out, middle, frame.t)
+        if self.mode is not Mode.POINTER or previous is None:
+            self._settling = False
+            return False
+        thumb_prev, middle_prev, t_prev = previous
+        dt = frame.t - t_prev
+        if dt <= 0:
+            return self._settling
+        thumb_fast = abs(frame.thumb_out - thumb_prev) / dt > self._thumb_freeze_rate
+        middle_opening = (middle_prev - middle) / dt > self._freeze_curl_rate
+        # Hızlı kıvırma donması aynı karede zaten geri aldıysa ikinci kez alınmaz.
+        if middle_opening and not self._settling and not self._tap_busy \
+                and not self._pointer_frozen:
+            self._send_move(self._pointer.rollback(self._rollback_ms))
+        self._settling = thumb_fast or middle_opening
+        return self._settling
 
     def _move_pointer(self, index: Finger, hand_size: float, t: float, curling_fast: bool) -> None:
         if "index" not in self._open_fingers:

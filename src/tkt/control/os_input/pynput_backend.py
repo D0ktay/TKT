@@ -4,6 +4,9 @@ import sys
 from contextlib import ExitStack
 from math import isfinite, trunc
 
+# Sistem diktesini aç/kapat eylemleri (ikisi de aynı kısayolu gönderir).
+DICTATION_ACTIONS = ("dictation_start", "dictation_stop", "dictation_submit")
+
 
 class PynputBackend:
     """pynput bağımlılığını yalnızca örnek oluşturulurken yükler."""
@@ -50,6 +53,14 @@ class PynputBackend:
 
     def system_action(self, name: str) -> None:
         key = self._keys
+        if name == "dictation_submit":
+            from tkt.control.os_input import dictation
+
+            dictation.submit_later(lambda: self._dictation_toggle(False), self._enter)
+            return
+        if name in DICTATION_ACTIONS:
+            self._dictation_toggle(name == "dictation_start")
+            return
         if sys.platform == "win32":
             chords = {
                 "mission_control": (key.cmd, key.tab),
@@ -69,6 +80,29 @@ class PynputBackend:
             for key in chords[name]:
                 releases.callback(self._key, key, False)
                 self._key(key, True)
+
+    def _enter(self) -> None:
+        self._key(self._keys.enter, True)
+        self._key(self._keys.enter, False)
+
+    def _dictation_toggle(self, start: bool):
+        """Sistem diktesini aç/kapat: macOS menüden (Düzen > Dikte), Windows Win+H.
+
+        macOS'ta başlatılan osascript süreci döner (dikte bitirmede beklenir).
+        """
+        if sys.platform == "darwin":
+            from tkt.control.os_input import mac_dictation
+
+            proc = mac_dictation.toggle(start)
+            self.events_sent += 1
+            return proc
+        elif sys.platform == "win32":
+            with ExitStack() as releases:
+                for k in (self._keys.cmd, "h"):
+                    releases.callback(self._key, k, False)
+                    self._key(k, True)
+        else:
+            raise RuntimeError(f"Dikte bu platformda desteklenmiyor: {sys.platform}")
 
     def _key(self, key, down: bool) -> None:
         send = self._keyboard.press if down else self._keyboard.release

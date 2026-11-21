@@ -17,6 +17,8 @@ _SYSTEM_KEYS = {
     "desktop_right": _KEY_RIGHT,
 }
 _MAX_DISPLAYS = 16
+_DICTATION_ACTIONS = ("dictation_start", "dictation_stop")
+_KEY_RETURN = 36
 
 
 def _system_double_click_interval() -> float:
@@ -155,6 +157,18 @@ class MacBackend:
         self._scroll_x, self._scroll_y = x - sx, y - sy
 
     def system_action(self, name: str) -> None:
+        if name == "dictation_submit":
+            from tkt.control.os_input import dictation, mac_dictation
+
+            dictation.submit_later(lambda: mac_dictation.toggle(False), self._enter)
+            self.events_sent += 1
+            return
+        if name in _DICTATION_ACTIONS:
+            from tkt.control.os_input import mac_dictation
+
+            mac_dictation.toggle(name == "dictation_start")
+            self.events_sent += 1
+            return
         try:
             keycode = _SYSTEM_KEYS[name]
         except KeyError:
@@ -164,6 +178,11 @@ class MacBackend:
             event = q.CGEventCreateKeyboardEvent(None, keycode, down)
             q.CGEventSetFlags(event, q.kCGEventFlagMaskControl)
             self._post(event)
+
+    def _enter(self) -> None:
+        q = self._q
+        for down in (True, False):
+            self._post(q.CGEventCreateKeyboardEvent(None, _KEY_RETURN, down))
 
     def release_all(self) -> None:
         self._scroll_x = self._scroll_y = 0.0

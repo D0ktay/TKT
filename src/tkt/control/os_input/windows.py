@@ -30,7 +30,12 @@ _VK_CONTROL = 0x11
 _VK_LEFT = 0x25
 _VK_RIGHT = 0x27
 _VK_LWIN = 0x5B
+_VK_H = 0x48
+_VK_RETURN = 0x0D
 _CHORDS = {
+    # Sistem diktesi (Windows sesle yazma): Win+H aç/kapat.
+    "dictation_start": (_VK_LWIN, _VK_H),
+    "dictation_stop": (_VK_LWIN, _VK_H),
     "mission_control": (_VK_LWIN, _VK_TAB),
     "desktop_left": (_VK_LWIN, _VK_CONTROL, _VK_LEFT),
     "desktop_right": (_VK_LWIN, _VK_CONTROL, _VK_RIGHT),
@@ -150,10 +155,19 @@ class WindowsBackend:
             self._pressed_keys.pop(key, None)
 
     def system_action(self, name: str) -> None:
+        if name == "dictation_submit":
+            from tkt.control.os_input import dictation
+
+            dictation.submit_later(lambda: self.system_action("dictation_stop"), self._enter)
+            return
         with ExitStack() as releases:
             for key in _CHORDS[name]:
                 self._key(key, True)
                 releases.callback(self._key, key, False)
+
+    def _enter(self) -> None:
+        self._key(_VK_RETURN, True)
+        self._key(_VK_RETURN, False)
 
     def release_all(self) -> None:
         for flag in self._wheel_remainder:
