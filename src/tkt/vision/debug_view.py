@@ -1,7 +1,9 @@
 """Debug penceresi (V3). PART2 2.2, 2.4.
 
 macOS'ta `cv2.imshow` ana thread'de çalışmalıdır; `run` döngüyü çağıran thread'de kurar.
-Çizim saf fonksiyonlardadır (`draw_overlay`); pencere ve klavye yalnızca `run` içindedir.
+Çizim saf fonksiyonlardadır (`draw_overlay`, `draw_tap_prompt`, `render_lift_graph`);
+pencere ve klavye yalnızca `run` içindedir. Tuşlar: `c` kalibrasyon, `t` tap kalibrasyonu,
+`q`/ESC veya pencere X düğmesi çıkış.
 
 cv2.putText yalnızca ASCII çizer; ekran metinleri bu yüzden Türkçe karaktersizdir.
 
@@ -11,6 +13,9 @@ CLI: python -m tkt.vision.debug_view --config config/vision.toml
 from __future__ import annotations
 
 import argparse
+import dataclasses
+from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,7 +24,7 @@ import numpy as np
 
 from tkt.core.types import FINGERS, HandFrame
 from tkt.vision import hand_calib
-from tkt.vision.hand_calib import STEPS, CalibrationSession
+from tkt.vision.hand_calib import STEPS, CalibrationSession, HandCalibration
 from tkt.vision.live_source import LiveSource, load_vision_config, open_live_source
 from tkt.vision.tracker import RawHand
 
@@ -44,10 +49,23 @@ STEP_TITLES: dict[str, str] = {
 
 # Kalibrasyon sonuç mesajının ekranda kalma süresi (kare zamanı, sn).
 MESSAGE_SECONDS = 4.0
-RESTART_NOTE = "Yeniden baslatinca gecerli"
+
+# Tap kalibrasyonu: TAP_COUNT kez, her biri TAP_WINDOW_SECONDS'lik pencerede. Pencerenin
+# başında TAP_FLASH_SECONDS boyunca ekran işareti ("TAP!") çıkar; asıl pencereler başlamadan
+# önce TAP_LEAD_SECONDS hazırlık süresi vardır (örnek toplanmaz). Süreler kare zamanıyla
+# ölçülür.
+TAP_COUNT = 10
+TAP_WINDOW_SECONDS = 2.0
+TAP_FLASH_SECONDS = 0.25
+TAP_LEAD_SECONDS = 1.5
+
+# Lift grafiğinin gösterdiği süre (kare zamanı, sn) ve parmakların çizgi renkleri.
+LIFT_GRAPH_SECONDS = 3.0
+LIFT_GRAPH_FINGERS = ("index", "middle")
 
 KEY_QUIT = (ord("q"), 27)   # q, ESC
 KEY_CALIB = ord("c")
+KEY_TAP = ord("t")
 
 # BGR renkler
 _WHITE = (255, 255, 255)
@@ -58,6 +76,7 @@ _YELLOW = (60, 220, 240)
 _CYAN = (230, 200, 60)
 _GRAY = (150, 150, 150)
 _BAR_BG = (50, 50, 50)
+_GRAPH_COLORS = {"index": _YELLOW, "middle": _CYAN}
 
 
 @dataclass(frozen=True)
@@ -201,7 +220,8 @@ def draw_overlay(image: np.ndarray, frame: HandFrame, hand: RawHand | None,
     if calib_state is not None:
         _draw_calibration(out, calib_state, u, fs, pad)
     else:
-        _text(out, "c: kalibrasyon   q/ESC: cikis", (pad, h - pad), fs * 0.8, _GRAY)
+        _text(out, "c: kalibrasyon  t: tap kalibrasyonu  q/ESC: cikis",
+              (pad, h - pad), fs * 0.8, _GRAY)
     return out
 
 
@@ -225,6 +245,157 @@ def _draw_calibration(out: np.ndarray, cs: CalibState, u: int, fs: float, pad: i
         _text(out, "el gorunmuyor", (pad, y), fs, _RED)
 
 
+@dataclass(frozen=True)
+class TapState:
+    """Tap kalibrasyonunun ekranda gösterilen durumu."""
+    total: int              # istenen tap sayısı
+    index: int              # geçerli tap (0 tabanlı); hazırlık süresinde 0
+    lead: bool              # hazırlık süresi (örnek toplanmıyor)
+    flash: bool             # pencere başlangıcı: şimdi tap yap işareti
+    progress: float         # tüm oturum, 0–1
+    samples: int            # şimdiye dek toplanan örnek sayısı
+
+
+class TapSession:
+    """Tap kalibrasyonu için zamanlı pencereler ve örnek toplama (kamera/GUI yok).
+
+    Zaman ilk `add` çağrısındaki `t` ile başlar. `lead_s` saniye hazırlıktan sonra
+    `n` pencere (her biri `window_s` sn) gelir; pencereler boyunca `(t, RawHand)`
+    örnekleri `samples` listesine yazılır. `None` (el yok) örnekler atlanır ama zaman
+    ilerler. Tüm pencereler bitince `done` olur ve sonraki örnekler yok sayılır.
+    Gerçek saate bakmaz; yalnızca verilen `t` değerlerini kullanır.
+    """
+
+    def __init__(self, n: int = TAP_COUNT, window_s: float = TAP_WINDOW_SECONDS,
+                 lead_s: float = TAP_LEAD_SECONDS,
+                 flash_s: float = TAP_FLASH_SECONDS) -> None:
+        if n < 1 or not window_s > 0 or lead_s < 0:
+            raise ValueError("TapSession: n >= 1, window_s > 0, lead_s >= 0 olmalı")
+        self.n = int(n)
+        self.window_s = float(window_s)
+        self.lead_s = float(lead_s)
+        self.flash_s = float(flash_s)
+        self.samples: list[tuple[float, RawHand]] = []
+        self._t0: float | None = None
+        self._elapsed = 0.0
+
+    @property
+    def duration(self) -> float:
+        return self.lead_s + self.n * self.window_s
+
+    @property
+    def done(self) -> bool:
+        return self._elapsed >= self.duration
+
+    def add(self, hand: RawHand | None, t: float) -> None:
+        """`t` anındaki örneği (hazırlık süresi dışındaysa) toplar; zamanı ilerletir."""
+        if self.done:
+            return
+        if self._t0 is None:
+            self._t0 = float(t)
+        self._elapsed = max(self._elapsed, float(t) - self._t0)   # geri giden zaman yok sayılır
+        if self.done or hand is None or self._elapsed < self.lead_s:
+            return
+        self.samples.append((float(t), hand))
+
+    def state(self) -> TapState:
+        lead = self._elapsed < self.lead_s
+        w = max(0.0, self._elapsed - self.lead_s)
+        index = 0 if lead else min(self.n - 1, int(w // self.window_s))
+        phase = w - index * self.window_s
+        return TapState(
+            total=self.n, index=index, lead=lead,
+            flash=(not lead) and not self.done and phase < self.flash_s,
+            progress=min(1.0, self._elapsed / self.duration),
+            samples=len(self.samples),
+        )
+
+
+def draw_tap_prompt(out: np.ndarray, ts: TapState) -> None:
+    """Tap kalibrasyon yönergesini, ilerlemeyi ve tap işaretini `out` üstüne çizer (yerinde)."""
+    h, w = out.shape[:2]
+    u = max(12, round(h / 36))
+    fs = u / 30.0
+    pad = u // 2
+    y = h - pad - u          # en alttaki satır yardım yazısına ayrılmıştır
+    _text(out, f"isaret parmagiyla {ts.total} kez tap yap", (pad, y), fs * 1.1, _YELLOW)
+    y -= u
+    if ts.lead:
+        _text(out, "hazir ol...", (pad, y), fs, _WHITE)
+    else:
+        _text(out, f"TAP {ts.index + 1}/{ts.total}", (pad, y), fs, _WHITE)
+    y -= u
+    _bar(out, pad, y - u + 4, max(10, w - 2 * pad), u - 6, ts.progress, _GREEN)
+    if not ts.lead and ts.samples == 0:
+        y -= u
+        _text(out, "el gorunmuyor", (pad, y), fs, _RED)
+    if ts.flash:
+        # ekran işareti: kalın çerçeve ve ortada "TAP!"
+        t = max(3, round(min(h, w) / 60))
+        cv2.rectangle(out, (0, 0), (w - 1, h - 1), _GREEN, t)
+        label = "TAP!"
+        scale = fs * 3.0
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+        _text(out, label, (max(pad, (w - tw) // 2), (h + th) // 2), scale, _GREEN)
+
+
+def render_lift_graph(history: Sequence[tuple[float, float | None, float | None]],
+                      width: int, height: int,
+                      window_s: float = LIFT_GRAPH_SECONDS) -> np.ndarray:
+    """Son `window_s` saniyenin işaret/orta parmak değerlerini (height, width, 3) BGR çizer.
+
+    `history` elemanları `(t, işaret, orta)`; değer lift'tir, lift yoksa curl verilir,
+    el yoksa `None` (çizgi kopar). Sağ kenar en son örneğin zamanıdır; eksen 0 altta, 1
+    üsttedir. Boş geçmişte yalnızca zemin ve çerçeve çizilir.
+    """
+    width, height = max(1, int(width)), max(1, int(height))
+    out = np.full((height, width, 3), 30, np.uint8)
+    cv2.rectangle(out, (0, 0), (width - 1, height - 1), _GRAY, 1)
+    cv2.line(out, (0, height // 2), (width - 1, height // 2), _BAR_BG, 1)
+    pts = [e for e in history if np.isfinite(e[0])]
+    if pts and window_s > 0:
+        t_end = max(e[0] for e in pts)
+        t_start = t_end - window_s
+        for k, name in enumerate(LIFT_GRAPH_FINGERS):
+            run: list[tuple[int, int]] = []
+            segments: list[list[tuple[int, int]]] = [run]
+            for e in sorted(pts, key=lambda e: e[0]):
+                v = e[1 + k]
+                if e[0] < t_start:
+                    continue
+                if v is None or not np.isfinite(v):
+                    if run:
+                        run = []
+                        segments.append(run)
+                    continue
+                x = int(round((e[0] - t_start) / window_s * (width - 1)))
+                y = int(round((1.0 - float(np.clip(v, 0.0, 1.0))) * (height - 1)))
+                run.append((x, y))
+            for seg in segments:
+                if len(seg) >= 2:
+                    cv2.polylines(out, [np.array(seg, np.int32)], False,
+                                  _GRAPH_COLORS[name], 1, cv2.LINE_8)
+                elif len(seg) == 1:
+                    cv2.circle(out, seg[0], 1, _GRAPH_COLORS[name], -1)
+    return out
+
+
+def draw_lift_graph(out: np.ndarray,
+                    history: Sequence[tuple[float, float | None, float | None]]) -> None:
+    """Lift grafiğini `out` görüntüsünün sağ üst köşesine (fps yazılarının altına) yerleştirir."""
+    h, w = out.shape[:2]
+    u = max(12, round(h / 36))
+    pad = u // 2
+    gw, gh = max(0, min(w // 3, 8 * u * 2)), max(0, min(h // 6, 5 * u))
+    x0, y0 = w - gw - pad, pad + 4 * u + pad
+    if gw < 24 or gh < 16 or x0 < 0 or y0 + gh + 14 > h:
+        return   # görüntü çok küçük
+    out[y0:y0 + gh, x0:x0 + gw] = render_lift_graph(history, gw, gh)
+    fs = u / 30.0 * 0.7
+    _text(out, "lift idx", (x0 + 3, y0 + gh + 12), fs, _GRAPH_COLORS["index"])
+    _text(out, "mid", (x0 + int(gw * 0.6), y0 + gh + 12), fs, _GRAPH_COLORS["middle"])
+
+
 # ---------------------------------------------------------------------- döngü
 
 
@@ -238,59 +409,145 @@ def _calib_state(session: CalibrationSession, samples: int, message: str = "") -
     )
 
 
-def run(source: LiveSource, calib_path: Path) -> None:
-    """İskelet, curl/lift çubukları, fps; `c` kalibrasyon, `q`/ESC çıkış. Ana thread'de çalışır.
+def _current_calibration(calib_path: Path) -> HandCalibration:
+    """Dosyadaki kalibrasyon; dosya yok veya bozuksa `DEFAULT` (LiveSource da böyle başlar)."""
+    try:
+        return hand_calib.load(calib_path) or hand_calib.DEFAULT
+    except ValueError:
+        return hand_calib.DEFAULT
 
-    Kalibrasyon bitince sonuç `calib_path` dosyasına yazılır. LiveSource kalibrasyonu
-    çalışırken değiştirmek için genel bir yol sunmadığından yeni değerler uygulama
-    yeniden başlatılınca geçerli olur; ekranda bu yazılır.
+
+def _lift_value(frame: HandFrame, name: str) -> float | None:
+    """Grafik değeri: lift; yoksa curl; el yoksa None."""
+    finger = frame.fingers.get(name) if frame.present else None
+    if finger is None:
+        return None
+    return finger.curl if finger.lift is None else finger.lift
+
+
+def _window_visible() -> bool | None:
+    """Pencere görünür mü? Backend desteklemiyorsa None."""
+    try:
+        v = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE)
+    except cv2.error:
+        return None
+    return v >= 1
+
+
+def run(source: LiveSource, calib_path: Path) -> None:
+    """İskelet, curl/lift çubukları, lift grafiği, fps. Ana thread'de çalışır.
+
+    Tuşlar: `c` kalibrasyon, `t` tap kalibrasyonu, `q`/ESC çıkış; pencerenin X düğmesi de
+    çıkartır. Kalibrasyon bitince yeni değerler `source.set_calibration` ile hemen
+    geçerli olur ve `calib_path` dosyasına yazılır.
     """
     session: CalibrationSession | None = None
+    tap: TapSession | None = None
+    calib: HandCalibration | None = None     # geçerli kalibrasyon; ilk ihtiyaçta dosyadan
+    history: deque[tuple[float, float | None, float | None]] = deque()
     message = ""
     message_until = 0.0
+    seen_visible = False
     try:
         for frame, hand, image in source.frames_raw():
             if message and frame.t > message_until:
                 message = ""
 
             calib_state: CalibState | None = None
+            tap_state: TapState | None = None
             if session is not None:
                 session.add(hand if frame.present else None, frame.t)
                 if session.done:
-                    message, message_until = _finish_calibration(session, calib_path, frame.t)
+                    calib = calib or _current_calibration(calib_path)
+                    message, message_until, calib = _finish_calibration(
+                        session, source, calib, calib_path, frame.t)
                     session = None
                 else:
                     calib_state = _calib_state(
                         session, len(session.samples.get(session.current_step or "", [])),
                         message)
+            if tap is not None:
+                tap.add(hand if frame.present else None, frame.t)
+                if tap.done:
+                    calib = calib or _current_calibration(calib_path)
+                    message, message_until, calib = _finish_tap(
+                        tap, source, calib, calib_path, frame.t)
+                    tap = None
+                else:
+                    tap_state = tap.state()
             if calib_state is None and message:
                 calib_state = CalibState(None, 0.0, 0.0, 0, message)
 
+            history.append((frame.t, *(_lift_value(frame, n) for n in LIFT_GRAPH_FINGERS)))
+            while history and frame.t - history[0][0] > LIFT_GRAPH_SECONDS:
+                history.popleft()
+
             stats = Stats(source.capture_fps(), source.process_fps(), source.last_process_ms)
-            cv2.imshow(WINDOW_NAME, draw_overlay(image, frame, hand, stats, calib_state))
+            out = draw_overlay(image, frame, hand, stats, calib_state)
+            draw_lift_graph(out, history)
+            if tap_state is not None:
+                draw_tap_prompt(out, tap_state)
+            cv2.imshow(WINDOW_NAME, out)
             key = cv2.waitKey(1) & 0xFF
             if key in KEY_QUIT:
                 break
+            visible = _window_visible()
+            if visible:
+                seen_visible = True
+            elif visible is False and seen_visible:
+                break          # pencere X düğmesiyle kapatıldı
             if key == KEY_CALIB:
-                session = CalibrationSession()
+                session, tap = CalibrationSession(), None
+                message = ""
+            elif key == KEY_TAP:
+                tap, session = TapSession(), None
                 message = ""
     finally:
         source.close()
         cv2.destroyAllWindows()
 
 
-def _finish_calibration(session: CalibrationSession, calib_path: Path,
-                        t: float) -> tuple[str, float]:
-    """Oturum sonucunu kaydeder; (ekran mesajı, mesajın biteceği kare zamanı) döner."""
+def _apply(source: LiveSource, result: HandCalibration, calib_path: Path) -> str | None:
+    """Kalibrasyonu hemen uygular, sonra dosyaya yazar. Kayıt hatası varsa mesajı döner."""
+    source.set_calibration(result)
+    try:
+        hand_calib.save(result, calib_path)
+    except OSError as e:
+        return f"Uygulandi ama kayit hatasi: {e}"[:90]
+    return None
+
+
+def _finish_calibration(session: CalibrationSession, source: LiveSource,
+                        calib: HandCalibration, calib_path: Path,
+                        t: float) -> tuple[str, float, HandCalibration]:
+    """Oturum sonucunu uygular ve kaydeder; (ekran mesajı, bitiş zamanı, geçerli kalibrasyon).
+
+    Daha önce çıkarılmış `tap_ref`/`angle_sign` korunur: eğri kalibrasyonu lift'i etkilemez.
+    """
     try:
         result = session.result()
-        hand_calib.save(result, calib_path)
     except ValueError as e:
         # Örn. örnek yok (el görünmedi) veya yumruk açık elden büyük değil.
-        return f"Kalibrasyon basarisiz: {e}"[:90], t + MESSAGE_SECONDS
-    except OSError as e:
-        return f"Kayit hatasi: {e}"[:90], t + MESSAGE_SECONDS
-    return f"Kaydedildi. {RESTART_NOTE}", t + MESSAGE_SECONDS
+        return f"Kalibrasyon basarisiz: {e}"[:90], t + MESSAGE_SECONDS, calib
+    result = dataclasses.replace(result, tap_ref=calib.tap_ref, angle_sign=calib.angle_sign)
+    err = _apply(source, result, calib_path)
+    return err or "Kaydedildi ve uygulandi", t + MESSAGE_SECONDS, result
+
+
+def _finish_tap(tap: TapSession, source: LiveSource, calib: HandCalibration,
+                calib_path: Path, t: float) -> tuple[str, float, HandCalibration]:
+    """Tap örneklerinden `fit_taps` ile kalibrasyonu çıkarır, uygular ve kaydeder."""
+    until = t + MESSAGE_SECONDS
+    if not tap.samples:
+        return "Tap kalibrasyonu basarisiz: el gorunmedi", until, calib
+    try:
+        result = hand_calib.fit_taps(calib, tap.samples)
+    except NotImplementedError:
+        return "fit_taps henuz yok", until, calib
+    except ValueError as e:
+        return f"Tap kalibrasyonu basarisiz: {e}"[:90], until, calib
+    err = _apply(source, result, calib_path)
+    return err or "Tap kaydedildi ve uygulandi", until, result
 
 
 def main(argv: list[str] | None = None) -> None:
