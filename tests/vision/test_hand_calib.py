@@ -367,3 +367,90 @@ def test_fit_taps_empty_or_flat_raises():
     flat = [(10.0 + i / 60, _lifted({})) for i in range(60)]
     with pytest.raises(ValueError):
         hand_calib.fit_taps(DEFAULT, flat)
+
+
+def _contiguous_taps(angles, fps=60.0, period=2.0, t0=10.0):
+    """Kesintisiz örnek akışı (debug penceresi gibi): her `period` sn'de bir pencere."""
+    out = []
+    windows = []
+    for k, a in enumerate(angles):
+        start = t0 + k * period
+        windows.append((start, start + period))
+        for i in range(int(period * fps)):
+            x = i / fps
+            out.append((start + x, _lifted({"index": a if 0.25 <= x < 0.45 else 0.0})))
+    return out, windows
+
+
+def test_fit_taps_explicit_windows_on_contiguous_stream():
+    samples, windows = _contiguous_taps((0.2, 0.3, 0.5, 0.3, 0.2))
+    out = hand_calib.fit_taps(DEFAULT, samples, windows=windows)
+    # pencere başına tepe; medyan 0,3'ün tepesi (tek pencerede max 0,5 çıkardı)
+    assert out.tap_ref["index"] == pytest.approx(_raw_peak(0.3), rel=1e-6)
+    assert out.angle_sign == -1.0
+
+
+def test_fit_taps_windows_per_window_baseline():
+    # her pencere farklı duruşta başlıyor (tüm parmaklar biraz kalkık); taban pencereye göre
+    samples, windows = [], []
+    for k, base in enumerate((0.0, 0.15, 0.3)):
+        start = 10.0 + 2.0 * k
+        windows.append((start, start + 2.0))
+        for i in range(120):
+            x = i / 60
+            a = 0.3 if 0.25 <= x < 0.45 else 0.0
+            pose = {f: base for f in FINGER_JOINTS}
+            pose["index"] = base + a
+            samples.append((start + x, _lifted(pose)))
+    out = hand_calib.fit_taps(DEFAULT, samples, windows=windows)
+    from tkt.vision.lift import raw_signals
+
+    peaks = []
+    for base in (0.0, 0.15, 0.3):
+        pose = {f: base for f in FINGER_JOINTS}
+        a0, l0 = raw_signals(_lifted(pose))["index"]
+        pose["index"] = base + 0.3
+        a1, l1 = raw_signals(_lifted(pose))["index"]
+        peaks.append(-(a1 - a0) + (l0 - l1))
+    assert out.tap_ref["index"] == pytest.approx(float(np.median(peaks)), rel=1e-6)
+
+
+def test_fit_taps_windows_ignore_outside_and_empty():
+    samples, windows = _contiguous_taps((0.3, 0.3, 0.3))
+    noise = [(5.0 + i / 60, _lifted({"index": 0.6 if i == 10 else 0.0})) for i in range(30)]
+    out = hand_calib.fit_taps(DEFAULT, noise + samples,
+                              windows=windows + [(100.0, 102.0)])   # boş pencere
+    assert out.tap_ref["index"] == pytest.approx(_raw_peak(0.3), rel=1e-6)
+    with pytest.raises(ValueError):
+        hand_calib.fit_taps(DEFAULT, samples, windows=[(100.0, 102.0)])
+
+
+def test_fit_taps_aspect_matches_pixel_geometry():
+    aspect = 512 / 640
+
+    def rot(h):
+        # parmakları görüntüde köklerinin çevresinde 90° çevir; bilek→kök dikey kalır
+        img = np.array(h.image_pts, dtype=float)
+        for mcp, *rest in FINGER_JOINTS.values():
+            for i in rest:
+                d = img[i] - img[mcp]
+                img[i] = img[mcp] + (-d[1], d[0])
+        return RawHand(image_pts=img, world_pts=h.world_pts, score=h.score)
+
+    def scale(h):
+        img = np.asarray(h.image_pts, dtype=float).copy()
+        img[:, 0] *= aspect
+        return RawHand(image_pts=img, world_pts=h.world_pts, score=h.score)
+
+    samples = [(t, rot(h)) for t, h in _tap_samples(["tap1"] * 4)]
+    a = hand_calib.fit_taps(DEFAULT, samples, aspect=aspect)
+    b = hand_calib.fit_taps(DEFAULT, [(t, scale(h)) for t, h in samples])
+    assert a.tap_ref == pytest.approx(b.tap_ref)
+    c = hand_calib.fit_taps(DEFAULT, samples)
+    assert c.tap_ref["index"] != pytest.approx(a.tap_ref["index"])
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_fit_taps_rejects_bad_aspect(bad):
+    with pytest.raises(ValueError, match="aspect"):
+        hand_calib.fit_taps(DEFAULT, _tap_samples(["tap1"] * 2), aspect=bad)

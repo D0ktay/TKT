@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 from dataclasses import asdict, dataclass, replace
@@ -219,8 +220,15 @@ TAP_PEAK_REL = 0.5
 TAP_MIN_FOUND = 0.25
 
 
-def _tap_windows(samples: list[tuple[float, RawHand]]) -> list[list[tuple[float, RawHand]]]:
+def _tap_windows(samples: list[tuple[float, RawHand]],
+                 bounds: list[tuple[float, float]] | None = None,
+                 ) -> list[list[tuple[float, RawHand]]]:
     ordered = sorted(samples, key=lambda s: s[0])
+    if bounds is not None:
+        # Verilen sınırlar: [başlangıç, bitiş); boş pencereler atılır.
+        out = [[(t, h) for t, h in ordered if float(a) <= t < float(b)]
+               for a, b in sorted(bounds)]
+        return [w for w in out if w]
     windows: list[list[tuple[float, RawHand]]] = []
     for t, hand in ordered:
         if not windows or t - windows[-1][-1][0] > TAP_GAP_S:
@@ -229,12 +237,19 @@ def _tap_windows(samples: list[tuple[float, RawHand]]) -> list[list[tuple[float,
     return windows
 
 
-def fit_taps(calib: HandCalibration, samples: list[tuple[float, RawHand]]) -> HandCalibration:
+def fit_taps(calib: HandCalibration, samples: list[tuple[float, RawHand]], *,
+             aspect: float = 1.0,
+             windows: list[tuple[float, float]] | None = None) -> HandCalibration:
     """Tap örneklerinden `tap_ref` ve `angle_sign` (Faz 2).
 
     `samples`: bip pencerelerinden (bip anından ~1,5 sn) toplanmış `(t, el)` kareleri.
-    Pencereler zaman boşluğundan (`TAP_GAP_S`) ayrılır; her pencerenin ilk `TAP_BASE_S`
-    saniyesinin medyanı o pencerenin taban çizgisidir.
+    `windows` verilirse pencere sınırları bunlardır (`[başlangıç, bitiş)`; dışındaki örnekler
+    yok sayılır, boş pencereler atılır). Verilmezse pencereler zaman boşluğundan (`TAP_GAP_S`)
+    ayrılır; bu, pencereler arasında örnek toplanmadığında çalışır. Her pencerenin ilk
+    `TAP_BASE_S` saniyesinin medyanı o pencerenin taban çizgisidir.
+
+    `aspect`: görüntü genişliği / yüksekliği; `LiftEstimator` ile aynı değer verilmelidir
+    (görüntü boyu piksel oranıyla ölçülür, bkz. `lift.raw_signals`).
 
     - `angle_sign`: her pencerede açı değişimi en büyük olan parmağın, en büyük değişim
       anındaki işareti; pencerelerin çoğunluğu. Eşitlikte `calib.angle_sign` korunur.
@@ -243,19 +258,22 @@ def fit_taps(calib: HandCalibration, samples: list[tuple[float, RawHand]]) -> Ha
       Kalkışı bulunamayan parmaklar (ör. tek tapta orta, her zaman yüzük ve serçe) bulunan
       parmakların medyanıyla doldurulur.
 
-    Örnek yoksa veya hiçbir parmakta pozitif tepe yoksa `ValueError`.
+    Örnek yoksa, `aspect` geçersizse veya hiçbir parmakta pozitif tepe yoksa `ValueError`.
     """
     # lift bu modülden HandCalibration'ı import eder; döngüyü önlemek için burada.
     from tkt.vision.lift import FIT_WEIGHTS, raw_signals
 
-    windows = _tap_windows(samples)
-    if not windows:
+    aspect = float(aspect)
+    if not (math.isfinite(aspect) and aspect > 0):
+        raise ValueError(f"fit_taps: aspect sonlu ve pozitif olmalı: {aspect!r}")
+    wins = _tap_windows(samples, windows)
+    if not wins:
         raise ValueError("fit_taps: örnek yok")
 
     # Her pencere: parmak → (açı farkı dizisi, boy farkı dizisi), taban çizgisine göre.
     deltas: list[dict[str, tuple[list[float], list[float]]]] = []
-    for win in windows:
-        sig = [raw_signals(h) for _t, h in win]
+    for win in wins:
+        sig = [raw_signals(h, aspect) for _t, h in win]
         t0 = win[0][0]
         n_base = max(1, sum(1 for t, _h in win if t - t0 < TAP_BASE_S))
         d: dict[str, tuple[list[float], list[float]]] = {}

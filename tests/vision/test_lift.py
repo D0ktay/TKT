@@ -334,3 +334,146 @@ def test_eval_cli_missing_prompts(tmp_path, capsys):
     with pytest.raises(SystemExit):
         lift_mod.main(["--eval", str(tap), str(normal), "--config", str(cfg)])
     assert "prompts" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- en-boy oranı
+
+
+def _scaled_x(hand: RawHand, sx: float) -> RawHand:
+    """Görüntü noktalarının x'ini `sx` ile ölçekler (piksel geometrisine geçiş)."""
+    img = np.asarray(hand.image_pts, dtype=float).copy()
+    img[:, 0] *= sx
+    return RawHand(image_pts=img, world_pts=hand.world_pts, score=hand.score)
+
+
+def _sideways(hand: RawHand) -> RawHand:
+    """Görüntüde parmakları köklerinin çevresinde 90° çevirir: parmaklar yatay, bilek→kök
+    dikey kalır (en-boy oranının boyu etkilediği durum)."""
+    img = np.array(hand.image_pts, dtype=float)
+    for mcp, *rest in FINGER_JOINTS.values():
+        for i in rest:
+            d = img[i] - img[mcp]
+            img[i] = img[mcp] + (-d[1], d[0])
+    return RawHand(image_pts=img, world_pts=hand.world_pts, score=hand.score)
+
+
+def test_raw_signals_length_in_pixels():
+    # 512x640 dikey kare: yatay parmak 0,3 genişlik = 153,6 px, dikey bilek→kök 0,3 yükseklik
+    # = 192 px → boy 0,8 (0–1 oranlarıyla 1,0 çıkıyordu).
+    h = make_hand()
+    img = np.zeros((21, 2))
+    img[0] = (0.5, 0.8)       # bilek
+    img[9] = (0.5, 0.5)       # orta kök
+    mcp, _p, _d, tip = FINGER_JOINTS["index"]
+    img[mcp] = (0.2, 0.5)
+    img[tip] = (0.5, 0.5)
+    hand = RawHand(image_pts=img, world_pts=h.world_pts, score=0.95)
+    assert raw_signals(hand)["index"][1] == pytest.approx(1.0)
+    assert raw_signals(hand, aspect=512 / 640)["index"][1] == pytest.approx(0.8)
+
+
+def test_estimator_aspect_matches_pixel_geometry():
+    aspect = 512 / 640
+    calib = calib_with_tap_ref()
+    a = LiftEstimator(calib, CFG, aspect=aspect)
+    b = LiftEstimator(calib, CFG)
+    hands = [_sideways(make_hand({"index": TAP_ANGLE * tap_profile(i * DT, 0.2)}))
+             for i in range(40)]
+    out_a = run(a, hands)
+    out_b = run(b, [_scaled_x(h, aspect) for h in hands])
+    for x, y in zip(out_a, out_b, strict=True):
+        assert x == pytest.approx(y)
+    # varsayılan 1.0 eski davranıştır; dikey karede sonuç farklı
+    out_c = run(LiftEstimator(calib, CFG), hands)
+    assert max(o["index"] for o in out_c) != pytest.approx(max(o["index"] for o in out_a))
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_estimator_rejects_bad_aspect(bad):
+    with pytest.raises(ValueError):
+        LiftEstimator(calib_with_tap_ref(), CFG, aspect=bad)
+
+
+def test_evaluate_uses_recording_aspect(tmp_path, monkeypatch):
+    tap = tmp_path / "tap.raw.jsonl"
+    normal = tmp_path / "normal.raw.jsonl"
+    _write_tap_recording(tap)
+    _write_normal_recording(normal, seconds=3)
+    from tkt.vision import hand_calib
+
+    seen: dict[str, list] = {"fit": [], "est": []}
+    real_fit = hand_calib.fit_taps
+
+    def spy_fit(calib, samples, **kw):
+        seen["fit"].append(kw)
+        return real_fit(calib, samples, **kw)
+
+    class SpyEstimator(LiftEstimator):
+        def __init__(self, calib, cfg, **kw):
+            seen["est"].append(kw)
+            super().__init__(calib, cfg, **kw)
+
+    monkeypatch.setattr(hand_calib, "fit_taps", spy_fit)
+    monkeypatch.setattr(lift_mod, "LiftEstimator", SpyEstimator)
+    lift_mod.evaluate(tap, normal, DEFAULT, CFG)
+    aspect = INFO.width / INFO.height
+    assert seen["fit"] and all(kw["aspect"] == pytest.approx(aspect) for kw in seen["fit"])
+    assert len(seen["est"]) == 2
+    assert all(kw["aspect"] == pytest.approx(aspect) for kw in seen["est"])
+
+
+def test_evaluate_passes_prompt_windows_to_fit_taps(tmp_path, monkeypatch):
+    tap = tmp_path / "tap.raw.jsonl"
+    normal = tmp_path / "normal.raw.jsonl"
+    # bipler 1 sn arayla: 1,5 sn'lik pencereler birbirine değer, örnek akışı kesintisiz
+    prompts = _write_tap_recording(tap, n_prompts=6, period=1.0)
+    _write_normal_recording(normal, seconds=3)
+    from tkt.vision import hand_calib
+
+    seen = []
+    real_fit = hand_calib.fit_taps
+
+    def spy_fit(calib, samples, **kw):
+        seen.append(kw)
+        return real_fit(calib, samples, **kw)
+
+    monkeypatch.setattr(hand_calib, "fit_taps", spy_fit)
+    lift_mod.evaluate(tap, normal, DEFAULT, CFG)
+    (kw,) = seen
+    assert kw["windows"] == [(p.t, p.t + lift_mod.EVAL_WINDOW_S) for p in prompts]
+
+
+# --------------------------------------------------------------------------- oran uç durumları
+
+
+def _result(peaks, p99):
+    return lift_mod.EvalResult(fingers=("index",), peaks=list(peaks), normal_p99=p99,
+                               n_prompts=len(peaks), n_missing=0,
+                               calib=calib_with_tap_ref(), fitted=False)
+
+
+def test_eval_zero_peaks_and_zero_noise_is_not_pass():
+    r = _result([0.0] * 5, 0.0)
+    assert not r.passed
+    text = lift_mod.format_result(r)
+    assert "ölçülemez" in text and "GEÇMEDİ" in text
+    assert "GEÇTİ" not in text and "inf" not in text
+
+
+def test_eval_zero_peaks_is_not_pass_even_with_noise():
+    r = _result([0.0] * 5, 0.2)
+    assert not r.passed
+    assert "ölçülemez" in lift_mod.format_result(r)
+
+
+def test_eval_no_noise_with_taps_passes_without_infinite_ratio():
+    r = _result([0.9, 0.95, 1.0], 0.0)
+    assert r.passed
+    text = lift_mod.format_result(r)
+    assert "gürültü yok" in text and "GEÇTİ" in text and "inf" not in text
+
+
+def test_eval_normal_ratio_unchanged():
+    r = _result([0.9, 0.9, 0.9], 0.3)
+    assert r.ratio == pytest.approx(3.0) and r.passed
+    assert "3.00" in lift_mod.format_result(r)
