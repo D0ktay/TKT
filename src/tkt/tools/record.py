@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -277,17 +278,25 @@ def record(source: Any, out: str | Path, note: str = "", duration: float | None 
     prompts: list[Prompt] = []
     clock_start: float | None = None
 
+    # Önceki kayıttan kalan bip yan dosyası bu kayda ait değildir (bip zamanları eski kaydın).
+    stale_prompts = prompts_path(out_path)
+    if stale_prompts.exists():
+        stale_prompts.unlink()
+        print(f"uyarı: eski bip dosyası silindi: {stale_prompts}", file=sys.stderr)
+
     writer = RecordingWriter(out_path, info)
     rwriter = RawWriter(raw_path, info) if raw else None
+    interrupted = False
     stream = source.frames_raw()
     try:
         for frame, hand, image in stream:
             if t_start is None:
                 t_start = frame.t
-            writer.write(frame)
-            count += 1
+            # Önce ham, sonra işlenmiş: kesintide fazla satır `_reconcile` ile atılır.
             if rwriter is not None:
                 rwriter.write(frame.t, frame.frame_id, hand)
+            writer.write(frame)
+            count += 1
             if video:
                 if vwriter is None:
                     h, w = image.shape[:2]
@@ -303,14 +312,17 @@ def record(source: Any, out: str | Path, note: str = "", duration: float | None 
                 if clock_start is None:
                     clock_start = now
                 if len(prompts) < prompt:
-                    due = clock_start + PROMPT_LEAD_S + len(prompts) * PROMPT_INTERVAL_S
+                    # Sonraki bip, son bipin verildiği andan hesaplanır; kare boşluğundan sonra
+                    # geciken bipler ardı ardına yığılmaz.
+                    due = (clock_start + PROMPT_LEAD_S if not prompts
+                           else prompts[-1].t + PROMPT_INTERVAL_S)
                     if now >= due:
                         beep()
                         prompts.append(Prompt(t=now, kind=kind))
                 elif duration is None and now - prompts[-1].t >= PROMPT_TAIL_S:
                     break
     except KeyboardInterrupt:
-        pass
+        interrupted = True
     finally:
         stream.close()
         writer.close()
@@ -320,10 +332,52 @@ def record(source: Any, out: str | Path, note: str = "", duration: float | None 
             vwriter.release()
         if prompt is not None:
             write_prompts(prompts_path(out_path), prompts)
+    if interrupted and raw:
+        count = _reconcile(out_path, raw_path)
     return count
 
 
+def _complete_lines(path: Path) -> int:
+    """Dosyadaki tamamlanmış (\\n ile biten) satır sayısı, başlık dahil."""
+    with path.open("rb") as fh:
+        return sum(1 for line in fh if line.endswith(b"\n"))
+
+
+def _truncate_lines(path: Path, keep: int) -> None:
+    """Başlık dahil ilk `keep` tam satırı tutar, gerisini (yarım satır dahil) atar."""
+    with path.open("rb") as fh:
+        head = [line for _, line in zip(range(keep), fh, strict=False)]
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        tmp.write_bytes(b"".join(head))
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _reconcile(out_path: Path, raw_path: Path) -> int:
+    """Kesintiden sonra işlenmiş ve ham dosyayı ortak tamamlanmış kareye indirir; kare sayısı."""
+    n = min(_complete_lines(out_path), _complete_lines(raw_path)) - 1   # başlık hariç
+    for p in (out_path, raw_path):
+        if _complete_lines(p) != n + 1:
+            _truncate_lines(p, n + 1)
+    return max(n, 0)
+
+
 # --------------------------------------------------------------------------- ham kayıttan üretim
+
+
+class OutputIsInputError(ValueError):
+    """`--from-raw` çıktısı girdi dosyasıyla aynı dosya."""
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    if a.resolve() == b.resolve():
+        return True
+    try:
+        return os.path.samefile(a, b)     # sabit bağ (hard link) ve sembolik bağ
+    except OSError:                       # biri yoksa aynı dosya olamaz
+        return False
 
 
 def rebuild_from_raw(raw_path: str | Path, out: str | Path,
@@ -333,11 +387,17 @@ def rebuild_from_raw(raw_path: str | Path, out: str | Path,
     Kalibrasyon config'teki `hand.calibration` yolundan okunur (yoksa `DEFAULT`). `tap_ref`
     varsa ve `LiftEstimator` kurulabiliyorsa `lift` hesaplanır; yoksa `lift` None kalır.
     Ham kaydın `prompts` yan dosyası varsa `out`'un yan dosyasına kopyalanır. Yazılan kare
-    sayısını döndürür.
+    sayısını döndürür. Çıktı girdiyle aynı dosyaysa `OutputIsInputError`; çıktı önce geçici
+    dosyaya yazılır, dönüşüm bitince `os.replace` ile yerine konur (hata olursa eski çıktı kalır).
     """
     from tkt.vision import features, hand_calib
     from tkt.vision.lift import LiftEstimator
     from tkt.vision.live_source import load_vision_config
+
+    if _same_file(Path(raw_path), Path(out)):
+        raise OutputIsInputError(
+            f"çıktı girdiyle aynı dosya: {out}; ham kaydı üzerine yazmamak için farklı --out verin")
+    info = read_raw_header(raw_path)
 
     cfg = load_vision_config(config_path)
     calib_path = Path(cfg["hand"]["calibration"]).expanduser()
@@ -346,28 +406,33 @@ def rebuild_from_raw(raw_path: str | Path, out: str | Path,
     lift = None
     if calib.tap_ref is not None:
         try:
-            lift = LiftEstimator(calib, cfg["lift"])
+            lift = LiftEstimator(calib, cfg["lift"], aspect=info.width / info.height)
         except NotImplementedError:
             print("uyarı: LiftEstimator henüz uygulanmamış; lift olmadan devam ediliyor",
                   file=sys.stderr)
 
-    info = read_raw_header(raw_path)
+    out_path = Path(out)
+    tmp_path = out_path.with_name(f".{out_path.name}.tmp-{os.getpid()}")
     prev_size: float | None = None
     count = 0
-    with RecordingWriter(out, info) as writer:
-        for s in iter_raw(raw_path):
-            if s.hand is None and lift is not None:
-                lift.reset()
-            frame = features.build_frame(
-                s.hand, s.t, s.frame_id, calib, info, lift=None, prev_hand_size=prev_size)
-            if s.hand is not None and lift is not None and frame.present:
-                curls = {name: f.curl for name, f in frame.fingers.items()}
+    try:
+        with RecordingWriter(tmp_path, info) as writer:
+            for s in iter_raw(raw_path):
+                if s.hand is None and lift is not None:
+                    lift.reset()
                 frame = features.build_frame(
-                    s.hand, s.t, s.frame_id, calib, info,
-                    lift=lift.update(s.hand, s.t, curls), prev_hand_size=prev_size)
-            prev_size = frame.hand_size if frame.present else None
-            writer.write(frame)
-            count += 1
+                    s.hand, s.t, s.frame_id, calib, info, lift=None, prev_hand_size=prev_size)
+                if s.hand is not None and lift is not None and frame.present:
+                    curls = {name: f.curl for name, f in frame.fingers.items()}
+                    frame = features.build_frame(
+                        s.hand, s.t, s.frame_id, calib, info,
+                        lift=lift.update(s.hand, s.t, curls), prev_hand_size=prev_size)
+                prev_size = frame.hand_size if frame.present else None
+                writer.write(frame)
+                count += 1
+        os.replace(tmp_path, out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
     src_prompts, dst_prompts = prompts_path(raw_path), prompts_path(out)
     if src_prompts.exists() and src_prompts.resolve() != dst_prompts.resolve():
@@ -408,7 +473,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.from_raw is not None:
         if args.prompt is not None:
             build_parser().error("--from-raw ile --prompt birlikte kullanılamaz")
-        n = rebuild_from_raw(args.from_raw, args.out, args.config)
+        try:
+            n = rebuild_from_raw(args.from_raw, args.out, args.config)
+        except OutputIsInputError as e:
+            build_parser().error(str(e))
         print(f"{n} kare yazıldı: {args.out}")
         return
     if args.prompt is not None and args.prompt < 1:
