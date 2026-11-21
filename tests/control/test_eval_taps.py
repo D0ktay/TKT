@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,6 @@ def recordings(tmp_path, monkeypatch):
             self.backend = backend
 
         def process(self, frame):
-            assert frame.t == frame.frame_id / 20
             if frame.frame_id in (9, 13):
                 self.backend.move_rel(10, 0)
             if frame.frame_id == 10:
@@ -72,18 +72,115 @@ def test_json_replays_multiple_recordings(recordings, capsys):
     }
     taps, unprompted = report["recordings"]
     assert taps["misses"] == [{"kind": "tap1", "t": 0.5, "frame_id": 10}]
-    assert [item["drift_px"] for item in taps["captures"]] == [pytest.approx(104**0.5), 0]
+    assert [item["drift_px"] for item in taps["captures"]] == [pytest.approx(404**0.5), 0]
     assert report["latency_ms"] == pytest.approx({"median": 225, "p95": 250})
-    assert [taps["false_clicks"][key] for key in ("left", "right")] == [0, 1]
+    assert taps["false_clicks"] is None
+    assert taps["unmatched_clicks"] == {"left": 0, "right": 1}
     assert [unprompted["false_clicks"][key] for key in ("left", "right")] == [1, 2]
     false = report["false_clicks"]
-    assert false["duration_s"] == pytest.approx(4.35 + 3.95)
-    assert false["outside_windows_s"] == pytest.approx(false["duration_s"] - 3.05)
-    assert false["per_minute"] == pytest.approx(4 * 60 / false["outside_windows_s"])
+    assert false["duration_s"] == pytest.approx(3.95)
+    assert false["outside_windows_s"] == false["duration_s"]
+    assert false["per_minute"] == pytest.approx(3 * 60 / false["duration_s"])
     assert report["gate"] == {
         "passed": False,
         "checks": {"tap1": False, "tap2": True, "false_clicks": False, "drift": False},
     }
+
+
+def test_prompted_recording_does_not_dilute_false_click_gate(recordings, tmp_path, capsys):
+    _, quiet, _ = recordings
+    long_recording = tmp_path / "long.jsonl"
+    source = SyntheticSource(fps=20).rest(4)
+    frames = list(source.frames())
+    # Only the last frame moves far into the future. All three clicks are near the start.
+    write_recording(long_recording, source.info, [*frames[:-1], replace(frames[-1], t=2400)])
+    write_prompts(prompts_path(long_recording), [Prompt(0.45, "tap1"), Prompt(2.1, "tap2")])
+
+    eval_taps.main([str(long_recording), str(quiet), "--config", str(_CONFIG), "--json"])
+
+    report = json.loads(capsys.readouterr().out)
+    assert not report["gate"]["checks"]["false_clicks"]
+    assert report["false_clicks"]["duration_s"] == pytest.approx(3.95)
+    assert report["false_clicks"]["per_minute"] == pytest.approx(3 * 60 / 3.95)
+
+
+def test_prompted_wrong_type_and_extra_clicks_are_reported(recordings, capsys):
+    _, quiet, _ = recordings
+    write_prompts(prompts_path(quiet), [Prompt(0.45, "tap2"), Prompt(2.25, "tap2")])
+
+    eval_taps.main([str(quiet), "--config", str(_CONFIG), "--json"])
+
+    report = json.loads(capsys.readouterr().out)
+    recording, = report["recordings"]
+    assert recording["misses"] == [{"kind": "tap2", "t": 0.45, "frame_id": 9}]
+    assert recording["unmatched_clicks"] == {"left": 1, "right": 1}
+    assert report["false_clicks"]["per_minute"] is None
+    assert not report["gate"]["checks"]["false_clicks"]
+
+
+def test_negative_can_override_existing_prompts(recordings, capsys):
+    prompted, _, _ = recordings
+
+    eval_taps.main([
+        str(prompted), "--negative", str(prompted), "--config", str(_CONFIG), "--json",
+    ])
+
+    report = json.loads(capsys.readouterr().out)
+    recording, = report["recordings"]
+    assert not recording["captures"] and not recording["misses"]
+    assert report["false_clicks"]["left"] == 1
+    assert report["false_clicks"]["right"] == 2
+
+
+def test_empty_sidecar_does_not_mark_recording_as_negative(recordings, capsys):
+    _, quiet, _ = recordings
+    write_prompts(prompts_path(quiet), [])
+
+    eval_taps.main([str(quiet), "--config", str(_CONFIG), "--json"])
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["false_clicks"]["per_minute"] is None
+    assert report["unmatched_clicks"] == {"left": 1, "right": 2}
+
+
+def test_drift_uses_pre_lift_rollback_target_and_reports_tap_duration(
+    tmp_path, monkeypatch, capsys,
+):
+    path = tmp_path / "rollback.jsonl"
+    source = SyntheticSource(fps=8).open(1, 0.5).tap(ms=250)
+    write_recording(path, source.info, source.frames())
+    write_prompts(prompts_path(path), [Prompt(0.125, "tap1")])
+
+    class RollbackEngine:
+        def __init__(self, cfg, backend, info):
+            self.backend = backend
+
+        def process(self, frame):
+            if frame.t == 0.125:
+                self.backend.move_rel(30, 40)
+            elif frame.t == 0.25:
+                self.backend.move_rel(150, 0)
+            elif frame.t == 0.5:
+                self.backend.move_rel(-150, 0)
+            elif frame.t == 0.625:
+                self.backend.button("left", True)
+                self.backend.button("left", False)
+
+    monkeypatch.setattr(eval_taps, "GestureEngine", RollbackEngine)
+    args = [str(path), "--config", str(_CONFIG), "--set", "pointer.rollback_ms=250"]
+    eval_taps.main([*args, "--json"])
+
+    report = json.loads(capsys.readouterr().out)
+    capture, = report["recordings"][0]["captures"]
+    assert capture["drift_px"] == 0
+    assert capture["latency_ms"] == 500
+    assert capture["tap_duration_ms"] == 125
+    assert report["tap_duration_ms"] == {"count": 1, "median": 125, "p95": 125}
+
+    eval_taps.main(args)
+    output = capsys.readouterr().out
+    assert "İlk geri alma hareketi" in output
+    assert "bip" in output
 
 
 def test_text_with_explicit_prompts_and_grid(recordings, tmp_path, capsys):
@@ -99,14 +196,15 @@ def test_text_with_explicit_prompts_and_grid(recordings, tmp_path, capsys):
 
     eval_taps.main([*args, "--grid", "lift_up=0.4,0.6", "min_ms=40,50"])
     output = capsys.readouterr().out.splitlines()
-    assert len(output) == 4
-    assert output[0].startswith("tap.lift_up=0.4 tap.min_ms=40 | ")
+    assert len(output) == 5
+    assert output[1].startswith("tap.lift_up=0.4 tap.min_ms=40 | ")
     assert configs == [("tap", 0.5, 50), ("tap", 0.4, 40), ("tap", 0.4, 50),
                        ("tap", 0.6, 40), ("tap", 0.6, 50)]
 
 
 def test_real_engine_passes_gate_on_clean_synthetic_taps(tmp_path, capsys):
     recording = tmp_path / "taps.jsonl"
+    quiet = tmp_path / "quiet.jsonl"
     source = (
         SyntheticSource()
         .open(1, 0.5)
@@ -118,9 +216,12 @@ def test_real_engine_passes_gate_on_clean_synthetic_taps(tmp_path, capsys):
     )
     write_recording(recording, source.info, source.frames())
     write_prompts(prompts_path(recording), [Prompt(0.4, "tap1"), Prompt(2.4, "tap2")])
+    source = SyntheticSource(fps=2).rest(301)
+    write_recording(quiet, source.info, source.frames())
 
-    eval_taps.main([str(recording), "--config", str(_CONFIG), "--json"])
+    eval_taps.main([str(recording), str(quiet), "--config", str(_CONFIG), "--json"])
 
     report = json.loads(capsys.readouterr().out)
     assert report["gate"]["passed"]
     assert report["drift_px"] == {"count": 2, "median": 0, "max": 0}
+    assert report["tap_duration_ms"]["count"] == 2

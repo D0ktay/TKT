@@ -177,9 +177,9 @@ class ScreenState:
         for event in events:
             self.log.append(event)
             if event.kind == "move":
-                x, y = self.cursor
+                x, y = _clamp_cursor(self.cursor)
                 dx, dy = event.args
-                self.cursor = x + dx, y + dy
+                self.cursor = _clamp_cursor((x + dx, y + dy))
                 self.trail.append((event.t, (x, y), self.cursor, bool(self.pressed)))
             elif event.kind == "button":
                 name, down = event.args
@@ -353,10 +353,15 @@ def draw_hand(frame: HandFrame, curl_open: float, curl_closed: float) -> np.ndar
     return image
 
 
-def _screen_point(point: Point) -> Point:
+def _clamp_cursor(point: Point) -> Point:
     x, y = point
+    return max(18, min(_PANEL_WIDTH - 19, x)), max(78, min(506, y))
+
+
+def _screen_point(point: Point) -> Point:
+    x, y = _clamp_cursor(point)
     # Keep the existing virtual cursor bounds while fitting the shorter viewport.
-    return max(18, min(_PANEL_WIDTH - 19, x)), 66 + round((max(78, min(506, y)) - 78) * 258 / 428)
+    return x, 66 + round((y - 78) * 258 / 428)
 
 
 def _draw_event_log(image: np.ndarray, state: ScreenState) -> None:
