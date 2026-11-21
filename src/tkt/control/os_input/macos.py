@@ -17,6 +17,10 @@ _SYSTEM_KEYS = {
     "desktop_right": _KEY_RIGHT,
 }
 _MAX_DISPLAYS = 16
+# Sistem diktesi: "Control tuşuna iki kez bas" kısayolu (sol Control sanal tuş kodu).
+_KEY_CONTROL = 59
+_DICTATION_ACTIONS = ("dictation_start", "dictation_stop")
+_DICTATION_TAP_GAP_S = 0.05
 
 
 def _system_double_click_interval() -> float:
@@ -155,6 +159,9 @@ class MacBackend:
         self._scroll_x, self._scroll_y = x - sx, y - sy
 
     def system_action(self, name: str) -> None:
+        if name in _DICTATION_ACTIONS:
+            self._dictation_toggle()
+            return
         try:
             keycode = _SYSTEM_KEYS[name]
         except KeyError:
@@ -164,6 +171,17 @@ class MacBackend:
             event = q.CGEventCreateKeyboardEvent(None, keycode, down)
             q.CGEventSetFlags(event, q.kCGEventFlagMaskControl)
             self._post(event)
+
+    def _dictation_toggle(self) -> None:
+        """Control'e iki kez basar (macOS Dikte kısayolu bu olmalı)."""
+        q = self._q
+        for i in range(2):
+            if i:
+                time.sleep(_DICTATION_TAP_GAP_S)
+            for down in (True, False):
+                event = q.CGEventCreateKeyboardEvent(None, _KEY_CONTROL, down)
+                q.CGEventSetFlags(event, q.kCGEventFlagMaskControl if down else 0)
+                self._post(event)
 
     def release_all(self) -> None:
         self._scroll_x = self._scroll_y = 0.0

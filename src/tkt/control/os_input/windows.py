@@ -30,7 +30,11 @@ _VK_CONTROL = 0x11
 _VK_LEFT = 0x25
 _VK_RIGHT = 0x27
 _VK_LWIN = 0x5B
+_VK_H = 0x48
 _CHORDS = {
+    # Sistem diktesi (Windows sesle yazma): Win+H aç/kapat.
+    "dictation_start": (_VK_LWIN, _VK_H),
+    "dictation_stop": (_VK_LWIN, _VK_H),
     "mission_control": (_VK_LWIN, _VK_TAB),
     "desktop_left": (_VK_LWIN, _VK_CONTROL, _VK_LEFT),
     "desktop_right": (_VK_LWIN, _VK_CONTROL, _VK_RIGHT),

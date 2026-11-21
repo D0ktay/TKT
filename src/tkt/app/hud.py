@@ -42,6 +42,7 @@ _MODE_LABELS = {
     Mode.POINTER: ("IMLEC", _GREEN),
     Mode.SCROLL: ("KAYDIRMA", _BLUE),
     Mode.SWIPE: ("KAYDIRMA (4 parmak)", _BLUE),
+    Mode.DICTATE: ("DIKTE - konus (yumruk: dur)", _RED),
 }
 
 

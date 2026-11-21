@@ -22,6 +22,7 @@ class Mode(Enum):
     POINTER = 2
     SCROLL = 3
     SWIPE = 4
+    DICTATE = 5
 
 
 _MODES_BY_FINGERS = {
@@ -29,6 +30,8 @@ _MODES_BY_FINGERS = {
     ("index", "middle"): Mode.SCROLL,
     ("index", "middle", "ring"): Mode.SWIPE,
     ("index", "middle", "ring", "pinky"): Mode.SWIPE,
+    # Yalnız serçe açık (başparmak serbest, "telefon" işareti): sistem diktesi.
+    ("pinky",): Mode.DICTATE,
 }
 _TAP_FINGERS = {Mode.POINTER: ("index",), Mode.SCROLL: ("index", "middle")}
 
@@ -119,8 +122,10 @@ class GestureEngine:
                 self._send_scroll(self._scroll.tick(frame.t))
 
     def release(self) -> None:
-        """Tuşları bırak ve jest durumunu sıfırla."""
+        """Tuşları bırak, dikteyi durdur ve jest durumunu sıfırla."""
         with self._lock:
+            if self.mode is Mode.DICTATE:
+                self._backend.system_action("dictation_stop")
             self._backend.release_all()
             self._pointer.reset()
             self._stop_scroll()
@@ -200,6 +205,10 @@ class GestureEngine:
         self._open_fingers = opened
 
     def _change_mode(self, previous_mode: Mode, t: float) -> None:
+        if previous_mode is Mode.DICTATE:
+            self._backend.system_action("dictation_stop")
+        if self.mode is Mode.DICTATE:
+            self._backend.system_action("dictation_start")
         self._reset_swipe()
         if self.left_down:
             self._release_left()

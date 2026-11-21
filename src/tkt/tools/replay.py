@@ -62,6 +62,7 @@ _MODE_COLORS = {
     Mode.POINTER: _CURSOR,
     Mode.SCROLL: _PURPLE,
     Mode.SWIPE: _CURLED,
+    Mode.DICTATE: _OPEN,
 }
 _PROMPT_COLORS = {"tap1": _YELLOW, "tap2": _PURPLE}
 

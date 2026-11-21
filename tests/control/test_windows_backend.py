@@ -109,6 +109,8 @@ def test_full_step_scroll_and_reset(user32):
         ("mission_control", [(0x5B, 1), (0x09, 0)]),
         ("desktop_left", [(0x5B, 1), (0x11, 0), (0x25, 1)]),
         ("desktop_right", [(0x5B, 1), (0x11, 0), (0x27, 1)]),
+        ("dictation_start", [(0x5B, 1), (0x48, 0)]),
+        ("dictation_stop", [(0x5B, 1), (0x48, 0)]),
     ],
 )
 def test_system_actions(user32, action, presses):

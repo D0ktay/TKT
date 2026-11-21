@@ -135,3 +135,19 @@ def test_pynput_failed_mouse_up_can_be_retried(pynput_backend):
     backend.release_all()
     backend.release_all()
     assert mouse.release.call_args_list == [call("left"), call("right"), call("left")]
+
+
+@pytest.mark.parametrize("action", ["dictation_start", "dictation_stop"])
+def test_pynput_dictation_shortcuts(pynput_backend, monkeypatch, action):
+    backend, _, keyboard = pynput_backend
+    monkeypatch.setattr("tkt.control.os_input.pynput_backend.time.sleep", lambda s: None)
+    monkeypatch.setattr(
+        "tkt.control.os_input.pynput_backend.sys", SimpleNamespace(platform="darwin"))
+    backend.system_action(action)
+    assert keyboard.mock_calls == [call.press("ctrl"), call.release("ctrl")] * 2
+    keyboard.reset_mock()
+    monkeypatch.setattr(
+        "tkt.control.os_input.pynput_backend.sys", SimpleNamespace(platform="win32"))
+    backend.system_action(action)
+    assert keyboard.mock_calls == [call.press("cmd"), call.press("h"),
+                                   call.release("h"), call.release("cmd")]

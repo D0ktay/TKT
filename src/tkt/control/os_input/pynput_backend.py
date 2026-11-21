@@ -1,8 +1,14 @@
 """pynput ile işletim sistemine girdi gönderen backend."""
 
 import sys
+import time
 from contextlib import ExitStack
 from math import isfinite, trunc
+
+# Sistem diktesini aç/kapat eylemleri (ikisi de aynı kısayolu gönderir).
+DICTATION_ACTIONS = ("dictation_start", "dictation_stop")
+# macOS "Control tuşuna iki kez bas" kısayolunda iki basış arası (sn).
+DICTATION_TAP_GAP_S = 0.05
 
 
 class PynputBackend:
@@ -50,6 +56,9 @@ class PynputBackend:
 
     def system_action(self, name: str) -> None:
         key = self._keys
+        if name in DICTATION_ACTIONS:
+            self._dictation_toggle()
+            return
         if sys.platform == "win32":
             chords = {
                 "mission_control": (key.cmd, key.tab),
@@ -69,6 +78,22 @@ class PynputBackend:
             for key in chords[name]:
                 releases.callback(self._key, key, False)
                 self._key(key, True)
+
+    def _dictation_toggle(self) -> None:
+        """Sistem diktesini aç/kapat: macOS Control'e iki kez, Windows Win+H."""
+        if sys.platform == "darwin":
+            for i in range(2):
+                if i:
+                    time.sleep(DICTATION_TAP_GAP_S)
+                self._key(self._keys.ctrl, True)
+                self._key(self._keys.ctrl, False)
+        elif sys.platform == "win32":
+            with ExitStack() as releases:
+                for k in (self._keys.cmd, "h"):
+                    releases.callback(self._key, k, False)
+                    self._key(k, True)
+        else:
+            raise RuntimeError(f"Dikte bu platformda desteklenmiyor: {sys.platform}")
 
     def _key(self, key, down: bool) -> None:
         send = self._keyboard.press if down else self._keyboard.release
