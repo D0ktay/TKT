@@ -81,10 +81,8 @@ def run(args, log):
             events = [ev.args for ev in backend.events if ev.kind == "button"]
             for ev in backend.events:
                 if ev.kind == "move":
-                    cursor = tuple(
-                        max(0, min(limit, p + delta))
-                        for p, delta, limit in zip(cursor, ev.args, (959, 539), strict=True)
-                    )
+                    dx, dy = ev.args
+                    cursor = (max(0, min(959, cursor[0] - dx)), max(0, min(539, cursor[1] + dy)))
             distance = frame.pinch["index"] if frame.present and frame.pinch else None
             if distance is not None and distance <= cfg["index_pinch"]["closed"] and onset is None:
                 previous, onset = prior_cursor, before
@@ -94,6 +92,7 @@ def run(args, log):
             view = cv2.convertScaleAbs(view, alpha=0.8)
             if hand:
                 draw_skeleton(view, hand)
+            view = cv2.flip(view, 1)
             for idx, (x, y, w) in enumerate(targets):
                 color = (85, 225, 110) if idx == 0 else (145, 145, 145)
                 cv2.rectangle(view, (x, y), (x + w - 1, y + w - 1), color, -1)
