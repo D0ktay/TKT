@@ -176,7 +176,7 @@ def main():
     parser.add_argument("--control", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--full", action="store_true", help="36 denemelik yakalama testi")
-    parser.add_argument("--radius", type=int, default=4)
+    parser.add_argument("--radius", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--gain-min", type=float, help="Bu oturumun yavas hareket kazanci")
     parser.add_argument("--seed", type=int, default=42)
