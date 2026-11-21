@@ -52,22 +52,33 @@ def run(args, log):
     if args.gain_min is not None:
         cfg["pointer"]["gain_min"] = args.gain_min
     jobs = schedule(args.radius, args.repeats, args.seed)
+    base_gain = cfg["pointer"]["gain_min"]
+    if args.full:
+        jobs = [(*job, base_gain) for job in jobs]
+    else:
+        # Use the balanced two-condition schedule to compare gains at a fixed radius.
+        jobs = [
+            (size, layout, direction, args.radius, base_gain * 0.75 if condition else base_gain)
+            for size, layout, direction, condition in jobs
+            if size == 12
+        ]
     source = open_live_source(args.vision)
     backend = DryBackend()
-    engine = GestureEngine(cfg, backend, source.info)
     rows = []
     ready = False
     try:
         for frame, hand, image in source.frames_raw():
             if hand is not None and frame.pinch is None:
                 raise SystemExit("Pinch verisi yok. Kalibre C vision kaynagini kullanin (PR #45).")
-            size, layout, direction, radius = jobs[len(rows)]
+            size, layout, direction, radius, gain = jobs[len(rows)]
             target = (480 + direction * 180, 270, size)
             targets = [target]
             if layout != "alone":
                 side = -direction if layout == "pass" else direction
                 targets.append((target[0] + side * (size + 8), target[1], size))
             if not ready:
+                cfg["pointer"]["gain_min"] = gain
+                engine = GestureEngine(cfg, backend, source.info)
                 cursor = (480, 270)
                 onset = previous = choice = None
                 prior_cursor = cursor
@@ -148,11 +159,12 @@ def run(args, log):
     finally:
         source.close()
         cv2.destroyAllWindows()
-    for r in (0, args.radius):
-        group = [row for row in rows if row["radius"] == r]
+    for r, gain in sorted({(row["radius"], row["gain_min"]) for row in rows}):
+        group = [row for row in rows if row["radius"] == r and row["gain_min"] == gain]
         if group:
             print(
-                f"{r}px: {sum(row['hit'] == 0 for row in group)}/{len(group)} isabet, "
+                f"{r}px, gain={gain:g}: "
+                f"{sum(row['hit'] == 0 for row in group)}/{len(group)} isabet, "
                 f"{sum(row['hit'] == 1 for row in group)} komsu, "
                 f"medyan {statistics.median(row['seconds'] for row in group):.2f} sn"
             )
@@ -163,6 +175,7 @@ def main():
     parser.add_argument("--vision", required=True)
     parser.add_argument("--control", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--full", action="store_true", help="36 denemelik yakalama testi")
     parser.add_argument("--radius", type=int, default=4)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--gain-min", type=float, help="Bu oturumun yavas hareket kazanci")
