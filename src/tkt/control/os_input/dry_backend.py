@@ -17,26 +17,36 @@ class DryBackend:
 
     events: list[Event]
 
+    def __init__(self) -> None:
+        self.events = []
+        self._t = 0.0
+        self._pressed: dict[str, None] = {}
+
     def set_time(self, t: float) -> None:
         """Sonraki olaylar için karenin zamanını ayarla."""
-        raise NotImplementedError
+        self._t = t
 
     def move_rel(self, dx: int, dy: int) -> None:
         """Göreli hareket olayını kaydet."""
-        raise NotImplementedError
+        self.events.append(Event(self._t, "move", (dx, dy)))
 
     def button(self, name: str, down: bool) -> None:
         """Tuş olayını kaydet."""
-        raise NotImplementedError
+        self.events.append(Event(self._t, "button", (name, down)))
+        if down:
+            self._pressed[name] = None
+        else:
+            self._pressed.pop(name, None)
 
     def scroll(self, dx: float, dy: float) -> None:
         """Kaydırma olayını kaydet."""
-        raise NotImplementedError
+        self.events.append(Event(self._t, "scroll", (dx, dy)))
 
     def system_action(self, name: str) -> None:
         """Sistem eylemini kaydet."""
-        raise NotImplementedError
+        self.events.append(Event(self._t, "system", (name,)))
 
     def release_all(self) -> None:
         """Basılı tüm tuşlar için bırakma olayı kaydet."""
-        raise NotImplementedError
+        for name in tuple(self._pressed):
+            self.button(name, False)
