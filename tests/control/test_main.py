@@ -124,11 +124,11 @@ def test_live_defaults_to_pynput_and_hotkey_toggles_output(monkeypatch):
     ("args", "message"),
     [
         (["--source", "replay"], "--file gerekli"),
-        (["--backend", "native"], "native henüz yok (macos.py, V3 şeridi)"),
+        (["--backend", "native"], "native backend yalnızca Windows ve macOS'ta var"),
     ],
 )
 def test_argument_errors(args, message, capsys, monkeypatch):
-    monkeypatch.setattr(app, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(app, "sys", SimpleNamespace(platform="linux"))
     with pytest.raises(SystemExit) as error:
         app.main(args)
     assert error.value.code == 2
@@ -257,3 +257,30 @@ def test_offline_latency_is_invalid(latency_run, capsys, source):
 def test_latency_without_csv(latency_run, capsys):
     latency_run("synthetic", csv_output=False)
     assert "Gecikme (çıkış) geçersiz" in capsys.readouterr().out
+
+
+def test_mac_native_backend_selection(monkeypatch):
+    source = SimpleNamespace(info=None, frames=lambda: iter([make_frame()]), close=Mock())
+    engine = Mock()
+    calls = Mock()
+    keyboard = SimpleNamespace(GlobalHotKeys=calls.hotkeys)
+
+    class FakeMacBackend:
+        def __init__(self):
+            calls.backend_init()
+
+        release_all = calls.release_all
+
+    monkeypatch.setattr(app, "sys", SimpleNamespace(platform="darwin"))
+    monkeypatch.setattr(app, "_set_dpi_awareness", calls.dpi)
+    monkeypatch.setattr(app, "_open_source", lambda _: source)
+    monkeypatch.setattr(app, "MacBackend", FakeMacBackend)
+    monkeypatch.setattr(app, "GestureEngine", lambda *_: engine)
+    monkeypatch.setitem(sys.modules, "pynput.keyboard", keyboard)
+
+    app.main(["--backend", "native", "--source", "synthetic"])
+
+    calls.backend_init.assert_called_once()
+    calls.hotkeys.return_value.start.assert_called_once()
+    engine.process.assert_called_once()
+    calls.release_all.assert_called_once()
