@@ -55,6 +55,7 @@ class GestureEngine:
         self._thumb_close_threshold = thumb["closed"]
         self._thumb_open_threshold = thumb["open"]
         self._thumb_debounce_s = thumb["debounce_ms"] / 1000
+        self._thumb_freeze_rate = thumb["freeze_rate"]
         self._drag_threshold = thumb["drag_threshold"]
         self._still_s = thumb["still_ms"] / 1000
         self._swipe_distance = swipe["distance"]
@@ -90,6 +91,7 @@ class GestureEngine:
             self._last_reliable_t = frame.t
             # Hızlı kıvrılma aynı karede modu kapatsa bile geri almayı gönder.
             curling_fast = self._check_curl_rate(index.curl, frame.t)
+            settling = self._check_settle_rate(frame)
             previous_mode = self.mode
             self._update_mode(frame)
             if self.mode is not previous_mode:
@@ -103,7 +105,9 @@ class GestureEngine:
                 self._scroll_needs_rebase = True
             if self._tap_busy:
                 return
-            if self.mode is Mode.POINTER:
+            if self.mode is Mode.POINTER and settling:
+                self._pointer_needs_rebase = True
+            elif self.mode is Mode.POINTER:
                 self._move_pointer(index, frame.hand_size, frame.t, curling_fast)
             elif self.mode is Mode.SCROLL and scroll_pos is not None:
                 if self._scroll_needs_rebase:
@@ -130,6 +134,8 @@ class GestureEngine:
         self._last_reliable_t: float | None = None
         self._hand_missing = False
         self._previous_index: tuple[float, float] | None = None
+        self._previous_settle: tuple[float, float, float] | None = None
+        self._settling = False
         self._pointer_frozen = False
         self._pointer_needs_rebase = True
         self._tap_busy = False
@@ -158,6 +164,8 @@ class GestureEngine:
                 self._send_move(self._pointer.rollback_at(self._rollback_ms, t))
             self._wait_until = None
             self._previous_index = None
+            self._previous_settle = None
+            self._settling = False
             self._pointer_needs_rebase = True
             self._thumb_change_at = None
             self._still_history.clear()
@@ -330,10 +338,16 @@ class GestureEngine:
             self._backend.button("right", False)
 
     def _press_left(self) -> None:
+        if self.mode is Mode.POINTER:
+            # Başparmak kapanırken el kaymış olabilir: tık, kaymadan önceki yerde olsun.
+            self._send_move(self._pointer.rollback(self._rollback_ms))
         self._backend.button("left", True)
         self.left_down = True
 
     def _release_left(self) -> None:
+        if self.mode is Mode.POINTER:
+            # Başparmak açılırken el kaymış olabilir: bırakma, kaymadan önceki yerde olsun.
+            self._send_move(self._pointer.rollback(self._rollback_ms))
         self._backend.button("left", False)
         self.left_down = False
         if self._drag_origin is not None:
@@ -357,6 +371,32 @@ class GestureEngine:
             if not self.left_down and not self._tap_busy:
                 self._send_move(self._pointer.rollback(self._rollback_ms))
         return curling_fast
+
+    def _check_settle_rate(self, frame: HandFrame) -> bool:
+        """İmleç modunda başparmak hızlı oynuyor veya orta parmak hızla açılıyorsa True.
+
+        Bu sürede imleç donar (el tıklarken/mod değiştirirken kayıyor). Orta parmak
+        açılmaya başlayınca son `rollback_ms` hareket de geri alınır; başparmakta geri alma
+        tuş basılıp bırakılırken yapılır (normal harekette yanlış geri alma olmasın).
+        """
+        previous = self._previous_settle
+        middle = frame.fingers["middle"].curl
+        self._previous_settle = (frame.thumb_out, middle, frame.t)
+        if self.mode is not Mode.POINTER or previous is None:
+            self._settling = False
+            return False
+        thumb_prev, middle_prev, t_prev = previous
+        dt = frame.t - t_prev
+        if dt <= 0:
+            return self._settling
+        thumb_fast = abs(frame.thumb_out - thumb_prev) / dt > self._thumb_freeze_rate
+        middle_opening = (middle_prev - middle) / dt > self._freeze_curl_rate
+        # Hızlı kıvırma donması aynı karede zaten geri aldıysa ikinci kez alınmaz.
+        if middle_opening and not self._settling and not self._tap_busy \
+                and not self._pointer_frozen:
+            self._send_move(self._pointer.rollback(self._rollback_ms))
+        self._settling = thumb_fast or middle_opening
+        return self._settling
 
     def _move_pointer(self, index: Finger, hand_size: float, t: float, curling_fast: bool) -> None:
         if "index" not in self._open_fingers:

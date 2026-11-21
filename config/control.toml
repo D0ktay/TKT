@@ -16,6 +16,7 @@ open = 0.50
 debounce_ms = 30
 drag_threshold = 0.03       # el boyu
 still_ms = 150              # sağ tık için elin durgun olması gereken süre
+freeze_rate = 4.0           # 1/sn; thumb_out bundan hızlı değişirse imleç donar (tık kayması)
 
 [pointer]
 min_cutoff = 1.0

@@ -24,6 +24,7 @@ def rig(monkeypatch, request):
             "closed": 0.25,
             "open": 0.5,
             "debounce_ms": 31.25,
+            "freeze_rate": 4.0,
             "drag_threshold": 0.05,
             "still_ms": 125,
         },
