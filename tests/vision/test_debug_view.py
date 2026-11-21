@@ -1,10 +1,13 @@
 import math
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import cv2
 import numpy as np
 import pytest
 
-from tkt.core.types import FINGERS, Finger, HandFrame
+from tkt.core.types import FINGERS, SCHEMA_VERSION, Finger, HandFrame, SourceInfo
 from tkt.vision import debug_view as dv
 from tkt.vision import hand_calib
 from tkt.vision.debug_view import (
@@ -67,8 +70,10 @@ def hand_for_step(step):
 class FakeSource:
     """frames_raw: (kare, el, görüntü) üretir; kamera/tracker yok."""
 
-    def __init__(self, items):
+    def __init__(self, items, width=640, height=512):
         self.items = list(items)
+        self.info = SourceInfo(schema=SCHEMA_VERSION, width=width, height=height, fps=60.0,
+                               hand="right")
         self.closed = False
         self.last_process_ms = 8.0
         self.calibrations = []
@@ -407,6 +412,13 @@ def test_tap_session_windows_and_samples():
     assert s.state().progress == 1.0
 
 
+def test_tap_session_window_bounds():
+    s = TapSession(n=3, window_s=2.0, lead_s=1.0)
+    assert s.windows == []
+    s.add(make_hand(), 10.0)
+    assert s.windows == [(11.0, 13.0), (13.0, 15.0), (15.0, 17.0)]
+
+
 def test_tap_session_backwards_time_ignored():
     s = TapSession(n=2, window_s=1.0, lead_s=0.0)
     s.add(make_hand(), 5.0)
@@ -442,27 +454,33 @@ def test_run_tap_calls_fit_taps_and_applies(rec, tmp_path, monkeypatch):
         tap_ref={f: 0.4 for f in FINGERS}, angle_sign=-1.0)
     calls = []
 
-    def fake_fit(calib, samples):
-        calls.append((calib, list(samples)))
+    def fake_fit(calib, samples, **kw):
+        calls.append((calib, list(samples), kw))
         return fitted
 
     monkeypatch.setattr(hand_calib, "fit_taps", fake_fit)
-    src = FakeSource(_tap_items(_tap_total_frames()))
+    src = FakeSource(_tap_items(_tap_total_frames()), width=512, height=640)
     dv.run(src, path)
-    (calib_arg, samples), = calls
+    (calib_arg, samples, kw), = calls
     assert calib_arg == hand_calib.DEFAULT       # dosya yoksa DEFAULT
     assert samples and all(isinstance(t, float) and isinstance(h, RawHand)
                            for t, h in samples)
     # hazırlık süresindeki kareler (t < t0 + lead) toplanmadı; 't' ilk karede basıldı,
     # oturum 2. kareden başlar
     assert min(t for t, _ in samples) >= 20.25 + dv.TAP_LEAD_SECONDS
+    # kesintisiz örnek akışı: pencere sınırları ayrıca verilir (boşluktan ayrılamaz)
+    start = 20.25 + dv.TAP_LEAD_SECONDS
+    w = dv.TAP_WINDOW_SECONDS
+    assert kw["windows"] == [pytest.approx((start + k * w, start + (k + 1) * w))
+                             for k in range(dv.TAP_COUNT)]
+    assert kw["aspect"] == pytest.approx(512 / 640)
     assert src.calibrations == [fitted]
     assert hand_calib.load(path) == fitted
     assert r.destroyed == 1 and src.closed
 
 
 def test_run_tap_fit_not_implemented_does_not_crash(rec, tmp_path, monkeypatch):
-    def nope(calib, samples):
+    def nope(calib, samples, **kw):
         raise NotImplementedError
 
     monkeypatch.setattr(hand_calib, "fit_taps", nope)
@@ -484,7 +502,7 @@ def test_run_tap_fit_not_implemented_does_not_crash(rec, tmp_path, monkeypatch):
 
 
 def test_run_tap_fit_value_error_and_no_hand(rec, tmp_path, monkeypatch):
-    def bad(calib, samples):
+    def bad(calib, samples, **kw):
         raise ValueError("tepe bulunamadi")
 
     monkeypatch.setattr(hand_calib, "fit_taps", bad)
@@ -571,18 +589,96 @@ def test_render_lift_graph_window_drops_old_samples():
     assert np.array_equal(b, render_lift_graph([], 100, 50))   # eskiler pencere dışı
 
 
-def test_run_draws_lift_graph_into_overlay(rec):
+def _graph_rect(h, w):
+    """draw_lift_graph'ın yerleşimi (aynı formül)."""
+    u = max(12, round(h / 36))
+    pad = u // 2
+    gw, gh = min(w // 3, 8 * u * 2), min(h // 6, 5 * u)
+    return w - gw - pad, pad + 4 * u + pad, gw, gh
+
+
+def test_run_draws_lift_graph_into_overlay(rec, monkeypatch):
     # lift dolu karelerle grafik köşede çizilir; lift None iken curl kullanılır (çökmez)
     img = np.zeros((512, 640, 3), np.uint8)
     r = rec([])
+    calls = []
+    real = dv.draw_lift_graph
+
+    def spy(out, history):
+        calls.append(list(history))
+        real(out, history)
+
+    monkeypatch.setattr(dv, "draw_lift_graph", spy)
     items = [(make_frame(t=1.0 + i * 0.1, frame_id=i, lift=(0.8 if i % 2 else None)),
               make_hand(), img) for i in range(40)]
     dv.run(FakeSource(items), "unused")
+    assert len(calls) == 40
+    # son çağrıda geçmiş: son LIFT_GRAPH_SECONDS sn; lift varsa lift, yoksa curl (0.3)
+    hist = calls[-1]
+    assert hist[-1][0] == pytest.approx(1.0 + 39 * 0.1)
+    assert sorted({round(v, 6) for _t, v, _m in hist}) == [0.3, 0.8]
     last = r.shown[-1][1]
-    x = last.shape[1] - 5
-    corner = last[: last.shape[0] // 2, last.shape[1] * 2 // 3:]
-    assert corner.shape[0] and np.any(corner != 0) and last.shape == (512, 640, 3)
-    assert x > 0
+    assert last.shape == (512, 640, 3)
+    x0, y0, gw, gh = _graph_rect(512, 640)
+    region = last[y0:y0 + gh, x0:x0 + gw]
+    # grafiğe özgü pikseller: zemin (30), çerçeve ve parmak çizgisi (işaret ve orta aynı
+    # değerde; orta en son çizildiği için onun rengi görünür)
+    assert np.array_equal(region[gh // 4, 2], [30, 30, 30])
+    assert np.array_equal(region[0, gw // 2], dv._GRAY)
+    assert np.any(np.all(region == dv._GRAPH_COLORS["middle"], axis=2))
+
+
+def test_overlay_without_graph_has_no_graph_pixels():
+    # yukarıdaki denetimin anlamlı olduğunu gösterir: grafik yoksa bu pikseller yok
+    img = np.zeros((512, 640, 3), np.uint8)
+    out = draw_overlay(img, make_frame(lift=0.8), make_hand(), STATS)
+    x0, y0, gw, gh = _graph_rect(512, 640)
+    region = out[y0:y0 + gh, x0:x0 + gw]
+    assert not np.array_equal(region[gh // 4, 2], [30, 30, 30])
+    assert not np.any(np.all(region == dv._GRAPH_COLORS["middle"], axis=2))
+
+
+# ---------------------------------------------------------------- macOS kapatma düğmesi
+
+
+def _fake_appkit(monkeypatch, title=dv.WINDOW_NAME, style=1):
+    native = Mock()
+    native.title.return_value = title
+    native.styleMask.return_value = style
+    native.isReleasedWhenClosed.return_value = True
+    app = Mock()
+    app.windows.return_value = [native]
+    appkit = SimpleNamespace(
+        NSApplication=SimpleNamespace(sharedApplication=lambda: app),
+        NSWindowStyleMaskClosable=2,
+    )
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+    return native
+
+
+def test_run_enables_cocoa_close_button_and_restores(rec, monkeypatch):
+    native = _fake_appkit(monkeypatch)
+    monkeypatch.setattr(dv, "platform", "darwin")
+    monkeypatch.setattr(cv2, "currentUIFramework", lambda: "COCOA", raising=False)
+    r = rec([-1, -1, ord("q")])
+    img = np.zeros((256, 320, 3), np.uint8)
+    items = [(make_frame(t=1.0 + i * 0.1, frame_id=i), make_hand(), img) for i in range(5)]
+    dv.run(FakeSource(items), "unused")
+    native.setStyleMask_.assert_called_once_with(3)
+    assert [c.args for c in native.setReleasedWhenClosed_.call_args_list] == [(False,), (True,)]
+    assert r.destroyed == 1
+
+
+def test_cocoa_close_skipped_off_mac_or_already_closable(monkeypatch):
+    native = _fake_appkit(monkeypatch, style=3)
+    monkeypatch.setattr(cv2, "currentUIFramework", lambda: "COCOA", raising=False)
+    monkeypatch.setattr(dv, "platform", "win32")
+    assert dv._enable_cocoa_close() is None
+    monkeypatch.setattr(dv, "platform", "darwin")
+    assert dv._enable_cocoa_close() is None          # zaten kapatılabilir
+    native.setStyleMask_.assert_not_called()
+    monkeypatch.setattr(cv2, "currentUIFramework", lambda: "QT", raising=False)
+    assert dv._enable_cocoa_close() is None
 
 
 # ---------------------------------------------------------------- CLI

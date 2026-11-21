@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import math
 from collections import deque
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from sys import platform
+from typing import Any
 
 import cv2
 import numpy as np
@@ -284,6 +288,19 @@ class TapSession:
         return self.lead_s + self.n * self.window_s
 
     @property
+    def windows(self) -> list[tuple[float, float]]:
+        """Tap pencerelerinin gerçek sınırları `[başlangıç, bitiş)`; oturum başlamadıysa boş.
+
+        Örnek akışı pencereler arasında kesintisizdir; `fit_taps` pencereleri zaman
+        boşluğundan ayıramaz, sınırlar bu yüzden açıkça verilir.
+        """
+        if self._t0 is None:
+            return []
+        start = self._t0 + self.lead_s
+        return [(start + k * self.window_s, start + (k + 1) * self.window_s)
+                for k in range(self.n)]
+
+    @property
     def done(self) -> bool:
         return self._elapsed >= self.duration
 
@@ -425,6 +442,41 @@ def _lift_value(frame: HandFrame, name: str) -> float | None:
     return finger.curl if finger.lift is None else finger.lift
 
 
+def _enable_cocoa_close() -> tuple[Any, bool] | None:
+    """macOS/Cocoa: pencereye kapatma (X) düğmesini ekler; (pencere, eski ayar) veya None.
+
+    OpenCV 4.11 Cocoa pencerelerini kapatılabilir stil olmadan oluşturur. Pencere kapanınca
+    serbest bırakılmasın diye `releasedWhenClosed` kapatılır; HighGUI pencereyi kendi
+    kaydından silene dek yaşamalıdır. `_restore_cocoa` eski ayarı geri yükler.
+    tools/replay.py'deki aynı fonksiyonun kopyası: vision, control'ü import eden
+    tools.replay'i import edemez.
+    """
+    ui = getattr(cv2, "currentUIFramework", None)
+    if platform != "darwin" or ui is None or ui() != "COCOA":
+        return None
+    try:
+        from AppKit import NSApplication, NSWindowStyleMaskClosable
+    except ImportError:
+        return None
+    for window in NSApplication.sharedApplication().windows():
+        if window.title() == WINDOW_NAME:
+            style = window.styleMask()
+            if not style & NSWindowStyleMaskClosable:
+                releases_on_close = window.isReleasedWhenClosed()
+                window.setReleasedWhenClosed_(False)
+                window.setStyleMask_(style | NSWindowStyleMaskClosable)
+                return window, releases_on_close
+            break
+    return None
+
+
+def _restore_cocoa(cocoa: tuple[Any, bool] | None) -> None:
+    if cocoa is not None:
+        window, releases_on_close = cocoa
+        with suppress(Exception):
+            window.setReleasedWhenClosed_(releases_on_close)
+
+
 def _window_visible() -> bool | None:
     """Pencere görünür mü? Backend desteklemiyorsa None."""
     try:
@@ -448,6 +500,8 @@ def run(source: LiveSource, calib_path: Path) -> None:
     message = ""
     message_until = 0.0
     seen_visible = False
+    shown = False
+    cocoa: tuple[Any, bool] | None = None
     try:
         for frame, hand, image in source.frames_raw():
             if message and frame.t > message_until:
@@ -488,6 +542,9 @@ def run(source: LiveSource, calib_path: Path) -> None:
             if tap_state is not None:
                 draw_tap_prompt(out, tap_state)
             cv2.imshow(WINDOW_NAME, out)
+            if not shown:
+                shown = True
+                cocoa = _enable_cocoa_close()
             key = cv2.waitKey(1) & 0xFF
             if key in KEY_QUIT:
                 break
@@ -504,6 +561,7 @@ def run(source: LiveSource, calib_path: Path) -> None:
                 message = ""
     finally:
         source.close()
+        _restore_cocoa(cocoa)
         cv2.destroyAllWindows()
 
 
@@ -534,6 +592,17 @@ def _finish_calibration(session: CalibrationSession, source: LiveSource,
     return err or "Kaydedildi ve uygulandi", t + MESSAGE_SECONDS, result
 
 
+def _source_aspect(source: LiveSource) -> float:
+    """Kaynak görüntünün genişlik / yüksekliği; bilinmiyorsa 1.0."""
+    info = getattr(source, "info", None)
+    w, h = getattr(info, "width", 0), getattr(info, "height", 0)
+    try:
+        a = float(w) / float(h)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 1.0
+    return a if math.isfinite(a) and a > 0 else 1.0
+
+
 def _finish_tap(tap: TapSession, source: LiveSource, calib: HandCalibration,
                 calib_path: Path, t: float) -> tuple[str, float, HandCalibration]:
     """Tap örneklerinden `fit_taps` ile kalibrasyonu çıkarır, uygular ve kaydeder."""
@@ -541,7 +610,8 @@ def _finish_tap(tap: TapSession, source: LiveSource, calib: HandCalibration,
     if not tap.samples:
         return "Tap kalibrasyonu basarisiz: el gorunmedi", until, calib
     try:
-        result = hand_calib.fit_taps(calib, tap.samples)
+        result = hand_calib.fit_taps(calib, tap.samples, aspect=_source_aspect(source),
+                                     windows=tap.windows)
     except NotImplementedError:
         return "fit_taps henuz yok", until, calib
     except ValueError as e:
