@@ -27,8 +27,8 @@ class HandCalibration:
 
 # Kalibrasyon yokken kullanılır. Kaba değerlerdir; ilk kayıtlar bununla alınır, `fit_hand`
 # kişiye göre yeniler.
-# - curl_raw (orta + uç eklem bükülmesi, radyan): açık elde eklemler neredeyse düz (~0,2);
-#   yumrukta orta eklem ~100°, uç eklem ~70° (~3,0).
+# - curl_raw (orta + uç eklem bükülmesi, radyan, görüntü noktaları): açık elde eklemler
+#   neredeyse düz (~0,2); yumrukta ~3,0 (kayıtta kıvrık parmak 2,6–2,9 ölçüldü).
 # - thumb_raw (başparmak ucu–işaret kökü / bilek–orta kök, dünya noktaları): ele yapışık
 #   başparmağın ucu işaret parmağının ilk boğumu yanındadır (~2–3 cm / ~9 cm ≈ 0,35);
 #   serbest başparmakta uç kökten ~7 cm uzaktadır (≈ 0,8).
@@ -91,7 +91,7 @@ def _median(values: list[float]) -> float:
 
 
 def fit_hand(open_s: list[RawHand], fist_s: list[RawHand],
-             thumb_closed_s: list[RawHand]) -> HandCalibration:
+             thumb_closed_s: list[RawHand], aspect: float = 1.0) -> HandCalibration:
     """Açık el, yumruk ve kapalı başparmak örneklerinin medyanından kalibrasyon.
 
     - `open_ref[f]`: açık el örneklerinde `curl_raw` medyanı; `fist_ref[f]`: yumrukta.
@@ -100,7 +100,8 @@ def fit_hand(open_s: list[RawHand], fist_s: list[RawHand],
 
     Medyan, tek tük bozuk karelerin sonucu kaydırmasını önler. Boş liste veya yumruk
     değeri açık elden büyük olmayan parmak (ya da açık başparmak değeri kapalıdan büyük
-    değilse) `ValueError` yükseltir. `tap_ref` None, `angle_sign` 1.0 kalır.
+    değilse) `ValueError` yükseltir. `tap_ref` None, `angle_sign` 1.0 kalır. `aspect`:
+    görüntü genişliği / yüksekliği, `curl_raw`'a geçer (`build_frame` ile aynı olmalı).
     """
     # features bu modülden HandCalibration'ı import eder; döngüyü önlemek için burada.
     from tkt.vision.features import FINGER_JOINTS, curl_raw, thumb_raw
@@ -113,8 +114,8 @@ def fit_hand(open_s: list[RawHand], fist_s: list[RawHand],
     open_ref: dict[str, float] = {}
     fist_ref: dict[str, float] = {}
     for finger in FINGER_JOINTS:
-        o = _median([curl_raw(h, finger) for h in open_s])
-        f = _median([curl_raw(h, finger) for h in fist_s])
+        o = _median([curl_raw(h, finger, aspect) for h in open_s])
+        f = _median([curl_raw(h, finger, aspect) for h in fist_s])
         if not f > o:
             raise ValueError(
                 f"fit_hand: {finger} için yumruk ({f:.3f}) açık elden ({o:.3f}) büyük değil"
@@ -200,12 +201,12 @@ class CalibrationSession:
             return
         self.samples[step].append(hand)
 
-    def result(self) -> HandCalibration:
+    def result(self, aspect: float = 1.0) -> HandCalibration:
         """Toplanan örneklerden `fit_hand`. Oturum bitmediyse veya veri bozuksa `ValueError`."""
         if not self.done:
             raise ValueError("kalibrasyon oturumu bitmedi")
         return fit_hand(self.samples["open"], self.samples["fist"],
-                        self.samples["thumb_closed"])
+                        self.samples["thumb_closed"], aspect)
 
 
 # fit_taps: örnekler arasında bundan uzun boşluk yeni bir bip penceresi başlatır (sn).

@@ -44,6 +44,13 @@ JUMP_FACTOR = 0.5
 _EPS = 1e-9
 
 
+def _joints(finger: str) -> tuple[int, int, int, int]:
+    try:
+        return FINGER_JOINTS[finger]
+    except KeyError:
+        raise ValueError(f"bilinmeyen parmak adı: {finger!r}") from None
+
+
 def _flexion(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     """`b` eklemindeki bükülme açısı (radyan); düz parmakta ~0."""
     u = b - a
@@ -56,20 +63,19 @@ def _flexion(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     return math.acos(min(1.0, max(-1.0, cos)))
 
 
-def _joints(finger: str) -> tuple[int, int, int, int]:
-    try:
-        return FINGER_JOINTS[finger]
-    except KeyError:
-        raise ValueError(f"bilinmeyen parmak adı: {finger!r}") from None
+def curl_raw(hand: RawHand, finger: str, aspect: float = 1.0) -> float:
+    """Orta ve uç eklem bükülmesinin toplamı (radyan), görüntü (2B) noktalarıyla.
 
+    Kök eklemi dışarıdadır; kökten hareket `lift`'e aittir. Düz parmak kökten kalksa da
+    görüntüde düz kalır, açı değişmez. `aspect` = görüntü genişliği / yüksekliği; x ekseni
+    buna göre ölçeklenir, açılar piksel uzayında ölçülür.
 
-def curl_raw(hand: RawHand, finger: str) -> float:
-    """Orta ve uç eklem bükülmesinin toplamı (radyan, dünya noktalarıyla).
-
-    Kök eklemi dışarıdadır; kökten hareket `lift`'e aittir.
+    Dünya (3B) noktaları kullanılmaz: tek parmak açıkken MediaPipe'ın derinlik tahmini o
+    parmağı kıvrık gösteriyor, görüntü noktaları ise doğru (kayıt ölçümü, 2026-11-21:
+    açık ~0,1, kıvrık ~2,6–2,9 rad).
     """
     mcp, pip, dip, tip = _joints(finger)
-    p = np.asarray(hand.world_pts, dtype=float)
+    p = np.asarray(hand.image_pts, dtype=float) * (float(aspect), 1.0)
     return _flexion(p[mcp], p[pip], p[dip]) + _flexion(p[pip], p[dip], p[tip])
 
 
@@ -147,11 +153,13 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
         return _empty_frame(t, frame_id)
 
     img = np.asarray(hand.image_pts, dtype=float)
+    aspect = info.width / info.height if info.height else 1.0
 
     fingers: dict[str, Finger] = {}
     for name in FINGERS:
         tip = FINGER_JOINTS[name][3]
-        curl = _normalize(curl_raw(hand, name), calib.open_ref[name], calib.fist_ref[name])
+        curl = _normalize(curl_raw(hand, name, aspect), calib.open_ref[name],
+                          calib.fist_ref[name])
         lift_v = None
         if lift is not None and name in lift and lift[name] is not None:
             lift_v = float(lift[name])

@@ -515,11 +515,11 @@ class GuidedCalibration:
         if el >= self.countdown_s and hand is not None:
             self.samples[STEPS[self._index]].append(hand)
 
-    def result(self) -> HandCalibration:
+    def result(self, aspect: float = 1.0) -> HandCalibration:
         if not self.done:
             raise ValueError("kalibrasyon oturumu bitmedi")
         return hand_calib.fit_hand(self.samples["open"], self.samples["fist"],
-                                   self.samples["thumb_closed"])
+                                   self.samples["thumb_closed"], aspect)
 
 
 def _guided_state(g: GuidedCalibration) -> CalibState:
@@ -718,7 +718,7 @@ def _finish_calibration(session: CalibrationSession | GuidedCalibration, source:
     Daha önce çıkarılmış `tap_ref`/`angle_sign` korunur: eğri kalibrasyonu lift'i etkilemez.
     """
     try:
-        result = session.result()
+        result = session.result(aspect=_source_aspect(source))
     except ValueError as e:
         # Örn. örnek yok (el görünmedi) veya yumruk açık elden büyük değil.
         return f"Kalibrasyon basarisiz: {e}"[:90], t + MESSAGE_SECONDS, calib

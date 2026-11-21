@@ -10,6 +10,7 @@ from tkt.vision.hand_calib import DEFAULT, HandCalibration
 from tkt.vision.tracker import RawHand
 
 INFO = SourceInfo(schema=SCHEMA_VERSION, width=640, height=512, fps=60.0, hand="right")
+ASPECT = INFO.width / INFO.height
 PORTRAIT = SourceInfo(schema=SCHEMA_VERSION, width=512, height=640, fps=60.0, hand="right")
 
 # Parmak kökleri (dünya, metre): bilekten 9 cm ileride, yan yana; orta kök tam karşıda.
@@ -28,8 +29,10 @@ def make_hand(pip: float | dict[str, float] = 0.0, dip: float | dict[str, float]
               center: tuple[float, float] = (0.5, 0.6), scale: float = 2.0) -> RawHand:
     """Yapay 21 nokta. `pip`, `dip`: orta ve uç eklem bükülmesi (radyan).
 
-    Görüntü noktaları dünya noktalarının x-y izdüşümüdür: ileri (+y dünya) görüntüde yukarı
-    (y azalır). `center` bileğin görüntü konumu, `scale` metre → görüntü birimi.
+    Görüntü noktaları eğik izdüşümdür: görüntü x = dünya x + z / ASPECT, görüntü y = -dünya y
+    (ileri görüntüde yukarı). Bükülme y-z düzleminde olduğundan INFO'nun piksel uzayında
+    açısı korunur; z=0 olan noktalar (avuç, düz parmak) düz x-y izdüşümüyle aynıdır.
+    `center` bileğin görüntü konumu, `scale` metre → görüntü birimi.
     """
     w = np.zeros((21, 3))
     w[0] = (0.0, 0.0, 0.0)
@@ -48,7 +51,8 @@ def make_hand(pip: float | dict[str, float] = 0.0, dip: float | dict[str, float]
     w[2] = (-0.05, 0.04, 0.0)
     w[3] = (-0.06, 0.06, 0.0)
     w[4] = w[5] + np.array([-thumb_dist, 0.0, 0.0])
-    img = np.stack([center[0] + w[:, 0] * scale, center[1] - w[:, 1] * scale], axis=1)
+    img = np.stack([center[0] + (w[:, 0] + w[:, 2] / ASPECT) * scale,
+                    center[1] - w[:, 1] * scale], axis=1)
     return RawHand(image_pts=img, world_pts=w, score=score)
 
 
@@ -64,19 +68,40 @@ def test_straight_finger_curl_raw_zero():
 def test_curl_raw_sums_pip_and_dip():
     hand = make_hand(pip=1.7, dip=1.2)
     for name in FINGERS:
-        assert curl_raw(hand, name) == pytest.approx(2.9, abs=1e-6)
+        assert curl_raw(hand, name, ASPECT) == pytest.approx(2.9, abs=1e-6)
 
 
 def test_curl_raw_ignores_mcp_flexion():
-    """Kök eklemden bükülme (lift) curl_raw'u değiştirmez."""
-    hand = make_hand(pip=0.5, dip=0.3)
-    w = hand.world_pts.copy()
+    """Kök eklemden kalkış (lift) curl_raw'u değiştirmez: düz parmak görüntüde düz kalır."""
+    hand = make_hand()
+    img = hand.image_pts.copy()
     mcp, p, d, t = features.FINGER_JOINTS["index"]
-    # İşaret parmağını kökten 30° kaldır: tüm parmak kök etrafında döner.
+    # Düz işaret parmağını kökten kaldır: görüntüde parmak kısalır ama doğru kalır.
     for i in (p, d, t):
-        w[i] = w[mcp] + _rot_x(w[i] - w[mcp], 0.5)
-    lifted = RawHand(image_pts=hand.image_pts, world_pts=w, score=hand.score)
-    assert curl_raw(lifted, "index") == pytest.approx(0.8, abs=1e-6)
+        img[i] = img[mcp] + 0.6 * (img[i] - img[mcp])
+    lifted = RawHand(image_pts=img, world_pts=hand.world_pts, score=hand.score)
+    assert curl_raw(lifted, "index") == pytest.approx(0.0, abs=1e-6)
+
+
+def test_curl_raw_uses_image_points_not_world():
+    """Dünya noktaları bozuk olsa da (MediaPipe derinlik hatası) sonuç görüntüden gelir."""
+    hand = make_hand(pip=0.5, dip=0.3)
+    broken = RawHand(image_pts=hand.image_pts, world_pts=make_hand(pip=1.7).world_pts,
+                     score=hand.score)
+    assert curl_raw(broken, "index", ASPECT) == pytest.approx(0.8, abs=1e-6)
+
+
+def test_curl_raw_aspect_scales_x():
+    """Açı piksel uzayında ölçülür: x ekseni aspect ile ölçeklenir."""
+    hand = make_hand()
+    img = hand.image_pts.copy()
+    mcp, p, d, t = features.FINGER_JOINTS["index"]
+    # Orta eklemden sonra 45° (normalize birimde) yana kıvrık parmak.
+    img[d] = img[p] + (0.02, -0.02)
+    img[t] = img[d] + (0.02, -0.02)
+    bent = RawHand(image_pts=img, world_pts=hand.world_pts, score=hand.score)
+    assert curl_raw(bent, "index") == pytest.approx(math.pi / 4, abs=1e-6)
+    assert curl_raw(bent, "index", aspect=2.0) == pytest.approx(math.atan(2.0), abs=1e-6)
 
 
 def test_curl_raw_unknown_finger():

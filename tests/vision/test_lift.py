@@ -28,6 +28,11 @@ def _rot_x(v: np.ndarray, a: float) -> np.ndarray:
     return np.array([v[0], c * v[1] - s * v[2], s * v[1] + c * v[2]])
 
 
+# Kıvrılmanın görüntü x'ine eklenen payı (curl 2B ölçülür, x-y izdüşümünde düz çizgi
+# kalırdı). Yalnızca kıvrılmadan gelen kayma eklenir; düz parmağın lift geometrisi değişmez.
+SHEAR = 1.0
+
+
 def make_hand(lift: dict[str, float] | None = None, curl: float | dict[str, float] = 0.0,
               tilt: float = 0.0, flip_z: bool = False) -> RawHand:
     """Yapay 21 nokta (test_features.make_hand gibi).
@@ -35,10 +40,12 @@ def make_hand(lift: dict[str, float] | None = None, curl: float | dict[str, floa
     `lift[f]`: parmağın kökten kalkış açısı (radyan, +z yönüne). `curl`: orta ve uç eklemin
     her birinde bükülme (radyan, -z yönüne). `tilt`: tüm parmakların kökten ortak açısı
     (yavaş duruş değişimi). `flip_z`: dünya noktalarını z'de aynalar (diğer yön).
-    Görüntü noktaları x-y izdüşümüdür; ileri (+y) görüntüde yukarı.
+    Görüntü noktaları x-y izdüşümüdür; ileri (+y) görüntüde yukarı. Kıvrık parmakta
+    kıvrılmanın kaydırdığı z, `SHEAR` ile görüntü x'ine eklenir.
     """
     lift = lift or {}
     w = np.zeros((21, 3))
+    shear = np.zeros(21)
     for name, (mcp, p_i, d_i, t_i) in FINGER_JOINTS.items():
         c = curl.get(name, 0.0) if isinstance(curl, dict) else curl
         w[mcp] = (MCP_X[name], 0.09, 0.0)
@@ -46,16 +53,18 @@ def make_hand(lift: dict[str, float] | None = None, curl: float | dict[str, floa
         rel = [SEG[0] * d0]
         rel.append(rel[0] + SEG[1] * _rot_x(d0, -c))
         rel.append(rel[1] + SEG[2] * _rot_x(d0, -2 * c))
+        straight = [SEG[0] * d0, (SEG[0] + SEG[1]) * d0, sum(SEG) * d0]
         a = lift.get(name, 0.0) + tilt
-        for idx, r in zip((p_i, d_i, t_i), rel, strict=True):
+        for idx, r, s in zip((p_i, d_i, t_i), rel, straight, strict=True):
             w[idx] = w[mcp] + _rot_x(r, a)
+            shear[idx] = SHEAR * (_rot_x(r, a)[2] - _rot_x(s, a)[2])
     w[1] = (-0.03, 0.02, 0.0)
     w[2] = (-0.05, 0.04, 0.0)
     w[3] = (-0.06, 0.06, 0.0)
     w[4] = w[5] + np.array([-0.07, 0.0, 0.0])
     if flip_z:
         w[:, 2] *= -1
-    img = np.stack([0.5 + w[:, 0] * 2.0, 0.8 - w[:, 1] * 2.0], axis=1)
+    img = np.stack([0.5 + (w[:, 0] + shear) * 2.0, 0.8 - w[:, 1] * 2.0], axis=1)
     return RawHand(image_pts=img, world_pts=w, score=0.95)
 
 

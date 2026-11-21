@@ -42,7 +42,8 @@ def make_hand(pip: float = 0.0, dip: float = 0.0, thumb_dist: float = 0.07) -> R
     w[2] = (-0.05, 0.04, 0.0)
     w[3] = (-0.06, 0.06, 0.0)
     w[4] = w[5] + np.array([-thumb_dist, 0.0, 0.0])
-    img = np.stack([0.5 + w[:, 0] * 2.0, 0.6 - w[:, 1] * 2.0], axis=1)
+    # Eğik izdüşüm (görüntü x = dünya x + z): bükülme görüntüde görünür.
+    img = np.stack([0.5 + (w[:, 0] + w[:, 2]) * 2.0, 0.6 - w[:, 1] * 2.0], axis=1)
     return RawHand(image_pts=img, world_pts=w, score=0.95)
 
 
@@ -157,7 +158,8 @@ def test_fit_hand_uses_median():
 
 
 def test_fit_hand_maps_poses_to_unit_range():
-    c = fit_hand([_open()] * 3, [_fist()] * 3, [_thumb_closed()] * 3)
+    c = fit_hand([_open()] * 3, [_fist()] * 3, [_thumb_closed()] * 3,
+                 aspect=INFO.width / INFO.height)
     open_f = build_frame(_open(), 0.0, 0, c, INFO)
     fist_f = build_frame(_fist(), 0.0, 1, c, INFO)
     closed_f = build_frame(_thumb_closed(), 0.0, 2, c, INFO)
