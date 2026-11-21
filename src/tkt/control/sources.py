@@ -63,6 +63,7 @@ class _Step:
     move: tuple[float, float] = (0.0, 0.0)
     tap: tuple[str, ...] = ()
     present: bool = True
+    pinch: dict[str, float] | None = None
 
 
 def _unit(value: float) -> float:
@@ -95,6 +96,7 @@ class SyntheticSource:
         self._with_lift = with_lift
         self._closed = Event()
         self._steps: list[_Step] = []
+        self._pinch: dict[str, float] | None = None
         self._open_count = 0
         self._thumb_out = 1.0
 
@@ -102,7 +104,7 @@ class SyntheticSource:
         if not isfinite(s) or s < 0:
             raise ValueError("Adım süresi negatif veya sonsuz olamaz")
         count = max(1, round(s * self.info.fps)) if s else 0
-        step = _Step(count, self._open_count, self._thumb_out)
+        step = _Step(count, self._open_count, self._thumb_out, pinch=self._pinch)
         self._steps.append(replace(step, **changes))
         return self
 
@@ -122,6 +124,13 @@ class SyntheticSource:
 
     def thumb(self, closed: bool, s: float = 0.1) -> Self:
         self._thumb_out = float(not closed)
+        return self._append(s)
+
+    def pinch(self, finger: str | None, s: float = 0.1) -> Self:
+        """Hold a pinch across steps; None opens all four measured fingers."""
+        if finger is not None and finger not in FINGERS:
+            raise ValueError("Bilinmeyen pinch parmağı")
+        self._pinch = {name: float(name != finger) for name in FINGERS}
         return self._append(s)
 
     def tap(self, fingers: tuple[str, ...] = ("index",), ms: float = 150) -> Self:
@@ -180,7 +189,8 @@ class SyntheticSource:
                 ),
             )
             fingers[name] = Finger(img, None, curl, lift if self._with_lift else None)
-        return HandFrame(t, frame_id, True, fingers, step.thumb_out, palm, 0.2, 1.0)
+        pinch = step.pinch.copy() if step.pinch is not None else None
+        return HandFrame(t, frame_id, True, fingers, step.thumb_out, palm, 0.2, 1.0, pinch)
 
     def close(self) -> None:
         self._closed.set()

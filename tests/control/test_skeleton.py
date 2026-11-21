@@ -115,7 +115,7 @@ def test_make_frame_accepts_shared_lift():
 def test_control_config_sections():
     with (ROOT / "config" / "control.toml").open("rb") as file:
         config = tomllib.load(file)
-    assert set(config) == {"general", "mode", "thumb", "pointer", "scroll", "tap", "swipe"}
+    assert set(config) == {"general", "mode", "thumb", "pointer", "scroll", "tap", "swipe", "pinch"}
 
 
 @pytest.mark.parametrize("name", CLI_MODULES)

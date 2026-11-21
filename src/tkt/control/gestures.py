@@ -49,6 +49,7 @@ class GestureEngine:
         thumb = cfg["thumb"]
         swipe = cfg["swipe"]
         self._click_method = general.get("click_method", "thumb")
+        self._pinch = cfg["pinch"] if self._click_method == "pinch" else None
         self._confidence_min = general["confidence_min"]
         self._lost_release_s = general["lost_release_ms"] / 1000
         self._lock_s = mode["lock_ms"] / 1000
@@ -78,6 +79,12 @@ class GestureEngine:
         """Bir el karesini işle."""
         with self._lock:
             reliable = frame.present and frame.confidence >= self._confidence_min
+            if self._pinch is not None:
+                if reliable and frame.pinch is not None and self._inside(frame):
+                    self._process_pinch(frame, frame.pinch)
+                elif self.mode is not Mode.NONE:
+                    self.release()
+                return
             if not reliable and not self._dictation_frame(frame):
                 self._process_missing_hand(frame.t)
                 return
@@ -135,6 +142,11 @@ class GestureEngine:
     def _reset_state(self) -> None:
         self.mode = Mode.NONE
         self.left_down = False
+        self._pinch_armed = False
+        self._pinch_owner: str | None = None
+        self._pinch_candidate: str | None = None
+        self._pinch_since: float | None = None
+        self._pinch_moving = False
         self._open_fingers: tuple[str, ...] = ()
         self._wait_until: float | None = None
         self._last_reliable_t: float | None = None
@@ -155,6 +167,100 @@ class GestureEngine:
         self._swipe_triggered = False
         self._scroll_coasting = False
         self._scroll_needs_rebase = False
+
+    @staticmethod
+    def _inside(frame: HandFrame) -> bool:
+        points = [frame.palm, *(f.surface for f in frame.fingers.values() if f.surface is not None)]
+        return all(0 <= coordinate <= 1 for point in points for coordinate in point)
+
+    def _process_pinch(self, frame: HandFrame, distances: dict[str, float]) -> None:
+        cfg = self._pinch
+        if self._loss_expired(frame.t):
+            self.release()
+        self._last_reliable_t = frame.t
+        all_open = all(distances[name] >= cfg["open"] for name in FINGERS)
+        if self._pinch_owner is not None:
+            self._held_pinch(frame, distances, all_open)
+            return
+
+        mean_curl = sum(frame.fingers[name].curl for name in FINGERS) / len(FINGERS)
+        if mean_curl >= cfg["fist_curl"]:
+            self._pinch_armed = False
+            self._pinch_candidate = None
+            self._pinch_since = None
+            if self.mode is not Mode.WAIT:
+                self._pointer.rebase()
+            self.mode = Mode.WAIT
+            return
+
+        self.mode = Mode.POINTER
+        if all_open:
+            self._pinch_armed = True
+        winner, runner_up, *_ = sorted(FINGERS, key=distances.__getitem__)
+        if (
+            self._pinch_armed
+            and (distances[winner] <= cfg["closed"]
+                 or (winner == self._pinch_candidate and distances[winner] < cfg["open"]))
+            and distances[runner_up] - distances[winner] >= cfg["margin"]
+        ):
+            if winner != self._pinch_candidate:
+                self._pinch_candidate = winner
+                self._pinch_since = frame.t
+                self._drag_origin = frame.palm
+                self._pointer.rebase()
+                self._scroll.rebase()
+            if frame.t >= self._pinch_since + cfg["debounce_ms"] / 1000:
+                self._pinch_owner = winner
+                self._pinch_candidate = None
+                self._pinch_since = None
+                self._pinch_armed = False
+                if winner == "index":
+                    self._backend.button("left", True)
+                    self.left_down = True
+                self._held_pinch(frame, distances, all_open)
+            return
+        self._pinch_candidate = None
+        self._pinch_since = None
+        self._send_move(self._pointer.update(frame.palm, frame.hand_size, frame.t))
+
+    def _held_pinch(self, frame: HandFrame, distances: dict[str, float], all_open: bool) -> None:
+        cfg = self._pinch
+        owner = self._pinch_owner
+        threshold = cfg["drag_threshold"] * frame.hand_size
+        if self._image_distance(frame.palm, self._drag_origin) > threshold:
+            self._pinch_moving = True
+
+        if distances[owner] >= cfg["open"]:
+            if self._pinch_since is None:
+                self._pinch_since = frame.t
+            if frame.t >= self._pinch_since + cfg["debounce_ms"] / 1000:
+                if self.left_down:
+                    self._backend.button("left", False)
+                    self.left_down = False
+                elif owner == "middle" and not self._pinch_moving:
+                    self._backend.button("right", True)
+                    self._backend.button("right", False)
+                self._pinch_owner = None
+                self._pinch_armed = all_open
+                self._pinch_since = None
+                self._pinch_moving = False
+                self._drag_origin = None
+                self._pointer.rebase()
+                self._stop_scroll()
+                self.mode = Mode.POINTER
+            return
+
+        self._pinch_since = None
+        # Keep the filter anchored while waiting so the threshold-crossing frame
+        # can emit motion even after a long stationary hold.
+        pos = frame.palm if self._pinch_moving else self._drag_origin
+        if owner == "index":
+            self._send_move(self._pointer.update(pos, frame.hand_size, frame.t))
+        elif owner == "middle":
+            delta = self._scroll.update(pos, frame.hand_size, frame.t)
+            if self._pinch_moving:
+                self.mode = Mode.SCROLL
+                self._send_scroll(delta)
 
     def _process_missing_hand(self, t: float) -> None:
         if self._last_reliable_t is None:
