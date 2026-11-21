@@ -4,7 +4,11 @@ from typing import Protocol
 
 
 class InputBackend(Protocol):
-    """Hareket, tuş, kaydırma ve sistem eylemlerinin ortak arayüzü."""
+    """Hareket, tuş, kaydırma ve sistem eylemlerinin ortak arayüzü.
+
+    İsteğe bağlı events_sent sayacı, gönderilen veya dry backend için
+    kaydedilen olaylarda artar. Gecikme ölçümü bu sayacı kullanabilir.
+    """
 
     def move_rel(self, dx: int, dy: int) -> None:
         """İmleci piksel cinsinden göreli hareket ettir."""
@@ -15,7 +19,7 @@ class InputBackend(Protocol):
         raise NotImplementedError
 
     def scroll(self, dx: float, dy: float) -> None:
-        """Piksel cinsinden kaydır."""
+        """İçeriği piksel cinsinden hareket ettir. +dx sağa, +dy aşağı."""
         raise NotImplementedError
 
     def system_action(self, name: str) -> None:

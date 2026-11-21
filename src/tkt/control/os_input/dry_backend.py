@@ -22,6 +22,11 @@ class DryBackend:
         self._t = 0.0
         self._pressed: dict[str, None] = {}
 
+    @property
+    def events_sent(self) -> int:
+        """Kaydedilen olay sayısı."""
+        return len(self.events)
+
     def set_time(self, t: float) -> None:
         """Sonraki olaylar için karenin zamanını ayarla."""
         self._t = t

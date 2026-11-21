@@ -20,9 +20,11 @@ class PynputBackend:
         self._buttons = {"left": mouse.Button.left, "right": mouse.Button.right}
         self._pressed: dict[str, None] = {}
         self._scroll_x = self._scroll_y = 0.0
+        self.events_sent = 0
 
     def move_rel(self, dx: int, dy: int) -> None:
         self._mouse.move(dx, dy)
+        self.events_sent += 1
 
     def button(self, name: str, down: bool) -> None:
         button = self._buttons[name]
@@ -32,6 +34,7 @@ class PynputBackend:
         else:
             self._mouse.release(button)
             self._pressed.pop(name, None)
+        self.events_sent += 1
 
     def scroll(self, dx: float, dy: float) -> None:
         step = self.step_px
@@ -40,7 +43,9 @@ class PynputBackend:
         x, y = self._scroll_x + dx, self._scroll_y + dy
         sx, sy = trunc(x / step), trunc(y / step)
         if sx or sy:
-            self._mouse.scroll(sx, sy)
+            # Windows pozitif yatay tekerlekle görünümü sağa kaydırır.
+            self._mouse.scroll(-sx if sys.platform == "win32" else sx, sy)
+            self.events_sent += 1
         self._scroll_x, self._scroll_y = x - sx * step, y - sy * step
 
     def system_action(self, name: str) -> None:
@@ -62,8 +67,13 @@ class PynputBackend:
 
         with ExitStack() as releases:
             for key in chords[name]:
-                releases.callback(self._keyboard.release, key)
-                self._keyboard.press(key)
+                releases.callback(self._key, key, False)
+                self._key(key, True)
+
+    def _key(self, key, down: bool) -> None:
+        send = self._keyboard.press if down else self._keyboard.release
+        send(key)
+        self.events_sent += 1
 
     def release_all(self) -> None:
         self._scroll_x = self._scroll_y = 0.0
