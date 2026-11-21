@@ -766,3 +766,26 @@ def test_guided_result_before_done_raises():
         dv.GuidedCalibration().result()
     with pytest.raises(ValueError):
         dv.GuidedCalibration(record_s=0)
+
+
+# ------------------------------------------------------------------ masa kalibrasyonu
+
+
+def test_table_session_countdown_then_records():
+    from tkt.vision.debug_view import TableSession
+
+    ts = TableSession(countdown_s=1.0, record_s=2.0)
+    hands = [object()] * 40
+    for i, h in enumerate(hands):          # 10 Hz, 4 sn
+        ts.add(h if i != 15 else None, 10.0 + i / 10)
+    # geri sayımda (t < 1 sn) örnek yok; 1–3 sn arası 20 kare, biri el yok
+    assert ts.done
+    assert len(ts.samples) == 19
+    assert "MASA" in ts.message()
+
+
+def test_table_session_validates():
+    from tkt.vision.debug_view import TableSession
+
+    with pytest.raises(ValueError):
+        TableSession(record_s=0)

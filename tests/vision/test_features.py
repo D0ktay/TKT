@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -276,3 +277,45 @@ def test_confidence_ignores_raw_score():
 def test_confidence_stays_in_unit_range():
     f = build_frame(make_hand(score=1.5), 0.0, 0, DEFAULT, INFO)
     assert 0.0 <= f.confidence <= 1.0
+
+
+# --------------------------------------------------------------------------- masa modeli
+
+
+def _table_for(hands, aspect=1.0):
+    from tkt.vision.hand_calib import fit_table
+    return fit_table(hands, aspect)
+
+
+def _grid_hands(scale=2.0):
+    return [make_hand(center=(0.3 + 0.05 * i, 0.4 + 0.04 * j), scale=scale)
+            for i in range(9) for j in range(8)]
+
+
+def test_palm_shape_terms_and_logs():
+    hand = make_hand(center=(0.5, 0.6), scale=2.0)
+    log_len, log_wid, terms = features.palm_shape(hand)
+    assert log_len == pytest.approx(math.log(0.18), abs=1e-9)        # 0,09 m × 2
+    assert log_wid == pytest.approx(math.log(0.12), abs=1e-9)        # 0,06 m × 2
+    x, y = terms[1], terms[2]
+    assert terms == pytest.approx([1.0, x, y, x * x, y * y, x * y])
+
+
+def test_table_deviation_zero_on_table_and_large_when_lifted():
+    table = _table_for(_grid_hands())
+    on = make_hand(center=(0.45, 0.55))
+    assert features.table_deviation(on, table) == pytest.approx(0.0, abs=1e-6)
+    # Kalkık el: aynı konumda görüntüde %30 küçük.
+    lifted = make_hand(center=(0.45, 0.55), scale=1.4)
+    assert features.table_deviation(lifted, table) > 0.25
+
+
+def test_build_frame_lift_off_drops_confidence():
+    calib = replace(DEFAULT, table=_table_for(_grid_hands()))
+    on = make_hand(center=(0.45, 0.55))
+    lifted = make_hand(center=(0.45, 0.55), scale=1.4)
+    assert build_frame(on, 0.0, 0, calib, INFO, lift_off=0.25).confidence > 0.5
+    assert build_frame(lifted, 0.0, 0, calib, INFO, lift_off=0.25).confidence == 0.0
+    # Eşik yoksa veya masa modeli yoksa değişmez.
+    assert build_frame(lifted, 0.0, 0, calib, INFO).confidence > 0.5
+    assert build_frame(lifted, 0.0, 0, DEFAULT, INFO, lift_off=0.25).confidence > 0.5

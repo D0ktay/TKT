@@ -468,7 +468,7 @@ def rebuild_from_raw(raw_path: str | Path, out: str | Path,
     sayısını döndürür. Çıktı girdiyle aynı dosyaysa `OutputIsInputError`; çıktı önce geçici
     dosyaya yazılır, dönüşüm bitince `os.replace` ile yerine konur (hata olursa eski çıktı kalır).
     """
-    from tkt.vision import features, hand_calib
+    from tkt.vision import features, hand_calib, live_source
     from tkt.vision.lift import LiftEstimator
     from tkt.vision.live_source import load_vision_config
 
@@ -480,6 +480,7 @@ def rebuild_from_raw(raw_path: str | Path, out: str | Path,
     cfg = load_vision_config(config_path)
     calib_path = Path(cfg["hand"]["calibration"]).expanduser()
     calib = hand_calib.load(calib_path) or hand_calib.DEFAULT
+    lift_off = live_source._lift_off(cfg["hand"])
 
     lift = None
     if calib.tap_ref is not None:
@@ -499,12 +500,14 @@ def rebuild_from_raw(raw_path: str | Path, out: str | Path,
                 if s.hand is None and lift is not None:
                     lift.reset()
                 frame = features.build_frame(
-                    s.hand, s.t, s.frame_id, calib, info, lift=None, prev_hand_size=prev_size)
+                    s.hand, s.t, s.frame_id, calib, info, lift=None, prev_hand_size=prev_size,
+                    lift_off=lift_off)
                 if s.hand is not None and lift is not None and frame.present:
                     curls = {name: f.curl for name, f in frame.fingers.items()}
                     frame = features.build_frame(
                         s.hand, s.t, s.frame_id, calib, info,
-                        lift=lift.update(s.hand, s.t, curls), prev_hand_size=prev_size)
+                        lift=lift.update(s.hand, s.t, curls), prev_hand_size=prev_size,
+                        lift_off=lift_off)
                 prev_size = frame.hand_size if frame.present else None
                 writer.write(frame)
                 count += 1

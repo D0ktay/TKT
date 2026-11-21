@@ -41,6 +41,9 @@ EDGE_MIN_FACTOR = 0.5
 # hand_size bir önceki kareye göre bu orandan fazla değişirse güven JUMP_FACTOR ile çarpılır.
 HAND_SIZE_JUMP = 0.20
 JUMP_FACTOR = 0.5
+# El masadan kalkık (masa modelinden sapma eşiği aşıldı): güven bu katsayıyla çarpılır.
+# 0: control eli "yok" sayar, imleç durur (J10 davranışı).
+LIFT_OFF_FACTOR = 0.0
 
 _EPS = 1e-9
 
@@ -97,6 +100,33 @@ def thumb_raw(hand: RawHand, aspect: float = 1.0) -> float:
     return float(np.linalg.norm(p[THUMB_TIP] - p[INDEX_PIP])) / size
 
 
+def palm_shape(hand: RawHand, aspect: float = 1.0) -> tuple[float, float, list[float]]:
+    """Masa modeli girdisi: (log avuç uzunluğu, log avuç genişliği, konum terimleri).
+
+    Uzunluk bilek (0)–orta kök (9), genişlik işaret kökü (5)–serçe kökü (17); görüntüde,
+    x `aspect` ile ölçeklenmiş birimde. Konum: avuç noktalarının ortalaması (0–1);
+    terimler `[1, x, y, x², y², xy]`.
+    """
+    img = np.asarray(hand.image_pts, dtype=float)
+    p = img * (float(aspect), 1.0)
+    length = max(float(np.linalg.norm(p[MIDDLE_MCP] - p[WRIST])), _EPS)
+    width = max(float(np.linalg.norm(p[17] - p[INDEX_MCP])), _EPS)
+    x, y = (float(v) for v in img[list(PALM_POINTS)].mean(axis=0))
+    return math.log(length), math.log(width), [1.0, x, y, x * x, y * y, x * y]
+
+
+def table_deviation(hand: RawHand, table: dict[str, list[float]],
+                    aspect: float = 1.0) -> float:
+    """Avuç şeklinin masa modelinden sapması: uzunluk ve genişlik log farklarının büyüğü.
+
+    El masadayken ~0 (kayıtlarda p99 ≈ 0,05–0,2); masadan kalkınca belirgin büyür.
+    """
+    log_len, log_wid, terms = palm_shape(hand, aspect)
+    pred_len = float(np.dot(table["length"], terms))
+    pred_wid = float(np.dot(table["width"], terms))
+    return max(abs(log_len - pred_len), abs(log_wid - pred_wid))
+
+
 def _normalize(raw: float, lo: float, hi: float) -> float:
     """`lo`→0, `hi`→1 doğrusal eşleme, 0–1'e kırpılır."""
     span = hi - lo
@@ -148,8 +178,13 @@ def _empty_frame(t: float, frame_id: int) -> HandFrame:
 
 def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibration,
                 info: SourceInfo, lift: dict[str, float] | None = None,
-                prev_hand_size: float | None = None) -> HandFrame:
-    """Tek karenin `HandFrame`'ini üretir; el yoksa `present=False`."""
+                prev_hand_size: float | None = None,
+                lift_off: float | None = None) -> HandFrame:
+    """Tek karenin `HandFrame`'ini üretir; el yoksa `present=False`.
+
+    `lift_off`: masa modelinden sapma eşiği (config `hand.lift_off`). Verilir ve
+    `calib.table` doluysa, sapma eşiği aşan karede güven `LIFT_OFF_FACTOR` ile çarpılır.
+    """
     if hand is None:
         return _empty_frame(t, frame_id)
 
@@ -183,6 +218,9 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
     if prev_hand_size is not None and prev_hand_size > _EPS:
         if abs(hand_size / prev_hand_size - 1.0) > HAND_SIZE_JUMP:
             confidence *= JUMP_FACTOR
+    if lift_off is not None and calib.table is not None:
+        if table_deviation(hand, calib.table, aspect) > lift_off:
+            confidence *= LIFT_OFF_FACTOR
 
     return HandFrame(
         t=t,
