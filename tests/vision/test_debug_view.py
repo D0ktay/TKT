@@ -20,7 +20,7 @@ from tkt.vision.debug_view import (
     render_lift_graph,
 )
 from tkt.vision.features import FINGER_JOINTS
-from tkt.vision.hand_calib import STEP_SECONDS, STEPS
+from tkt.vision.hand_calib import STEPS
 from tkt.vision.tracker import RawHand
 
 STATS = Stats(capture_fps=59.9, process_fps=55.2, process_ms=12.3)
@@ -246,22 +246,36 @@ def test_run_closes_on_exception(rec):
     assert src.closed and r.destroyed == 1
 
 
-def _calib_items(step_s=STEP_SECONDS, dt=0.25, extra=8):
-    """Her adım için `step_s` saniyelik kare, sonra `extra` kare. Zaman kare `t`'sinden."""
+def _calib_items(dt=0.25, extra=8, present=True):
+    """Adım adım kalibrasyon akışı: (kareler, tuşlar).
+
+    Kare 0'da 'c'; her adımda bir bekleme karesinde BOŞLUK, sonra geri sayım + kayıt
+    süresi kadar kare; en sonda `extra` kare. Tuş listesi kare sırasıyla hizalıdır.
+    """
     img = np.zeros((512, 640, 3), np.uint8)
-    n = int(step_s / dt) * len(STEPS) + extra
-    items = []
-    for i in range(n):
-        t = 50.0 + i * dt
-        step = STEPS[min(len(STEPS) - 1, int(i * dt // step_s))]
-        items.append((make_frame(t=t, frame_id=i), hand_for_step(step), img))
-    return items
+    items, keys = [], []
+
+    def add(step, key=-1):
+        i = len(items)
+        frame = make_frame(t=50.0 + i * dt, frame_id=i, present=present)
+        items.append((frame, hand_for_step(step) if present else None, img))
+        keys.append(key)
+
+    add(STEPS[0], ord("c"))
+    per_step = int((dv.GUIDED_COUNTDOWN_SECONDS + dv.GUIDED_RECORD_SECONDS) / dt) + 1
+    for step in STEPS:
+        add(step, ord(" "))
+        for _ in range(per_step):
+            add(step)
+    for _ in range(extra):
+        add(STEPS[-1])
+    return items, keys
 
 
 def test_run_calibration_saves_file(rec, tmp_path):
-    items = _calib_items()
-    # ilk karede 'c', sonra hiçbir tuş; akış bitince döngü kendiliğinden çıkar
-    r = rec([ord("c")])
+    items, keys = _calib_items()
+    # 'c', her adımda BOŞLUK; akış bitince döngü kendiliğinden çıkar
+    r = rec(keys)
     path = tmp_path / "sub" / "calibration.json"
     src = FakeSource(items)
     dv.run(src, path)
@@ -286,11 +300,13 @@ def test_run_calibration_message_text_and_progress(rec, tmp_path, monkeypatch):
         return real(image, frame, hand, stats, calib_state)
 
     monkeypatch.setattr(dv, "draw_overlay", spy)
-    rec([ord("c")])
-    dv.run(FakeSource(_calib_items(extra=24)), tmp_path / "c.json")   # 6 sn > mesaj süresi
+    items, keys = _calib_items(extra=24)
+    rec(keys)
+    dv.run(FakeSource(items), tmp_path / "c.json")   # 6 sn > mesaj süresi
     steps = [cs.step for cs in seen if cs is not None and cs.step is not None]
     assert [s for i, s in enumerate(steps) if i == 0 or steps[i - 1] != s] == list(STEPS)
-    msgs = [cs.message for cs in seen if cs is not None and cs.message]
+    assert any("BOSLUK" in cs.message for cs in seen if cs is not None and cs.step)
+    msgs = [cs.message for cs in seen if cs is not None and cs.step is None and cs.message]
     assert msgs and all("uygulandi" in m for m in msgs)
     # mesaj süresi dolunca kaybolur
     assert seen[-1] is None
@@ -305,10 +321,8 @@ def test_run_calibration_without_hand_reports_failure(rec, tmp_path, monkeypatch
         return real(image, frame, hand, stats, calib_state)
 
     monkeypatch.setattr(dv, "draw_overlay", spy)
-    rec([ord("c")])
-    img = np.zeros((64, 64, 3), np.uint8)
-    items = [(make_frame(present=False, t=10.0 + i * 0.5, frame_id=i), None, img)
-             for i in range(20)]
+    items, keys = _calib_items(present=False)
+    rec(keys)
     path = tmp_path / "c.json"
     src = FakeSource(items)
     dv.run(src, path)   # çökmez
@@ -320,8 +334,9 @@ def test_run_calibration_without_hand_reports_failure(rec, tmp_path, monkeypatch
 def test_run_c_restarts_session(rec, tmp_path):
     # kalibrasyon sırasında tekrar 'c': oturum baştan başlar, çökmez
     # (ikinci 'c' yalnızca 0,25 sn sonra, böylece adım başına örnekler hâlâ doğru adıma düşer)
-    r = rec([ord("c"), ord("c")])
-    dv.run(FakeSource(_calib_items(extra=24)), tmp_path / "c.json")
+    items, keys = _calib_items(extra=24)
+    r = rec([ord("c")] + keys)
+    dv.run(FakeSource([items[0]] + items), tmp_path / "c.json")
     assert (tmp_path / "c.json").is_file()
     assert r.destroyed == 1
 
@@ -333,8 +348,9 @@ def test_run_calibration_keeps_tap_ref(rec, tmp_path):
         tap_ref={f: 0.5 for f in FINGERS}, angle_sign=-1.0)
     path = tmp_path / "c.json"
     hand_calib.save(old, path)
-    rec([ord("c")])
-    src = FakeSource(_calib_items())
+    items, keys = _calib_items()
+    rec(keys)
+    src = FakeSource(items)
     dv.run(src, path)
     (new,) = src.calibrations
     assert new.tap_ref == old.tap_ref and new.angle_sign == -1.0
@@ -342,10 +358,11 @@ def test_run_calibration_keeps_tap_ref(rec, tmp_path):
 
 
 def test_run_save_error_still_applies(rec, tmp_path):
-    rec([ord("c")])
+    items, keys = _calib_items()
+    rec(keys)
     blocker = tmp_path / "file"
     blocker.write_text("x")
-    src = FakeSource(_calib_items())
+    src = FakeSource(items)
     dv.run(src, blocker / "calibration.json")   # üst dizin dosya: yazılamaz
     assert len(src.calibrations) == 1
 
@@ -532,8 +549,9 @@ def test_run_tap_fit_value_error_and_no_hand(rec, tmp_path, monkeypatch):
 
 def test_run_c_then_t_switches_session(rec, tmp_path, monkeypatch):
     monkeypatch.setattr(hand_calib, "fit_taps", lambda *a: pytest.fail("çağrılmamalı"))
-    rec([ord("c"), ord("t"), ord("c")])    # son 'c' t'yi iptal eder, c akışı tamamlanır
-    src = FakeSource(_calib_items(extra=12))
+    items, keys = _calib_items(extra=12)
+    rec([ord("c"), ord("t")] + keys)    # son 'c' t'yi iptal eder, c akışı tamamlanır
+    src = FakeSource([items[0], items[0]] + items)
     dv.run(src, tmp_path / "c.json")
     assert len(src.calibrations) == 1
 
@@ -703,3 +721,48 @@ def test_main_opens_source_and_runs(monkeypatch, tmp_path):
     dv.main(["--config", str(cfg)])
     assert calls["open"] == str(cfg)
     assert calls["run"] == (fake, calib)
+
+
+# ---------------------------------------------------------------- adım adım kalibrasyon
+
+
+def test_guided_waits_for_space_then_counts_down_then_records():
+    g = dv.GuidedCalibration(countdown_s=3.0, record_s=3.0)
+    h = hand_for_step("open")
+    for i in range(20):                      # boşluk yok: bekler, örnek toplamaz
+        g.add(h, 10.0 + i * 0.5)
+    assert g.phase == "wait" and g.samples["open"] == []
+    g.start()
+    assert g.phase == "countdown"
+    g.add(h, 20.0)                           # geri sayım başlar
+    g.add(h, 22.0)
+    assert g.phase == "countdown" and g.samples["open"] == []
+    assert math.ceil(g.remaining) == 1
+    g.add(h, 23.5)
+    assert g.phase == "record" and len(g.samples["open"]) == 1
+    g.start()                                # kayıt sürerken etkisiz
+    g.add(h, 26.0)                           # 6 sn doldu: sonraki adım
+    assert g.current_step == "fist" and g.phase == "wait"
+    assert len(g.samples["open"]) == 1
+
+
+def test_guided_result_after_all_steps():
+    g = dv.GuidedCalibration(countdown_s=1.0, record_s=1.0)
+    t = 0.0
+    for step in STEPS:
+        g.start()
+        for _ in range(9):
+            g.add(hand_for_step(step), t)
+            t += 0.25
+    assert g.done and g.phase == "done"
+    calib = g.result()
+    for f in FINGERS:
+        assert calib.fist_ref[f] > calib.open_ref[f]
+    assert calib.thumb_open > calib.thumb_closed
+
+
+def test_guided_result_before_done_raises():
+    with pytest.raises(ValueError):
+        dv.GuidedCalibration().result()
+    with pytest.raises(ValueError):
+        dv.GuidedCalibration(record_s=0)
