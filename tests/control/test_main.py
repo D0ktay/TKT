@@ -1,3 +1,4 @@
+import csv
 import sys
 from threading import Event
 from types import SimpleNamespace
@@ -148,3 +149,79 @@ def test_windows_dpi_awareness(monkeypatch):
     app._set_dpi_awareness()
     user32.SetProcessDpiAwarenessContext.assert_called_once_with(-4)
     user32.SetProcessDPIAware.assert_called_once_with()
+
+
+@pytest.fixture
+def latency_run(monkeypatch, tmp_path):
+    clock = SimpleNamespace(wall=100.0, perf=0.0)
+    frames = [make_frame(frame_id=i, t=t) for i, t in enumerate((100.99, 102, 104.95, 105.48))]
+    source = SimpleNamespace(info=None, frames=lambda: iter(frames), close=Mock())
+
+    class Engine:
+        def __init__(self, cfg, backend, info):
+            self.backend = backend
+
+        def process(self, frame):
+            clock.wall = (101.0, 102.0, 105.0, 105.5)[frame.frame_id]
+            clock.perf += (0.001, 0.003, 0.002, 0.001)[frame.frame_id]
+            if frame.frame_id == 0:
+                self.backend.move_rel(1, 2)
+                clock.wall += 0.001
+                self.backend.button("left", True)
+            elif frame.frame_id == 2:
+                self.backend.scroll(1, 2)
+            elif frame.frame_id == 3:
+                self.backend.system_action("mission_control")
+
+    monkeypatch.setattr(app, "monotonic", lambda: clock.wall)
+    monkeypatch.setattr(app, "perf_counter", lambda: clock.perf)
+    monkeypatch.setattr(app, "GestureEngine", Engine)
+    monkeypatch.setattr(app, "_open_source", lambda _: source)
+
+    def run(source_name, *, csv_output=True):
+        output = tmp_path / "latency.csv"
+        args = ["--source", source_name, "--backend", "dry"]
+        if source_name == "replay":
+            args += ["--file", "test.jsonl"]
+        args += ["--latency-out", str(output)] if csv_output else ["--latency"]
+        app.main(args)
+        if csv_output:
+            with output.open(newline="") as stream:
+                return list(csv.DictReader(stream))
+
+    return run
+
+
+def test_live_latency_reports_and_csv(latency_run, capsys):
+    rows = latency_run("live")
+    assert list(rows[0]) == ["frame_id", "t", "sent_t", "latency_ms", "process_ms"]
+    assert [row["frame_id"] for row in rows] == ["0", "1", "2", "3"]
+    assert [float(row["t"]) for row in rows] == [100.99, 102, 104.95, 105.48]
+    assert [row["sent_t"] for row in rows] == ["101.0", "", "105.0", "105.5"]
+    assert rows[1]["latency_ms"] == ""
+    assert [float(row["latency_ms"]) for row in rows if row["latency_ms"]] == pytest.approx(
+        [10, 50, 20]
+    )
+    assert [float(row["process_ms"]) for row in rows] == pytest.approx([1, 3, 2, 1])
+    periodic, final = capsys.readouterr().out.splitlines()
+    assert "(ara) p50=30.000 p95=48.000 max=50.000 ms (hedef p95 < 60 ms)" in periodic
+    assert "olaylı kare=2 | kontrol p50=2.000 p95=2.900 ms (hedef < 2 ms) | 0.60 fps" in periodic
+    assert "(çıkış) p50=20.000 p95=20.000 max=20.000 ms" in final
+    assert "olaylı kare=1 | kontrol p50=1.000 p95=1.000 ms (hedef < 2 ms) | 2.00 fps" in final
+
+
+@pytest.mark.parametrize("source", ["replay", "synthetic"])
+def test_offline_latency_is_invalid(latency_run, capsys, source):
+    rows = latency_run(source)
+    assert all(row["latency_ms"] == "" for row in rows)
+    assert rows[0]["sent_t"] == "101.0"
+    assert float(rows[0]["process_ms"]) == pytest.approx(1)
+    periodic, final = capsys.readouterr().out.splitlines()
+    assert "(ara) geçersiz" in periodic
+    assert "(çıkış) geçersiz" in final
+    assert "olaylı kare=2 | kontrol p50=2.000 p95=2.900 ms" in periodic
+
+
+def test_latency_without_csv(latency_run, capsys):
+    latency_run("synthetic", csv_output=False)
+    assert "Gecikme (çıkış) geçersiz" in capsys.readouterr().out
