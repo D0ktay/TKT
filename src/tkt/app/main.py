@@ -14,6 +14,7 @@ from tkt.app.config import load_control_config
 from tkt.control.gestures import GestureEngine
 from tkt.control.os_input.base import InputBackend
 from tkt.control.os_input.dry_backend import DryBackend
+from tkt.control.os_input.macos import MacBackend
 from tkt.control.os_input.pynput_backend import PynputBackend
 from tkt.control.os_input.windows import WindowsBackend
 from tkt.control.sources import ReplaySource, SyntheticSource
@@ -189,7 +190,7 @@ def _run(
     watchdog = Thread(target=watch_frames, name="tkt-frame-watchdog")
     watchdog.start()
     try:
-        if isinstance(backend, (PynputBackend, WindowsBackend)):
+        if isinstance(backend, (PynputBackend, WindowsBackend, MacBackend)):
             from pynput.keyboard import GlobalHotKeys
 
             listener = GlobalHotKeys({cfg["general"]["panic_hotkey"]: toggle_pause})
@@ -232,10 +233,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.source == "replay" and args.file is None:
         parser.error("--source replay için --file gerekli")
-    if args.backend == "native" and sys.platform != "win32":
-        if sys.platform == "darwin":
-            parser.error("native henüz yok (macos.py, V3 şeridi)")
-        parser.error("native backend henüz desteklenmiyor")
+    if args.backend == "native" and sys.platform not in ("win32", "darwin"):
+        parser.error("native backend yalnızca Windows ve macOS'ta var")
     if args.source == "replay" and args.latency_out is not None:
         if args.file.resolve() == args.latency_out.resolve() or (
             args.file.exists()
@@ -252,6 +251,8 @@ def main(argv: list[str] | None = None) -> None:
         if backend_name == "pynput":
             backend = PynputBackend()
             backend.step_px = cfg["scroll"]["step_px"]
+        elif backend_name == "native" and sys.platform == "darwin":
+            backend = MacBackend()
         elif backend_name == "native":
             backend = WindowsBackend(step_px=cfg["scroll"]["step_px"], smooth=True)
         else:

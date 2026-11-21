@@ -54,8 +54,9 @@ uv run python -m tkt.app.main --source live --backend pynput
 uv run python -m tkt.app.main --source live --backend native --latency
 ```
 
-`pynput` macOS ve Windows'ta kullanılabilir. İkinci örnekteki `native`
-yalnızca Windows'ta kullanılabilir. `--latency` her iki backend ile canlı
+`pynput` macOS ve Windows'ta kullanılabilir. `native` Windows'ta `SendInput`,
+macOS'ta Quartz kullanır; macOS'ta sürükleme olayları ve çift tık sayısı doğru
+gönderilir (Erişilebilirlik izni gerekir). `--latency` her iki backend ile canlı
 çalıştırmada kare zamanından girdi gönderimine kadar geçen süreyi ve
 kontrol işlem süresini ölçer. Plan hedefi gecikmede p95 < 60 ms.
 `Ctrl+Alt+P` çıktıyı duraklatıp basılı tuşları bırakır, tekrar basınca
