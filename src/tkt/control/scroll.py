@@ -2,7 +2,7 @@
 
 from collections import deque
 from collections.abc import Mapping
-from math import exp, hypot, isfinite, tau
+from math import exp, hypot, isfinite
 from statistics import median
 from typing import Any
 
@@ -19,40 +19,6 @@ _VELOCITY_SAMPLES = 3
 _ZERO = (0.0, 0.0)
 
 
-def _alpha(cutoff: float, dt: float) -> float:
-    scaled = tau * cutoff * dt
-    return scaled / (1.0 + scaled)
-
-
-class _ScrollOneEuro:
-    """Ortak OneEuro iskeleti tamamlanana kadar kullanılan filtre."""
-
-    def reset(self) -> None:
-        self._t: float | None = None
-        self._raw = self._filtered = self._velocity = _ZERO
-
-    def __call__(self, pos: tuple[float, float], t: float) -> tuple[float, float]:
-        if self._t is None:
-            self._t = t
-            self._raw = self._filtered = pos
-            return pos
-
-        dt = t - self._t
-        derivative_alpha = _alpha(_D_CUTOFF, dt)
-        dx = (pos[0] - self._raw[0]) / dt
-        dy = (pos[1] - self._raw[1]) / dt
-        vx, vy = self._velocity
-        vx += derivative_alpha * (dx - vx)
-        vy += derivative_alpha * (dy - vy)
-        alpha = _alpha(_MIN_CUTOFF + _BETA * hypot(vx, vy), dt)
-        x, y = self._filtered
-        self._filtered = (x + alpha * (pos[0] - x), y + alpha * (pos[1] - y))
-        self._velocity = vx, vy
-        self._raw = pos
-        self._t = t
-        return self._filtered
-
-
 class ScrollMotion:
     """Kaydırma hareketini ve ataletini hesaplar."""
 
@@ -65,10 +31,7 @@ class ScrollMotion:
         self._gap_s = cfg.get("gap_reset_ms", _GAP_RESET_MS) / 1000
         self._inertia_s = cfg["inertia_ms"] / 1000
         self._min_speed = cfg["inertia_min_speed"]
-        try:
-            self._filter = OneEuro(_MIN_CUTOFF, _BETA, _D_CUTOFF)
-        except NotImplementedError:
-            self._filter = _ScrollOneEuro()
+        self._filter = OneEuro(_MIN_CUTOFF, _BETA, _D_CUTOFF)
 
         self._hand_sizes: deque[tuple[float, float]] = deque()
         self._velocities: deque[tuple[float, float]] = deque(maxlen=_VELOCITY_SAMPLES)
