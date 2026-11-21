@@ -282,3 +282,88 @@ def test_session_time_going_back_does_not_rewind():
     s.add(_open(), 0.5)  # geri giden zaman: hâlâ "fist" adımı
     assert s.current_step == "fist"
     assert len(s.samples["fist"]) == 2
+
+
+# --------------------------------------------------------------------------- fit_taps
+
+
+def _lifted(lift: dict[str, float], flip_z: bool = False) -> RawHand:
+    """Düz el; `lift[f]` radyan kadar parmak kökten +z yönüne kalkık."""
+    h = make_hand()
+    w = h.world_pts.copy()
+    for f, a in lift.items():
+        mcp, p, d, t = FINGER_JOINTS[f]
+        for i in (p, d, t):
+            w[i] = w[mcp] + _rot_x(w[i] - w[mcp], a)
+    if flip_z:
+        w[:, 2] *= -1
+    img = np.stack([0.5 + w[:, 0] * 2.0, 0.6 - w[:, 1] * 2.0], axis=1)
+    return RawHand(image_pts=img, world_pts=w, score=0.95)
+
+
+def _tap_samples(kinds, angle=0.35, flip_z=False, fps=60.0, window=1.5, period=2.0):
+    """Bip pencereleri (window sn, period arayla); bipten 0,25 sn sonra 0,2 sn kalkış."""
+    out = []
+    for k, kind in enumerate(kinds):
+        t0 = 10.0 + k * period
+        fingers = ("index", "middle") if kind == "tap2" else ("index",)
+        for i in range(int(window * fps)):
+            x = i / fps
+            a = angle if 0.25 <= x < 0.45 else 0.0
+            out.append((t0 + x, _lifted({f: a for f in fingers}, flip_z)))
+    return out
+
+
+def _raw_peak(angle=0.35, sign=-1.0, finger="index"):
+    from tkt.vision.lift import raw_signals
+
+    a0, l0 = raw_signals(_lifted({}))[finger]
+    a1, l1 = raw_signals(_lifted({finger: angle}))[finger]
+    return sign * (a1 - a0) + (l0 - l1)
+
+
+def test_fit_taps_sign_and_ref_tap1():
+    calib = fit_hand([_open()], [_fist()], [_thumb_closed()])
+    out = hand_calib.fit_taps(calib, _tap_samples(["tap1"] * 6))
+    assert out.angle_sign == -1.0
+    expected = _raw_peak()
+    # yalnızca işaret kalktı: diğer parmaklar aynı değerle doldurulur
+    for f in FINGERS:
+        assert out.tap_ref[f] == pytest.approx(expected, rel=1e-6)
+    # diğer alanlar korunur
+    assert out.open_ref == calib.open_ref and out.thumb_open == calib.thumb_open
+
+
+def test_fit_taps_tap2_and_flipped_direction():
+    samples = _tap_samples(["tap1", "tap2", "tap2", "tap1", "tap2"], angle=0.3, flip_z=True)
+    out = hand_calib.fit_taps(DEFAULT, samples)
+    assert out.angle_sign == 1.0
+    # z aynalı elde de tepe aynı büyüklükte
+    assert out.tap_ref["index"] == pytest.approx(_raw_peak(0.3), rel=1e-6)
+    assert out.tap_ref["middle"] == pytest.approx(_raw_peak(0.3, finger="middle"), rel=1e-6)
+    fill = float(np.median([out.tap_ref["index"], out.tap_ref["middle"]]))
+    assert out.tap_ref["ring"] == pytest.approx(fill)
+    assert out.tap_ref["pinky"] == pytest.approx(fill)
+
+
+def test_fit_taps_uses_median_of_peaks():
+    samples = []
+    for k, a in enumerate((0.2, 0.3, 0.5)):
+        samples += [(t + k * 2.0, h) for t, h in _tap_samples(["tap1"], angle=a)]
+    out = hand_calib.fit_taps(DEFAULT, samples)
+    assert out.tap_ref["index"] == pytest.approx(_raw_peak(0.3), rel=1e-6)
+
+
+def test_fit_taps_majority_sign():
+    samples = _tap_samples(["tap1"] * 3)
+    samples += [(t + 6.0, h) for t, h in _tap_samples(["tap1"], flip_z=True)]
+    out = hand_calib.fit_taps(DEFAULT, samples)
+    assert out.angle_sign == -1.0
+
+
+def test_fit_taps_empty_or_flat_raises():
+    with pytest.raises(ValueError):
+        hand_calib.fit_taps(DEFAULT, [])
+    flat = [(10.0 + i / 60, _lifted({})) for i in range(60)]
+    with pytest.raises(ValueError):
+        hand_calib.fit_taps(DEFAULT, flat)
