@@ -94,6 +94,19 @@ def test_make_frame_without_hand_has_no_fingers():
     assert frame.fingers == {}
 
 
+def test_make_frame_has_no_pinch_by_default():
+    assert make_frame().pinch is None
+
+
+def test_make_frame_fills_missing_pinch_fingers_as_open():
+    frame = make_frame(pinch={"index": 0.0})
+    assert frame.pinch == {"index": 0.0, "middle": 1.0, "ring": 1.0, "pinky": 1.0}
+
+
+def test_make_frame_without_hand_has_no_pinch():
+    assert make_frame(present=False, pinch={"index": 0.0}).pinch is None
+
+
 def test_make_frame_accepts_shared_lift():
     frame = make_frame(lift=0.7)
     assert all(finger.lift == 0.7 for finger in frame.fingers.values())
