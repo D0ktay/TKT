@@ -297,7 +297,11 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
                     + ("yok" if face_last[1] is None else f"{face_last[1]:.3f}")
                     + f" arama maks {face_ms:.0f} ms"
                     + ("" if zoom is None or zoom.ratio is None
-                       else f", uzaklik {zoom.ratio:.2f}x seviye {zoom.level:+d}"))
+                       else f", uzaklik {zoom.ratio:.2f}x seviye {zoom.level:+d}")
+                    + ("" if not (gated and f.present and f.fingers) else
+                       ", kivrim " + " ".join(f"{n[0]}{f.fingers[n].curl:.2f}"
+                                              for n in ("index", "middle", "ring", "pinky"))
+                       + f" kapi {'acik' if gate.active else 'kapali'}"))
                 stat_t, ages, ax_max[0], face_ms = now, [], 0.0, 0.0
             dry.events.clear()
             dry.set_time(f.t)
