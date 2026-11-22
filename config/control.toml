@@ -94,7 +94,7 @@ screen_h = 1080
 file = "~/.tkt/face-zoom.json"          # normal mesafe (kalibrasyon) ve açık / kapalı durumu
 toggle_hotkey = "<ctrl>+m"              # özelliği aç / kapat (<alt> = Mac'te Option)
 calibrate_hotkey = "<ctrl>+<shift>+m"   # şimdiki mesafeyi normal say
-far = [1.20, 1.45]          # normal mesafenin bu katlarından uzakta: +1, +2 seviye (büyüt)
+far = [1.20, 1.40, 1.60, 1.80]   # normal mesafenin bu katlarından uzakta: +1 … +4 seviye (büyüt)
 near = []                   # yaklaşınca küçültme kapalı; açmak için ör. [0.80]: bu katından yakında -1 seviye
 hysteresis = 0.08           # her sınırın çevresindeki ölü bant (toplam genişlik, oran)
 dwell_ms = 1000             # yeni aralıkta bu kadar kalınmadan seviye değişmez
@@ -107,3 +107,11 @@ presses_per_level = 1       # bir seviye için menü öğesine kaç kez basılı
 skip_menus = ["Format", "Biçim"]        # bu üst menüler aranmaz: oradaki Büyüt belgedeki yazıyı değiştirir
 zoom_in_titles = ["Zoom In", "Bigger", "Make Text Bigger", "Increase Font Size", "Yakınlaştır", "Büyüt", "Daha Büyük"]
 zoom_out_titles = ["Zoom Out", "Smaller", "Make Text Smaller", "Decrease Font Size", "Uzaklaştır", "Küçült", "Daha Küçük"]
+
+[hand_gate]                 # deney (otomatik mod, C): barış işareti el faresini açar / kapatır
+enabled = true
+start_active = false        # C'ye girildiğinde el faresi kapalı başlar
+curl_open = 0.35            # işaret ve orta parmak bundan düz olmalı
+curl_closed = 0.55          # yüzük ve serçe bundan kıvrık olmalı
+hold_ms = 600               # işaret bu kadar tutulunca kapı çevrilir
+grace_ms = 150              # bu kadar kısa takip kopması işareti bozmaz

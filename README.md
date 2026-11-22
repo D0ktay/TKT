@@ -82,8 +82,12 @@ uv run python -m tkt.app.auto_mode
   HUD is an OpenCV window and closing it quits.
 - In C on macOS, target assist highlights a single nearby button with a green
   frame; a pinch that starts and ends on the same button clicks its center.
+- In C the hand mouse starts off, so a hand passing in front of the camera does
+  not move the pointer. Hold a peace sign (index and middle open, ring and pinky
+  curled) for about half a second to turn it on, and again to turn it off
+  (`[hand_gate]` in `config/control.toml`).
 - Distance zoom (macOS, in C, off by default): lean back and the frontmost app
-  zooms in by one or two steps; back at your normal distance it returns to normal size. **Ctrl+M** turns it on or off;
+  zooms in by up to four steps; back at your normal distance it returns to normal size. **Ctrl+M** turns it on or off;
   **Ctrl+Shift+M** takes your current distance as normal. It presses the app's own
   Zoom In / Zoom Out menu items, so apps without them are left alone. Ranges
   and timing are in `[face_zoom]` in `config/control.toml`.

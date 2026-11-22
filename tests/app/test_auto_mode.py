@@ -216,6 +216,53 @@ def test_face_finder_falls_back_to_full_image_and_forgets_lost_face():
     assert seen[-1] == 640 and len(seen) == 4  # yüz unutuldu: doğrudan bütün görüntü
 
 
+class FakeGate:
+    """3. karede açılır, 6. karede kapanır."""
+    enabled = True
+
+    def __init__(self):
+        self.active = False
+        self.n = 0
+
+    def update(self, f):
+        self.n += 1
+        if self.n in (3, 6):
+            self.active = not self.active
+            return self.active
+        return None
+
+
+def test_hand_gate_blocks_engine_until_opened_and_releases_on_close(core, monkeypatch):
+    cfg = am.profile("C")[1]
+    monkeypatch.setattr(am, "FACE_EVERY_S", 99.0)
+    monkeypatch.setattr(am, "GestureEngine", FakeEngine)
+    monkeypatch.setattr(am, "gate", FakeGate())
+    monkeypatch.setattr(am, "mode_txt", ["MOD C"])
+    # Motor her açılışta baştan kurulur: ilk karesinde tuşa basar, sonra imleci oynatır.
+    FakeEngine.script = [[("button", ("left", True))], [("move_rel", (5, 0))],
+                         [("move_rel", (5, 0))], [("move_rel", (5, 0))]]
+    am.history.clear()
+    am.run_mode(FakeSource(8), cfg, True, False, lambda img: 0.9, "C")
+    kinds = [(e.kind, e.args) for e in core.events]
+    # Kareler 1-2 kapalı (olay yok); 3-5 açık (bas, 2 hareket); 6'da kapanır: tuş bırakılır.
+    assert kinds == [("button", ("left", True)), ("move", (-5, 0)), ("move", (-5, 0)),
+                     ("button", ("left", False))]
+    msgs = [m for _, m in am.history]
+    assert msgs.index("EL FARESI ACIK") < msgs.index("EL FARESI KAPALI")
+    assert am.mode_txt[0] == f"MOD C - {am.GATE_OFF_TXT}"
+
+    core.events.clear()
+    monkeypatch.setattr(am, "gate", FakeGate())      # A'da kapı yok: el hep açık
+    FakeEngine.script = [[("move_rel", (1, 0))]] * 4
+    am.run_mode(FakeSource(2), am.profile("A")[1], False, False, lambda img: 0.1, "A")
+    assert [e.kind for e in core.events] == ["move", "move"]
+
+
+def test_make_gate_reads_config():
+    g = am.make_gate()
+    assert g.enabled and not g.active
+
+
 def test_make_zoom_reads_config(monkeypatch, tmp_path):
     monkeypatch.setattr(am, "zoom_config", lambda: {
         **am.tomllib.loads((am.REPO / "config/control.toml").read_text())["face_zoom"],

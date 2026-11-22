@@ -15,6 +15,9 @@ Repo kökünden: python -m tkt.app.auto_mode   (macOS ve Windows)
 - Mesafeyle yakınlaştırma (`[face_zoom]`, yalnız macOS ve C modu; `face_zoom` modülü): yüz
   normal mesafeden uzaklaşınca ön plandaki uygulama büyütülür, yaklaşınca küçültülür.
   Ctrl+M açar / kapatır, Ctrl+Shift+M şimdiki mesafeyi normal sayar.
+- El kapısı (`[hand_gate]`, yalnız C; `hand_gate` modülü): C'de el faresi kapalı başlar;
+  barış işareti (işaret + orta açık, yüzük + serçe kıvrık) tutulunca açılır, yeniden
+  yapılınca kapanır. Kapalıyken el jest motoruna verilmez, basılı tuşlar bırakılır.
 
 Platform farkları:
 - macOS (`auto_mode_mac`): HUD bir Cocoa penceresinde (kapatmak gizler); ekranın sol
@@ -24,6 +27,7 @@ Platform farkları:
 - Windows ve diğerleri: HUD bir OpenCV penceresi (mod ve durum onun içinde); hedef yardımı
   yok. Çıkış: Windows'ta her yerden Esc; HUD odaktayken Esc/q; HUD penceresini kapatmak.
 """
+import dataclasses
 import sys
 import threading
 import time
@@ -34,6 +38,7 @@ from pathlib import Path
 import cv2
 
 from tkt.app.face_zoom import FaceZoom
+from tkt.app.hand_gate import HandGate
 from tkt.app.hud import ActionTap
 from tkt.app.hud import draw as hud_draw
 from tkt.app.hud import status as hud_status
@@ -64,6 +69,9 @@ backend = None              # gerçek girdi backend'i; main() kurar
 target_click = None         # macOS: (out, (x, y, w, h)) -> None, hedefin ortasına tıklar
 zoom = None                 # FaceZoom; yalnız seviyeyi uygulayabilen arayüz (macOS) kurar
 zoom_txt = [""]             # ekranda gösterilen yakınlaştırma durumu
+gate = None                 # HandGate; main() kurar (yoksa el faresi hep açık)
+GATE_OFF_TXT = "EL KAPALI (baris isareti ile ac)"
+GATE_ON_TXT = "el acik (baris isareti kapatir)"
 
 
 def log(msg):
@@ -249,6 +257,8 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
     zoom_t = 0.0
     zoom_min = cfg.get("face_zoom", {}).get("face_score", FACE_SCORE)
     face_last, face_ms = (0.0, None), 0.0
+    gated = gate is not None and gate.enabled and mode_name == "C"
+    mode_base = mode_txt[0]
     try:
         for f, hand, img in s.frames_raw():
             if stop.is_set():
@@ -291,9 +301,23 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
                 stat_t, ages, ax_max[0], face_ms = now, [], 0.0, 0.0
             dry.events.clear()
             dry.set_time(f.t)
-            eng.process(f)
-            present = f.present
+            if gated:
+                flip = gate.update(f)
+                if flip is True:
+                    eng = GestureEngine(cfg, dry, s.info)     # temiz durumla başla
+                    act("EL FARESI ACIK")
+                elif flip is False:
+                    release_engine(eng, dry)
+                    act("EL FARESI KAPALI")
+            active = not gated or gate.active
+            if active:
+                eng.process(f)
+            present = f.present and active
             update_state(eng, f)
+            if gated:       # kapı durumu sol üstte, mod yazısının yanında; imleç yanı boş kalır
+                mode_txt[0] = f"{mode_base} - {GATE_ON_TXT if active else GATE_OFF_TXT}"
+                if not active:
+                    state_txt[0] = ""
             if state_txt[0] != prev_state:
                 if prev_state == "KAYDIRMA":
                     act(f"KAYDIRMA bitti (dikey {scroll_sum[1]:+.0f}, yatay {scroll_sum[0]:+.0f})")
@@ -349,18 +373,26 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
             if now - hud_t >= HUD_EVERY_S:
                 hud_t = now
                 st = hud_status(f, eng, out, now, conf_min, False)
+                if not active:
+                    st = dataclasses.replace(st, label=GATE_OFF_TXT)
                 hud_img[0] = render_hud(img, hand, f, st, mode_name, surface)
                 hud_img[1] += 1
     finally:
-        eng.release()
-        for v in dry.events:
-            if v.kind == "button" and not v.args[1]:
-                backend.button(v.args[0], False)
-            elif v.kind == "system" and v.args[0] == "dictation_stop":
-                backend.system_action("dictation_stop")     # dikte açıkken mod değişti / çıkış
-                act("DIKTE KAPANDI")
-        backend.release_all()
+        release_engine(eng, dry)
     return None
+
+
+def release_engine(eng, dry):
+    """Motoru sıfırlar; bıraktığı tuşları ve açık dikteyi gerçek backend'e de uygular."""
+    eng.release()
+    for v in dry.events:
+        if v.kind == "button" and not v.args[1]:
+            backend.button(v.args[0], False)
+        elif v.kind == "system" and v.args[0] == "dictation_stop":
+            backend.system_action("dictation_stop")     # dikte açıkken kapandı / mod değişti
+            act("DIKTE KAPANDI")
+    backend.release_all()
+    dry.events.clear()
 
 
 def render_hud(img, hand, f, st, mode_name, surface):
@@ -427,6 +459,11 @@ def make_zoom():
     return FaceZoom(zoom_config())
 
 
+def make_gate():
+    cfg = tomllib.loads((REPO / "config/control.toml").read_text())
+    return HandGate(cfg["hand_gate"], cfg["general"]["confidence_min"])
+
+
 def make_backend(platform=None):
     """Bu işletim sisteminin gerçek girdi backend'i."""
     platform = platform or sys.platform
@@ -484,11 +521,12 @@ def run_cv_ui(show=None, poll_key=None, window_open=None, worker_target=None):
 
 
 def main():
-    global backend
+    global backend, gate
     from tkt.app.main import _set_dpi_awareness
 
     _set_dpi_awareness()                  # Windows: ölçekli ekranda imleç kaymasın
     backend = make_backend()
+    gate = make_gate()
     log("hazir: otomatik mod (yuz var -> C, yok -> A), Esc ile cikis")
     if sys.platform == "darwin":
         from tkt.app import auto_mode_mac
