@@ -496,3 +496,107 @@ def test_load_rejects_bad_table(tmp_path):
     path.write_text(json.dumps(d))
     with pytest.raises(ValueError, match="table"):
         load(path)
+
+
+# ------------------------------------------------------------------------ pinch
+
+
+def _touch(finger: str, gap: float = 0.004, base: RawHand | None = None) -> RawHand:
+    """Başparmak ucu `finger` ucunun `gap` metre yanında (görüntüde aynı izdüşüm)."""
+    base = base or _open()
+    w = np.array(base.world_pts, dtype=float)
+    img = np.array(base.image_pts, dtype=float)
+    tip = FINGER_JOINTS[finger][3]
+    w[4] = w[tip] + (gap, 0.0, 0.0)
+    img[4] = img[tip] + (gap * 2.0, 0.0)
+    return RawHand(image_pts=img, world_pts=w, score=base.score)
+
+
+def _touch_samples(gaps=(0.004, 0.005, 0.03)):
+    return {f: [_touch(f, g) for g in gaps] for f in FINGERS}
+
+
+def test_fit_pinch_uses_medians_and_maps_touch_to_zero():
+    from tkt.vision.features import pinch_raw
+
+    opens = [_open(0.0), _open(0.05), _open(0.4)]
+    ref = hand_calib.fit_pinch(opens, _touch_samples())
+    assert set(ref) == set(FINGERS)
+    for f in FINGERS:
+        assert set(ref[f]) == set(hand_calib.PINCH_REF_KEYS)
+        assert ref[f]["img_open"] > ref[f]["img_touch"]
+        assert ref[f]["world_open"] > ref[f]["world_touch"]
+        # medyan: ortadaki örnek (gap 0,005; açıkta k=0,05)
+        mid = pinch_raw(_touch(f, 0.005), f)
+        assert ref[f]["img_touch"] == pytest.approx(mid["img"])
+        assert ref[f]["world_touch"] == pytest.approx(mid["world"])
+        assert ref[f]["world_open"] == pytest.approx(pinch_raw(_open(0.05), f)["world"])
+    calib = replace(_calib(), pinch_ref=ref)
+    info = SourceInfo(schema=SCHEMA_VERSION, width=1, height=1, fps=60.0, hand="right")
+    for f in FINGERS:
+        frame = build_frame(_touch(f, 0.004), 0.0, 0, calib, info)
+        assert frame.pinch[f] == pytest.approx(0.0, abs=1e-6)
+    assert all(v == pytest.approx(1.0, abs=0.05)
+               for v in build_frame(_open(0.05), 0.0, 0, calib, info).pinch.values())
+
+
+def test_fit_pinch_skips_unmeasurable_samples():
+    bad = RawHand(_open().image_pts, np.full((21, 3), np.nan), 0.9)
+    ref = hand_calib.fit_pinch([_open(), bad], {f: [_touch(f), bad] for f in FINGERS})
+    assert all(np.isfinite(list(r.values())).all() for r in ref.values())
+
+
+def test_fit_pinch_failures():
+    touch = _touch_samples()
+    with pytest.raises(ValueError, match="açık el"):
+        hand_calib.fit_pinch([], touch)
+    with pytest.raises(ValueError, match="ring"):
+        hand_calib.fit_pinch([_open()], {**touch, "ring": []})
+    # Dünya noktaları yok: ölçülemedi.
+    nw = [RawHand(h.image_pts, np.zeros((21, 3)), 0.9) for h in (_open(),)]
+    with pytest.raises(ValueError, match="ölçülemedi"):
+        hand_calib.fit_pinch(nw, {f: [RawHand(_touch(f).image_pts, np.zeros((21, 3)), 0.9)]
+                                  for f in FINGERS})
+    # "Açık" örneklerde başparmak zaten değiyor.
+    with pytest.raises(ValueError, match="büyük değil"):
+        hand_calib.fit_pinch([_touch("index", 0.0)], touch)
+    # Orta parmak adımında işarete değildi.
+    with pytest.raises(ValueError, match="daha yakın"):
+        hand_calib.fit_pinch([_open()], {**touch, "middle": [_touch("index")]})
+
+
+def test_pinch_ref_roundtrip_and_old_files(tmp_path):
+    ref = hand_calib.fit_pinch([_open()], _touch_samples())
+    c = replace(_calib(), pinch_ref=ref)
+    path = tmp_path / "c.json"
+    save(c, path)
+    assert load(path) == c
+    # Pinch'siz eski dosya (anahtar hiç yok) okunur, pinch_ref None.
+    d = json.loads(path.read_text())
+    del d["pinch_ref"]
+    path.write_text(json.dumps(d))
+    old = load(path)
+    assert old.pinch_ref is None and old.open_ref == c.open_ref
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda r: r.pop("pinky"),
+    lambda r: r["index"].pop("world_open"),
+    lambda r: r["index"].update(img_open=float("nan")),
+    lambda r: r["index"].update(img_open=True),
+    lambda r: r["middle"].update(world_open=0.0, world_touch=0.5),
+])
+def test_load_rejects_bad_pinch_ref(tmp_path, mutate):
+    ref = hand_calib.fit_pinch([_open()], _touch_samples())
+    path = tmp_path / "c.json"
+    save(replace(_calib(), pinch_ref=ref), path)
+    d = json.loads(path.read_text(), parse_constant=float)
+    mutate(d["pinch_ref"])
+    path.write_text(json.dumps(d))
+    with pytest.raises(ValueError, match="pinch_ref"):
+        load(path)
+
+
+def test_pinch_steps_cover_fingers():
+    assert tuple(hand_calib.PINCH_STEP_FINGER[s] for s in hand_calib.PINCH_STEPS) == FINGERS
+    assert not set(hand_calib.PINCH_STEPS) & set(STEPS)
