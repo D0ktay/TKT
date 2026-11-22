@@ -271,6 +271,18 @@ def test_make_zoom_reads_config(monkeypatch, tmp_path):
     assert not z.enabled and z.period == pytest.approx(0.2)
 
 
+def test_c_survives_a_partly_hidden_face_but_leaves_when_face_is_gone(core, monkeypatch):
+    monkeypatch.setattr(am, "FACE_EVERY_S", 0.0)
+    cfg = am.profile("C")[1]
+    # El yüzün önünde: güven 0,4–0,6. C'de kalınır.
+    assert am.run_mode(FakeSource(10), cfg, True, False, lambda img: 0.45, "C") is None
+    # Kamera masaya döndü: güven 0. A'ya geçilir.
+    assert am.run_mode(FakeSource(10), cfg, True, False, lambda img: 0.0, "C") == "A"
+    # A'dan C'ye geçmek için yine tam güven gerekir.
+    assert am.run_mode(FakeSource(10), am.profile("A")[1], False, False,
+                       lambda img: 0.45, "A") is None
+
+
 def test_face_score_flickers_do_not_switch(core, monkeypatch):
     monkeypatch.setattr(am, "FACE_EVERY_S", 0.0)
     scores = iter([0.95, 0.1, 0.95, 0.1, 0.95, 0.1, 0.95, 0.1])

@@ -88,6 +88,10 @@ def act(msg):
 REPO = Path(__file__).resolve().parents[3]
 FACE_MODEL = str(REPO / "models/blaze_face_short_range.tflite")
 FACE_SCORE = 0.7            # bu güvenin üstünde yüz = kamera kullanıcıya bakıyor
+# C'deyken yüz güveni ancak bunun altına inerse A'ya dönülür. El yüzün önünden geçince ya da
+# geriye yaslanınca güven 0,40–0,60'a düşüp mod boşuna A'ya geçiyordu (canlı, 2026-11-22:
+# 0,40 0,42 0,46 0,52 0,55 0,60); kamera masaya dönünce güven 0,00 oluyor.
+FACE_SCORE_LEAVE = 0.3
 FACE_EVERY_S = 1.0          # yüz kontrolü aralığı
 SWITCH_AFTER = 3            # art arda bu kadar aynı karar gelince mod değişir
 FACE_DETECT_W = 640         # yüz araması en çok bu genişlikte yapılır
@@ -283,7 +287,7 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
                     f"YAKINLASTIRMA: seviye {zoom.level:+d} (A modunda olcum yok)")
             if vote_due:
                 face_t = now
-                want = "C" if sc >= FACE_SCORE else "A"
+                want = "C" if sc >= (FACE_SCORE_LEAVE if mode_name == "C" else FACE_SCORE) else "A"
                 votes = (votes + [want])[-SWITCH_AFTER:]
                 if len(votes) == SWITCH_AFTER and all(v != mode_name for v in votes):
                     log(f"yuz guveni {sc:.2f} -> {want}")
