@@ -14,7 +14,7 @@
   uygulandığı tutulur; özellik kapanınca ya da uygulama öne gelince fark kapatılır. Menüsünde
   böyle bir çift olmayan uygulamaya dokunulmaz; Biçim menüsü (`skip_menus`) aranmaz, çünkü
   oradaki Büyüt belgedeki yazıyı değiştirir. Kısayollar (`toggle_hotkey`,
-  `calibrate_hotkey`) her yerden çalışır.
+  `calibrate_hotkey`) her yerden çalışır ve yutulur (öndeki uygulamaya gitmez).
 - Esc (her yerden) çıkartır; basılı tuşlar bırakılır, öndeki uygulamanın yakınlaştırması
   geri alınır.
 
@@ -218,26 +218,58 @@ def hotkey_matches(event, hotkey):
     flags = event.modifierFlags()
     held = {name for name, flag in _MOD_FLAGS.items() if flags & flag}
     chars = event.charactersIgnoringModifiers() or ""
-    return held == set(mods) and chars.lower() == key and not event.isARepeat()
+    return held == set(mods) and chars.lower() == key
 
 
 def install_zoom_hotkeys():
-    """Aç / kapat ve kalibrasyon kısayolları (her uygulamada; Erişilebilirlik izni gerekir)."""
+    """Aç / kapat ve kalibrasyon kısayolları (her uygulamada; Erişilebilirlik izni gerekir).
+
+    Tuş bir olay musluğuyla (CGEventTap) yakalanır ve yutulur: öndeki uygulamaya gitmez
+    (Ctrl+M Terminal'de Enter demektir). Musluk kurulamazsa tuş yalnız dinlenir (yutulmaz).
+    """
     toggle = parse_hotkey(zoom_cfg["toggle_hotkey"])
     calibrate = parse_hotkey(zoom_cfg["calibrate_hotkey"])
 
     def on_key(event):
+        """Kısayolsa işler ve True döner."""
         if hotkey_matches(event, toggle):
-            on = core.zoom.toggle()
-            core.act("YAKINLASTIRMA ACIK" if on else "YAKINLASTIRMA KAPALI")
+            if not event.isARepeat():
+                on = core.zoom.toggle()
+                core.act("YAKINLASTIRMA ACIK" if on else "YAKINLASTIRMA KAPALI")
         elif hotkey_matches(event, calibrate):
-            core.zoom.calibrate()
-            core.act("YAKINLASTIRMA kalibrasyonu basladi")
+            if not event.isARepeat():
+                core.zoom.calibrate()
+                core.act("YAKINLASTIRMA kalibrasyonu basladi")
+        else:
+            return False
         core.zoom_txt[0] = core.zoom.text()
+        return True
+
+    def on_tap(proxy, kind, event, refcon):
+        try:
+            if kind in (Quartz.kCGEventTapDisabledByTimeout,
+                        Quartz.kCGEventTapDisabledByUserInput):
+                Quartz.CGEventTapEnable(tap, True)
+            elif kind == Quartz.kCGEventKeyDown and on_key(K.NSEvent.eventWithCGEvent_(event)):
+                return None             # kısayol: uygulamaya gitmesin
+        except Exception as e:          # hata klavyeyi kesmesin: tuşu olduğu gibi geçir
+            core.log(f"kisayol hatasi: {e}")
+        return event
+
+    tap = Quartz.CGEventTapCreate(
+        Quartz.kCGSessionEventTap, Quartz.kCGHeadInsertEventTap, Quartz.kCGEventTapOptionDefault,
+        Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown), on_tap, None)
+    if tap is not None:
+        source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetMain(), source,
+                                  Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(tap, True)
+        return tap, source, on_tap
+
+    core.log("kisayol muslugu kurulamadi; tus yalniz dinleniyor (uygulamaya da gider)")
 
     def on_local(event):
-        on_key(event)
-        return event
+        return None if on_key(event) else event
 
     mask = K.NSEventMaskKeyDown
     return (K.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(mask, on_key),

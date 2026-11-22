@@ -92,8 +92,8 @@ screen_h = 1080
 
 [face_zoom]                 # deney (macOS, C modu): yüz uzaklaşınca ön plandaki uygulamada Büyüt, yaklaşınca Küçült
 file = "~/.tkt/face-zoom.json"          # normal mesafe (kalibrasyon) ve açık / kapalı durumu
-toggle_hotkey = "<ctrl>+<alt>+z"        # özelliği aç / kapat
-calibrate_hotkey = "<ctrl>+<alt>+k"     # şimdiki mesafeyi normal say
+toggle_hotkey = "<ctrl>+m"              # özelliği aç / kapat (<alt> = Mac'te Option)
+calibrate_hotkey = "<ctrl>+<shift>+m"   # şimdiki mesafeyi normal say
 far = [1.20, 1.45]          # normal mesafenin bu katlarından uzakta: +1, +2 seviye (büyüt)
 near = [0.80]               # normal mesafenin bu katından yakında: -1 seviye (küçült)
 hysteresis = 0.08           # her sınırın çevresindeki ölü bant (toplam genişlik, oran)

@@ -167,7 +167,8 @@ def test_bad_thresholds_rejected(tmp_path):
 
 def test_parse_hotkey():
     assert parse_hotkey("<ctrl>+<alt>+z") == (frozenset({"ctrl", "alt"}), "z")
-    assert parse_hotkey(cfg()["toggle_hotkey"]) != parse_hotkey(cfg()["calibrate_hotkey"])
+    assert parse_hotkey(cfg()["toggle_hotkey"]) == (frozenset({"ctrl"}), "m")
+    assert parse_hotkey(cfg()["calibrate_hotkey"]) == (frozenset({"ctrl", "shift"}), "m")
     for bad in ("<ctrl>+", "<hyper>+z", "<ctrl>+zz"):
         with pytest.raises(ValueError):
             parse_hotkey(bad)

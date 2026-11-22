@@ -14,7 +14,7 @@ Repo kökünden: python -m tkt.app.auto_mode   (macOS ve Windows)
   (`[surface].file`) yeşil/kırmızı çizilir.
 - Mesafeyle yakınlaştırma (`[face_zoom]`, yalnız macOS ve C modu; `face_zoom` modülü): yüz
   normal mesafeden uzaklaşınca ön plandaki uygulama büyütülür, yaklaşınca küçültülür.
-  Ctrl+Alt+Z açar / kapatır, Ctrl+Alt+K şimdiki mesafeyi normal sayar.
+  Ctrl+M açar / kapatır, Ctrl+Shift+M şimdiki mesafeyi normal sayar.
 
 Platform farkları:
 - macOS (`auto_mode_mac`): HUD bir Cocoa penceresinde (kapatmak gizler); ekranın sol

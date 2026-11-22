@@ -83,8 +83,8 @@ uv run python -m tkt.app.auto_mode
 - In C on macOS, target assist highlights a single nearby button with a green
   frame; a pinch that starts and ends on the same button clicks its center.
 - Distance zoom (macOS, in C, off by default): lean back and the frontmost app
-  zooms in, lean in and it zooms out. **Ctrl+Alt+Z** turns it on or off;
-  **Ctrl+Alt+K** takes your current distance as normal. It presses the app's own
+  zooms in, lean in and it zooms out. **Ctrl+M** turns it on or off;
+  **Ctrl+Shift+M** takes your current distance as normal. It presses the app's own
   Zoom In / Zoom Out menu items, so apps without them are left alone. Ranges
   and timing are in `[face_zoom]` in `config/control.toml`.
 - **Esc** quits from anywhere and releases all buttons (also `q` while the HUD
