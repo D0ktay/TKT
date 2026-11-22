@@ -15,6 +15,9 @@
   böyle bir çift olmayan uygulamaya dokunulmaz; Biçim menüsü (`skip_menus`) aranmaz, çünkü
   oradaki Büyüt belgedeki yazıyı değiştirir. Kısayollar (`toggle_hotkey`,
   `calibrate_hotkey`) her yerden çalışır ve yutulur (öndeki uygulamaya gitmez).
+- Kontrol penceresi (`panel_mac`): ayarlar ve kalibrasyonlar; `[panel] hotkey`
+  (Control+N) ve menü çubuğundaki "TKT" açıp kapatır. Kalibrasyon aracı açıkken izleme
+  durur ve Esc çıkış sayılmaz (araç penceresini kapatır).
 - Esc (her yerden) çıkartır; basılı tuşlar bırakılır, dokunulan uygulamaların yakınlaştırması
   geri alınır.
 
@@ -32,6 +35,7 @@ import Quartz
 from Foundation import NSObject, NSTimer
 
 from tkt.app.face_zoom import parse_hotkey, pick_zoom_items, skip_menu
+from tkt.app.panel_mac import Panel
 
 SNAP_PX = 8                 # hedef yardımı: imlecin bu kadar yakınındaki tek düğme
 ZOOM_POLL_S = 0.3           # istenen seviye ile uygulananın karşılaştırılma aralığı
@@ -39,12 +43,15 @@ ZOOM_MENU_DEPTH = 2         # menü araması kaç alt menü derine iner
 ZOOM_AX_TIMEOUT_S = 0.5
 ZOOM_RETRY_S = 3.0          # basılamayan (pasif / bayat) öğe için yeniden deneme aralığı
 ESC_KEYCODE = 53
+PANEL_REFRESH_TICKS = 16    # kontrol penceresi bu kadar Tick'te bir yenilenir (~1 sn)
 
 core = None                 # tkt.app.auto_mode (çalışan kopya); run() kurar
 screen = None
 H = 0.0
 view = None
 hud_view = None
+panel = None                # kontrol penceresi (Panel)
+ticks = [0]
 shown_seq = [-1]            # pencereye en son konan HUD görüntüsünün sıra no'su
 zoom_cfg = {}               # [face_zoom]
 zoom_applied = {}           # pid -> o uygulamaya uygulanmış seviye
@@ -232,6 +239,7 @@ def install_zoom_hotkeys():
     """
     toggle = parse_hotkey(zoom_cfg["toggle_hotkey"])
     calibrate = parse_hotkey(zoom_cfg["calibrate_hotkey"])
+    show_panel = parse_hotkey(core.control_config()["panel"]["hotkey"])
 
     def on_key(event):
         """Kısayolsa işler ve True döner."""
@@ -243,6 +251,9 @@ def install_zoom_hotkeys():
             if not event.isARepeat():
                 core.zoom.calibrate()
                 core.act("YAKINLASTIRMA kalibrasyonu basladi")
+        elif hotkey_matches(event, show_panel):
+            if not event.isARepeat() and panel is not None:
+                panel.toggle_(None)
         else:
             return False
         core.zoom_txt[0] = core.zoom.text()
@@ -309,18 +320,27 @@ class Canvas(K.NSView):
             path.stroke()
 
 
+def quit_app():
+    """Çıkış: basılı tuşlar bırakılır, yakınlaştırma geri alınır."""
+    core.stop.set()
+    core.backend.release_all()
+    try:
+        zoom_restore()
+    except Exception as e:
+        core.log(f"yakinlastirma geri alinamadi: {e}")
+    K.NSApp.terminate_(None)
+
+
 class Tick(NSObject):
     def update_(self, timer):
-        if Quartz.CGEventSourceKeyState(Quartz.kCGEventSourceStateCombinedSessionState,
-                                        ESC_KEYCODE):
-            core.stop.set()
-            core.backend.release_all()
-            try:
-                zoom_restore()
-            except Exception as e:
-                core.log(f"yakinlastirma geri alinamadi: {e}")
-            K.NSApp.terminate_(None)
+        # Kalibrasyon aracı açıkken Esc onun penceresini kapatır; uygulamayı kapatmaz.
+        if not core.tool_running[0] and Quartz.CGEventSourceKeyState(
+                Quartz.kCGEventSourceStateCombinedSessionState, ESC_KEYCODE):
+            quit_app()
             return
+        ticks[0] += 1
+        if panel is not None and ticks[0] % PANEL_REFRESH_TICKS == 0 and panel.window.isVisible():
+            panel.refresh()
         view.setNeedsDisplay_(True)
         img, seq = core.hud_img
         if img is not None and seq != shown_seq[0]:
@@ -354,7 +374,7 @@ def make_hud_window():
 
 def run(core_module):
     """Cocoa uygulamasını kurar, iz ve hedef bulucu thread'lerini başlatır; Esc'ye kadar döner."""
-    global core, screen, H, view, zoom_cfg
+    global core, screen, H, view, zoom_cfg, panel
     core = core_module
     core.target_click = click_target
     core.zoom = core.make_zoom()
@@ -375,12 +395,20 @@ def run(core_module):
     win.setContentView_(view)
     win.orderFrontRegardless()
     hud_win = make_hud_window()
+    panel = Panel.alloc().initWithCore_onQuit_(core, quit_app)
+    panel.hud_window = hud_win
+    panel.applyHud()
+    panel.addStatusItem()
+    if not A.AXIsProcessTrustedWithOptions({A.kAXTrustedCheckOptionPrompt: True}):
+        core.log("Erisilebilirlik izni yok: imlec, kisayollar ve hedef yardimi calismaz")
+        core.mode_txt[0] = "ERISILEBILIRLIK IZNI YOK (Sistem Ayarlari > Gizlilik)"
     tick = Tick.alloc().init()
     timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.06, tick, "update:", None, True)
     monitors = install_zoom_hotkeys()
     run.keep = (win, hud_win, tick, timer, monitors)   # pyobjc nesneleri çöp toplamaya gitmesin
     threading.Thread(target=zoom_worker, daemon=True).start()
+    panel.show()
     threading.Thread(target=core.track, daemon=True).start()
     threading.Thread(target=find_targets, daemon=True).start()
     app.run()

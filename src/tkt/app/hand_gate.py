@@ -80,8 +80,19 @@ class HandGate:
         self._since = None          # işaretin başladığı an
         self._seen = None           # işaretin son görüldüğü an
         self._fired = False         # bu işaret için kapı zaten çevrildi
+        self._path = path if path is not None else cfg["file"]
         # Öğretilmiş işaret: {parmak: (alt, üst)} ya da None (sabit eşikler).
-        self.ranges = load_ranges(path if path is not None else cfg["file"])
+        self.ranges = load_ranges(self._path)
+
+    def reload(self):
+        """Öğretilmiş işareti dosyadan yeniden okur (kalibrasyon penceresi kapanınca)."""
+        self.ranges = load_ranges(self._path)
+
+    def set_active(self, active):
+        """Kapıyı arayüzden açar / kapatır; tutulan işaret yeniden saymasın diye sıfırlanır."""
+        self.active = bool(active)
+        self._since = self._seen = None
+        self._fired = False
 
     # --- kapı ---
 

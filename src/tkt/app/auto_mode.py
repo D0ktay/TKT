@@ -29,6 +29,7 @@ Platform farkları:
   yok. Çıkış: Windows'ta her yerden Esc; HUD odaktayken Esc/q; HUD penceresini kapatmak.
 """
 import dataclasses
+import subprocess
 import sys
 import threading
 import time
@@ -38,6 +39,7 @@ from pathlib import Path
 
 import cv2
 
+from tkt.app import panel as panel_model
 from tkt.app.face_zoom import FaceZoom
 from tkt.app.hand_gate import HandGate
 from tkt.app.hud import ActionTap
@@ -73,6 +75,12 @@ zoom_txt = [""]             # ekranda gösterilen yakınlaştırma durumu
 gate = None                 # HandGate; main() kurar (yoksa el faresi hep açık)
 GATE_OFF_TXT = "EL KAPALI (baris isareti ile ac)"
 GATE_ON_TXT = "el acik (baris isareti kapatir)"
+TOOL = "TOOL"               # run_mode: kalibrasyon aracı istendi, kamera bırakılmalı
+CAMERA_RETRY_S = 3.0        # kamera açılamazsa yeniden deneme aralığı
+pending_tool = [None]       # arayüzün istediği kalibrasyon aracı (python -m … argümanları)
+tool_running = [False]      # araç penceresi açık (izleme durdu; Esc çıkışı sayılmaz)
+mode_now = [""]             # o anki mod adı ("A" / "C"), arayüz için
+prefs = dict(panel_model.DEFAULT_PREFS)     # kalıcı tercihler (~/.tkt/app.json); main() okur
 
 
 def log(msg):
@@ -111,13 +119,31 @@ def profile(name):
 
     Hedef yardımı yalnız platform arayüzü hedef bulabiliyorsa (`target_click` kuruluysa) açıktır.
     """
-    cfg = tomllib.loads((REPO / "config/control.toml").read_text())
+    cfg = control_config()
     if name == "A":
         cfg["general"]["click_method"] = "thumb"
+        if prefs["use_surface"]:        # imleç seçili masa alanından sürülür (alan varsa)
+            cfg["surface_pointer"] = {**cfg["surface_pointer"], "enabled": True}
         return str(REPO / "config/vision.toml"), cfg, False, False
     cfg["general"]["click_method"] = "index_pinch"
     cfg["pointer"] = {**cfg["pointer"], **cfg.get("pointer_front", {})}
     return str(REPO / "config/vision-front.toml"), cfg, True, target_click is not None
+
+
+def control_config():
+    return tomllib.loads((REPO / "config/control.toml").read_text())
+
+
+def set_pref(key, value):
+    prefs[key] = bool(value)
+    panel_model.save_prefs(prefs)
+
+
+def panel_hotkey_text():
+    """Kontrol penceresi kısayolu, okunur biçimde ("Control+N")."""
+    names = {"ctrl": "Control", "alt": "Option", "cmd": "Command", "shift": "Shift"}
+    parts = control_config()["panel"]["hotkey"].lower().split("+")
+    return "+".join(names.get(p.strip("<>"), p.upper()) for p in parts)
 
 
 def camera_rotated(vcfg_path):
@@ -221,17 +247,61 @@ def track():
             "MOD A: masa (basparmak tik)" if mode_name == "A"
             else "MOD C: pinch (kamera sana bakiyor)")
         surface = load_surface(vcfg) if mode_name == "A" else None
+        mode_now[0] = mode_name
+        try:
+            s = open_live_source(vcfg)
+        except RuntimeError as e:       # kamera takılı değil / izin yok: çökme, yeniden dene
+            log(f"kamera acilamadi: {e}")
+            mode_txt[0] = "KAMERA ACILAMADI (takili mi, izin var mi?) - yeniden deneniyor"
+            if stop.wait(CAMERA_RETRY_S):
+                break
+            continue
+        use_area = mode_name == "A" and prefs["use_surface"] and surface is not None
+        if use_area:
+            s.set_surface(surface)      # parmak uçlarına alan koordinatı yazılsın
         act(f"MOD {mode_name}: {Path(vcfg).name}"
-            + ("" if mode_name == "C" else ", alan var" if surface else ", alan yok"))
-        s = open_live_source(vcfg)
+            + ("" if mode_name == "C" else ", alan kullaniliyor" if use_area
+               else ", alan var" if surface else ", alan yok"))
         switch_to = run_mode(s, cfg, mirror, assist, face_score, mode_name, surface,
                              rotated=camera_rotated(vcfg))
         s.close()
         if switch_to is None:
             break
+        if switch_to == TOOL:
+            run_tool()
+            continue
         act(f"mod degisiyor: {mode_name} -> {switch_to}")
         mode_name = switch_to
     backend.release_all()
+
+
+def request_tool(args):
+    """Bir kalibrasyon aracını (`python -m …` argümanları) sıraya koyar; iz thread'i çalıştırır."""
+    pending_tool[0] = list(args)
+
+
+def request_reopen():
+    """Kamerayı ve o anki modu yeni ayarlarla yeniden açtırır (araç çalıştırmadan)."""
+    pending_tool[0] = []
+
+
+def run_tool(run=subprocess.run):
+    """Sıradaki kalibrasyon aracını çalıştırır ve bitmesini bekler (kamera bu sırada onundur)."""
+    args, pending_tool[0] = pending_tool[0], None
+    if not args:
+        return
+    tool_running[0] = True
+    mode_txt[0] = "KALIBRASYON penceresi acik (bitince pencereyi kapat)"
+    act("KALIBRASYON: " + args[-1])
+    try:
+        run([sys.executable, *args], cwd=str(REPO), check=False)
+    except OSError as e:
+        log(f"kalibrasyon araci calismadi: {e}")
+    finally:
+        tool_running[0] = False
+    if gate is not None:
+        gate.reload()                   # işaret yeniden öğretilmiş olabilir
+    act("KALIBRASYON bitti")
 
 
 def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotated=False):
@@ -259,11 +329,14 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
     zoom_min = cfg.get("face_zoom", {}).get("face_score", FACE_SCORE)
     face_last, face_ms = (0.0, None), 0.0
     gated = gate is not None and gate.enabled and mode_name == "C"
+    was_active = not gated or gate.active
     mode_base = mode_txt[0]
     try:
         for f, hand, img in s.frames_raw():
             if stop.is_set():
                 return None
+            if pending_tool[0] is not None:
+                return TOOL
             now = time.monotonic()
             vote_due = now - face_t >= FACE_EVERY_S
             # Mesafe ölçümü yalnız C'de (kamera kullanıcıya bakarken) ve özellik açıkken sıklaşır.
@@ -307,14 +380,16 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
             dry.events.clear()
             dry.set_time(f.t)
             if gated:
-                flip = gate.update(f)
-                if flip is True:
+                gate.update(f)
+            active = not gated or gate.active
+            if active != was_active:    # barış işareti ya da arayüzdeki kutu kapıyı çevirdi
+                was_active = active
+                if active:
                     eng = GestureEngine(cfg, dry, s.info)     # temiz durumla başla
                     act("EL FARESI ACIK")
-                elif flip is False:
+                else:
                     release_engine(eng, dry)
                     act("EL FARESI KAPALI")
-            active = not gated or gate.active
             if active:
                 eng.process(f)
             present = f.present and active
@@ -528,6 +603,8 @@ def run_cv_ui(show=None, poll_key=None, window_open=None, worker_target=None):
 def main():
     global backend, gate
     import faulthandler
+
+    prefs.update(panel_model.load_prefs())
 
     from tkt.app.main import _set_dpi_awareness
 

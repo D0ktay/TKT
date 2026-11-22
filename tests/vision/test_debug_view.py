@@ -1165,6 +1165,19 @@ def test_draw_surface_colors_and_partial():
     assert np.any(np.all(img == np.array(dv._YELLOW, np.uint8), axis=2))
 
 
+def test_main_start_option_presses_that_key(monkeypatch, tmp_path):
+    cfg = tmp_path / "vision.toml"
+    cfg.write_text(f'[hand]\ncalibration = "{(tmp_path / "c.json").as_posix()}"\n'
+                   'side = "right"\n')
+    calls = {}
+    monkeypatch.setattr(dv, "open_live_source", lambda path: "src")
+    monkeypatch.setattr(dv, "run", lambda *a, **kw: calls.update(kw=kw))
+    dv.main(["--config", str(cfg), "--start", "surface"])
+    assert calls["kw"] == {"start_key": dv.KEY_SURFACE}
+    assert dv.START_KEYS == {"hand": dv.KEY_CALIB, "pinch": dv.KEY_PINCH,
+                             "surface": dv.KEY_SURFACE}
+
+
 def test_main_passes_surface_config(monkeypatch, tmp_path):
     cfg = tmp_path / "vision.toml"
     calib = tmp_path / "cal.json"
