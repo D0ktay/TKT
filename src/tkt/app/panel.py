@@ -66,8 +66,8 @@ def file_status(path, valid=None):
 def calibrations(repo, control_cfg, zoom=None):
     """Pencerede gösterilecek kalibrasyonlar, sırasıyla."""
     repo = Path(repo)
-    desk = tomllib.loads((repo / "config/vision.toml").read_text())
-    front = tomllib.loads((repo / "config/vision-front.toml").read_text())
+    desk = tomllib.loads((repo / "config/vision.toml").read_text(encoding="utf-8"))
+    front = tomllib.loads((repo / "config/vision-front.toml").read_text(encoding="utf-8"))
     desk_cfg, front_cfg = "config/vision.toml", "config/vision-front.toml"
     view = ("-m", "tkt.vision.debug_view", "--config")
     a, c = "Masa modu", "Kamera sana bakarken"

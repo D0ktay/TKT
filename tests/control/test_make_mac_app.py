@@ -19,7 +19,7 @@ def test_build_writes_bundle(tmp_path):
     assert info["NSCameraUsageDescription"] and info["NSAppleEventsUsageDescription"]
     launcher = app / "Contents/MacOS/TKT"
     assert os.access(launcher, os.X_OK)
-    text = launcher.read_text()
+    text = launcher.read_text(encoding="utf-8")
     assert f'cd "{repo}"' in text and f'exec "{python}" -u -m tkt.app.auto_mode' in text
     assert "Library/Logs/TKT.log" in text
     assert m.build(tmp_path / "Apps", repo=repo) == app        # üstüne yazılabilir

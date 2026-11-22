@@ -54,7 +54,7 @@ def build(dest, repo=REPO, python=None):
     with (app / "Contents/Info.plist").open("wb") as fh:
         plistlib.dump(info_plist(), fh)
     launcher = macos / APP_NAME
-    launcher.write_text(LAUNCHER.format(repo=repo, python=python))
+    launcher.write_text(LAUNCHER.format(repo=repo, python=python), encoding="utf-8")
     launcher.chmod(launcher.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return app
 

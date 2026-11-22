@@ -132,7 +132,7 @@ def profile(name):
 
 
 def control_config():
-    return tomllib.loads((REPO / "config/control.toml").read_text())
+    return tomllib.loads((REPO / "config/control.toml").read_text(encoding="utf-8"))
 
 
 def set_pref(key, value):
