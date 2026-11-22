@@ -49,6 +49,8 @@ gösterir.
 
 - `c`: el kalibrasyonu (açık el 2 sn, yumruk 2 sn, başparmak kapalı 2 sn).
 - `t`: tap kalibrasyonu; ekranda "TAP!" görünce işaret parmağıyla tap yapın (10 kez).
+- `s` (deney): aktif alan kalibrasyonu; 4 köşede (sol-uzak, sağ-uzak, sağ-yakın, sol-yakın)
+  işaret parmağı ucunu köşeye koyup boşluk; `g` köşeyi tekrarlatır. `[surface].file` yoluna yazılır.
 - `q`, Esc veya pencereyi kapatmak: çıkış.
 
 Kalibrasyon hemen uygulanır ve `[hand].calibration` yoluna yazılır.
@@ -119,6 +121,8 @@ etkin olmalı.
 | [control.toml](config/control.toml) | `[mode]` `lock_ms`, `curl_open`, `curl_closed`. `[thumb]` `closed`, `open`, `drag_threshold`. |
 | [control.toml](config/control.toml) | `[pointer]` `gain_min`, `gain_max`. `[scroll]` `natural`, `gain`, `step_px`, `inertia_ms`. |
 | [control.toml](config/control.toml) | `[tap]` `lift_start`, `lift_up`, `min_ms`, `max_ms`, `pair_ms`. `[swipe]` `distance`, `window_ms`. |
+| [vision.toml](config/vision.toml) | Deney: `[surface]` `enabled`, `file`, `aspect` (aktif alan, varsayılan kapalı). |
+| [control.toml](config/control.toml) | Deney: `[surface_pointer]` `enabled`, `aspect`, `gain_*`, `speed_*`, `absolute`. `aspect` iki dosyada aynı olmalı. |
 
 ## Sorun giderme
 

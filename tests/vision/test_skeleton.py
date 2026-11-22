@@ -10,6 +10,7 @@ MODULES = [
     "tkt.vision.tracker",
     "tkt.vision.hand_calib",
     "tkt.vision.features",
+    "tkt.vision.calibration",
     "tkt.vision.lift",
     "tkt.vision.live_source",
     "tkt.vision.debug_view",
@@ -56,6 +57,7 @@ def test_record_cli_options():
 
 def test_vision_config_complete():
     cfg = tomllib.loads((ROOT / "config" / "vision.toml").read_text(encoding="utf-8"))
-    assert set(cfg) == {"camera", "tracker", "hand", "lift"}
+    assert set(cfg) == {"camera", "tracker", "hand", "lift", "surface"}
+    assert cfg["surface"]["enabled"] is False   # deney: varsayılan kapalı
     assert cfg["camera"]["fps"] == 60
     assert set(cfg["lift"]) == {"w_angle", "w_length", "baseline_s", "curl_rate_suppress"}
