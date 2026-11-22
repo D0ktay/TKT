@@ -686,3 +686,35 @@ def test_cli_preview_wraps_source(tmp_path, monkeypatch):
     assert isinstance(seen["source"], rec.PreviewSource)
     rec.main(["--out", str(tmp_path / "x.jsonl"), "--duration", "10"])
     assert isinstance(seen["source"], Src)
+
+
+def test_preview_waits_for_space_before_lead(tmp_path):
+    keys = iter([255, 255, ord(" ")])
+    stop = threading.Event()
+    shown = []
+    ps = rec.PreviewSource(preview_source(30), "x", None, stop, lead=0.0, wait_key=True,
+                           show=lambda name, img: shown.append(1),
+                           poll_key=lambda: next(keys, 255))
+    n = record(ps, tmp_path / "a.jsonl", duration=0.05)
+    frames = list(iter_frames(tmp_path / "a.jsonl"))
+    assert frames[0].frame_id == 4            # ilk 3 kare beklemede, kayda girmedi
+    assert n == len(frames)
+
+
+def test_cli_wait_space_enables_preview(tmp_path, monkeypatch):
+    import tkt.vision.live_source as ls
+
+    seen = {}
+
+    class Src(FakeSource):
+        def close(self):
+            pass
+
+    def fake_record(source, out, note, duration, raw, video, stop, **kw):
+        seen["source"] = source
+        return 0
+
+    monkeypatch.setattr(ls, "open_live_source", lambda cfg: Src(1))
+    monkeypatch.setattr(rec, "record", fake_record)
+    rec.main(["--out", str(tmp_path / "x.jsonl"), "--duration", "5", "--wait-space"])
+    assert isinstance(seen["source"], rec.PreviewSource) and seen["source"]._waiting
