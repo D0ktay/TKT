@@ -227,3 +227,7 @@ uv run pytest
 
 Camera tests are skipped by default. Plans are in [docs/plan/](docs/plan/) and
 agent rules in [AGENTS.md](AGENTS.md).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
