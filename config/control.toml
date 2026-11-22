@@ -48,6 +48,11 @@ cooldown_ms = 100
 [swipe]
 distance = 0.5              # el boyu
 window_ms = 500
+# Üç/dört parmak kaydırmanın gönderdiği eylem. Masaüstü: desktop_left, desktop_right, mission_control.
+# Uygulama kısayolu (ör. Doppel /play: önceki/sonraki hamle, çizgileri karşılaştır): key_left, key_right, key_tab.
+left = "desktop_left"
+right = "desktop_right"
+up = "mission_control"
 
 [pinch]
 closed = 0.25

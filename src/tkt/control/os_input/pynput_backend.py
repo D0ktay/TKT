@@ -61,7 +61,10 @@ class PynputBackend:
         if name in DICTATION_ACTIONS:
             self._dictation_toggle(name == "dictation_start")
             return
-        if sys.platform == "win32":
+        plain = {"key_left": (key.left,), "key_right": (key.right,), "key_tab": (key.tab,)}
+        if name in plain:
+            chords = plain
+        elif sys.platform == "win32":
             chords = {
                 "mission_control": (key.cmd, key.tab),
                 "desktop_left": (key.cmd, key.ctrl, key.left),

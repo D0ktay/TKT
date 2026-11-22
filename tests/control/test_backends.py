@@ -86,6 +86,9 @@ def test_pynput_mouse(pynput_backend, monkeypatch):
         ("win32", "mission_control", ("cmd", "tab")),
         ("win32", "desktop_left", ("cmd", "ctrl", "left")),
         ("win32", "desktop_right", ("cmd", "ctrl", "right")),
+        ("darwin", "key_left", ("left",)),
+        ("win32", "key_right", ("right",)),
+        ("win32", "key_tab", ("tab",)),
     ],
 )
 def test_pynput_system_shortcuts(pynput_backend, monkeypatch, platform, action, keys):

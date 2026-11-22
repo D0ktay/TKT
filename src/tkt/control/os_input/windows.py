@@ -39,6 +39,9 @@ _CHORDS = {
     "mission_control": (_VK_LWIN, _VK_TAB),
     "desktop_left": (_VK_LWIN, _VK_CONTROL, _VK_LEFT),
     "desktop_right": (_VK_LWIN, _VK_CONTROL, _VK_RIGHT),
+    "key_left": (_VK_LEFT,),
+    "key_right": (_VK_RIGHT,),
+    "key_tab": (_VK_TAB,),
 }
 
 

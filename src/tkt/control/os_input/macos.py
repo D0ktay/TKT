@@ -16,6 +16,13 @@ _SYSTEM_KEYS = {
     "desktop_left": _KEY_LEFT,
     "desktop_right": _KEY_RIGHT,
 }
+# Değiştirici tuşsuz gönderilen eylemler (uygulama kısayolları, ör. önceki/sonraki).
+_KEY_TAB = 48
+_PLAIN_KEYS = {
+    "key_left": _KEY_LEFT,
+    "key_right": _KEY_RIGHT,
+    "key_tab": _KEY_TAB,
+}
 _MAX_DISPLAYS = 16
 _DICTATION_ACTIONS = ("dictation_start", "dictation_stop")
 _KEY_RETURN = 36
@@ -169,11 +176,15 @@ class MacBackend:
             mac_dictation.toggle(name == "dictation_start")
             self.events_sent += 1
             return
+        q = self._q
+        if name in _PLAIN_KEYS:
+            for down in (True, False):
+                self._post(q.CGEventCreateKeyboardEvent(None, _PLAIN_KEYS[name], down))
+            return
         try:
             keycode = _SYSTEM_KEYS[name]
         except KeyError:
             raise ValueError(f"Bilinmeyen sistem eylemi: {name}") from None
-        q = self._q
         for down in (True, False):
             event = q.CGEventCreateKeyboardEvent(None, keycode, down)
             q.CGEventSetFlags(event, q.kCGEventFlagMaskControl)
