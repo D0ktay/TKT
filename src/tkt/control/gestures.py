@@ -15,6 +15,14 @@ from tkt.control.tap import TapDetector
 from tkt.core.types import FINGERS, Finger, HandFrame, SourceInfo
 
 
+# [swipe] left/right/up config'de yoksa kullanılan eylemler.
+SWIPE_DEFAULT_ACTIONS = {
+    "left": "desktop_left",
+    "right": "desktop_right",
+    "up": "mission_control",
+}
+
+
 class Mode(Enum):
     """Jest motorunun çalışma modları."""
 
@@ -76,6 +84,11 @@ class GestureEngine:
         self._still_s = thumb["still_ms"] / 1000
         self._swipe_distance = swipe["distance"]
         self._swipe_window_s = swipe["window_ms"] / 1000
+        # Kaydırma yönü -> sistem eylemi. Anahtar yoksa eski davranış (masaüstü geçişi) geçerli.
+        self._swipe_actions = {
+            direction: swipe.get(direction, default)
+            for direction, default in SWIPE_DEFAULT_ACTIONS.items()
+        }
         self._image_aspect = info.height / info.width
         self._rollback_ms = cfg["pointer"]["rollback_ms"]
         self._backend = backend
@@ -501,9 +514,9 @@ class GestureEngine:
             if hypot(dx, dy) < threshold:
                 continue
             if abs(dx) >= abs(dy):
-                action = "desktop_left" if dx < 0 else "desktop_right"
+                action = self._swipe_actions["left" if dx < 0 else "right"]
             elif dy < 0:
-                action = "mission_control"
+                action = self._swipe_actions["up"]
             else:
                 continue
             self._swipe_triggered = True

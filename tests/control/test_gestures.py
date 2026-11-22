@@ -121,6 +121,34 @@ def test_swipe_direction_and_one_shot(dx, dy, action):
     assert backend_events(backend) == [("system", action)]
 
 
+@pytest.mark.parametrize(
+    ("dx", "dy", "action"),
+    [(-0.25, 0, "key_left"), (0.25, 0, "key_right"), (0, -0.35, "key_tab")],
+)
+def test_swipe_actions_come_from_config(dx, dy, action):
+    cfg = load_control_config()
+    cfg["swipe"] = {**cfg["swipe"], "left": "key_left", "right": "key_right", "up": "key_tab"}
+    source = SyntheticSource().open(4, s=0.75).move(dx, dy, s=0.25)
+    backend = DryBackend()
+    engine = GestureEngine(cfg, backend, source.info)
+    for frame in source.frames():
+        engine.process(frame)
+
+    assert backend_events(backend) == [("system", action)]
+
+
+def test_swipe_without_action_keys_switches_desktops():
+    cfg = load_control_config()
+    cfg["swipe"] = {k: v for k, v in cfg["swipe"].items() if k not in ("left", "right", "up")}
+    source = SyntheticSource().open(4, s=0.75).move(-0.25, 0, s=0.25)
+    backend = DryBackend()
+    engine = GestureEngine(cfg, backend, source.info)
+    for frame in source.frames():
+        engine.process(frame)
+
+    assert backend_events(backend) == [("system", "desktop_left")]
+
+
 @pytest.mark.parametrize(("dx", "dy", "duration"), [(-0.25, 0, 1), (0, 0.3, 0.125)])
 def test_slow_and_downward_swipes_do_not_trigger(rig, dx, dy, duration):
     engine, backend, _, _ = rig

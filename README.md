@@ -137,7 +137,7 @@ all four fingers first.
 | J6 | Slide index and middle together | Scrolling (natural direction, with inertia). |
 | J7 | Lift the index finger and tap the desk | Experimental. Left click. |
 | J8 | Tap with index and middle together | Experimental. Right click. |
-| J9 | Three or four fingers open, swipe sideways or up | Switch desktop / Mission Control (Task View on Windows). |
+| J9 | Three or four fingers open, swipe sideways or up | Switch desktop / Mission Control (Task View on Windows). `[swipe]` `left`, `right`, `up` in `control.toml` can send plain keys instead (`key_left`, `key_right`, `key_tab`), e.g. to step through moves in an app. |
 | J10 | Take the hand out of view, or press Ctrl+Alt+P | Output stops; held buttons are released. |
 | J11 | Only the pinky open (thumb free) | Starts system dictation; speak. A fist stops dictation and presses Enter. |
 
@@ -195,7 +195,7 @@ Sample recordings are in [data/samples/](data/samples/).
 | [control.toml](config/control.toml) | `[general]` `panic_hotkey`, `click_method` (`thumb`, `tap`, `both`, `pinch`, `index_pinch`), `confidence_min`, `lost_release_ms`. |
 | [control.toml](config/control.toml) | `[mode]` `lock_ms`, `curl_open`, `curl_closed`. `[thumb]` `closed`, `open`, `drag_threshold`. |
 | [control.toml](config/control.toml) | `[pointer]` `gain_min`, `gain_max`, `min_cutoff`. `[pointer_front]` overrides `[pointer]` in C. |
-| [control.toml](config/control.toml) | `[scroll]` `natural`, `gain`, `step_px`, `inertia_ms`. `[tap]` `lift_start`, `lift_up`, `min_ms`, `max_ms`, `pair_ms`. `[swipe]` `distance`, `window_ms`. |
+| [control.toml](config/control.toml) | `[scroll]` `natural`, `gain`, `step_px`, `inertia_ms`. `[tap]` `lift_start`, `lift_up`, `min_ms`, `max_ms`, `pair_ms`. `[swipe]` `distance`, `window_ms`, `left`, `right`, `up`. |
 | [control.toml](config/control.toml) | Version C: `[pinch]` and `[index_pinch]` `closed`, `open`, `debounce_ms`, `drag_threshold`, `hold_ms` (right click), `fist_curl`. |
 | [control.toml](config/control.toml) | Experimental: `[surface_pointer]` `enabled`, `aspect`, `gain_*`, `speed_*`, `absolute`. `aspect` must match `[surface]`. |
 
