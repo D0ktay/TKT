@@ -15,7 +15,7 @@
   böyle bir çift olmayan uygulamaya dokunulmaz; Biçim menüsü (`skip_menus`) aranmaz, çünkü
   oradaki Büyüt belgedeki yazıyı değiştirir. Kısayollar (`toggle_hotkey`,
   `calibrate_hotkey`) her yerden çalışır ve yutulur (öndeki uygulamaya gitmez).
-- Esc (her yerden) çıkartır; basılı tuşlar bırakılır, öndeki uygulamanın yakınlaştırması
+- Esc (her yerden) çıkartır; basılı tuşlar bırakılır, dokunulan uygulamaların yakınlaştırması
   geri alınır.
 
 Ortak durum (`stop`, `state_txt`, `hud_img`…) çekirdek modülde tutulur; `run(core)` o modülü
@@ -50,6 +50,7 @@ zoom_cfg = {}               # [face_zoom]
 zoom_applied = {}           # pid -> o uygulamaya uygulanmış seviye
 zoom_items = {}             # pid -> (büyüt öğesi, küçült öğesi) ya da None (desteklenmiyor)
 zoom_retry = {}             # pid -> bu andan önce yeniden denenmez
+zoom_names = {}             # pid -> uygulama adı (çıkışta geri alırken kayıt için)
 zoom_lock = threading.Lock()
 
 
@@ -153,6 +154,7 @@ def find_zoom_items(pid):
 def zoom_sync(pid, name, want):
     """`pid` uygulamasını `want` seviyesine getirir; menü basışı başarısızsa sonraki tura kalır."""
     with zoom_lock:
+        zoom_names[pid] = name
         have = zoom_applied.get(pid, 0)
         if have == want or time.monotonic() < zoom_retry.get(pid, 0.0):
             return
@@ -200,13 +202,14 @@ def zoom_worker():
 
 
 def zoom_restore():
-    """Çıkışta öndeki uygulamayı normal boyuta döndürür (diğerlerine erişilemez)."""
-    front = front_app()
-    if front is not None and zoom_applied.get(front[0], 0):
-        zoom_sync(*front, 0)
-    left = [pid for pid, lvl in zoom_applied.items() if lvl]
+    """Çıkışta dokunulan bütün uygulamaları (arkadakiler dahil) normal boyuta döndürür."""
+    zoom_retry.clear()
+    for pid, level in list(zoom_applied.items()):
+        if level:
+            zoom_sync(pid, zoom_names.get(pid, "uygulama"), 0)
+    left = [zoom_names.get(pid, "?") for pid, lvl in zoom_applied.items() if lvl]
     if left:
-        core.log(f"yakinlastirma: {len(left)} uygulama buyutulmus / kucultulmus kaldi")
+        core.log(f"yakinlastirma geri alinamadi: {', '.join(left)}")
 
 
 _MOD_FLAGS = {"ctrl": K.NSEventModifierFlagControl, "alt": K.NSEventModifierFlagOption,

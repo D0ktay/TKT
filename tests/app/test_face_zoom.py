@@ -33,7 +33,7 @@ def feed(z, t0, seconds, ratio, period=0.2):
 
 def test_defaults_are_sane():
     c = cfg()
-    assert all(v > 1 for v in c["far"]) and all(v < 1 for v in c["near"])
+    assert all(v > 1 for v in c["far"]) and c["near"] == []     # küçültme varsayılan kapalı
     assert c["far"] == sorted(c["far"])
     # Komşu sınırların ölü bantları üst üste binmemeli.
     bounds = sorted(c["near"]) + c["far"]
@@ -62,8 +62,18 @@ def test_leaning_back_zooms_in_after_dwell(tmp_path):
     assert z.level == 2 and z.target == 2
 
 
-def test_leaning_in_zooms_out(tmp_path):
+def test_leaning_in_does_nothing_by_default(tmp_path):
     z = make(tmp_path)
+    _, msgs = feed(z, 0.0, 6.0, 0.60)
+    assert z.level == 0 and msgs == []
+    t, _ = feed(z, 6.0, 4.0, 1.60)           # geriye yaslanınca yine büyür
+    assert z.level == 2
+    feed(z, t, 4.0, 0.60)                    # öne eğilince normale döner, altına inmez
+    assert z.level == 0
+
+
+def test_leaning_in_zooms_out_when_near_is_set(tmp_path):
+    z = make(tmp_path, near=[0.80])
     feed(z, 0.0, 4.0, 0.70)
     assert z.level == -1
 
