@@ -65,7 +65,7 @@ class Panel(NSObject):
         core = self.core
         cal = model.calibrations(core.REPO, core.control_config(), core.zoom)
         groups = list(dict.fromkeys(c.group for c in cal))
-        height = (PAD + 26 + 12                      # durum
+        height = (PAD + 26 + 20 + 12                 # durum, izinler
                   + 4 * 26 + 14                      # kutular
                   + len(groups) * 28 + len(cal) * ROW_H + 10
                   + 20 + 36 + PAD)                   # kısayol notu, çıkış
@@ -86,6 +86,10 @@ class Panel(NSObject):
         self.fix_button.setTarget_(self)
         self.fix_button.setAction_("openAccessibility:")
         self.content.addSubview_(self.fix_button)
+        y -= 20
+        self.perm_label = _label("", ((PAD, y), (W - 2 * PAD, 16)), 11,
+                                 color=K.NSColor.secondaryLabelColor())
+        self.content.addSubview_(self.perm_label)
         y -= 12 + 26
         self.hand_box = self._checkbox("El faresi açık (barış işareti de açıp kapatır)", y,
                                        "handChanged:")
@@ -143,6 +147,8 @@ class Panel(NSObject):
         self.status.setStringValue_(
             model.status_line(core.mode_now[0], core.gate, core.zoom, tool, core.ax_ok[0]))
         self.fix_button.setHidden_(core.ax_ok[0])
+        self.perm_label.setStringValue_(
+            model.permissions_line({**core.perms, "camera": core.camera_ok[0]}))
         gate = core.gate
         self.hand_box.setState_(1 if gate is None or gate.active else 0)
         self.hand_box.setEnabled_(gate is not None and gate.enabled and core.mode_now[0] == "C")

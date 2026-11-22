@@ -81,6 +81,8 @@ pending_tool = [None]       # arayüzün istediği kalibrasyon aracı (python -m
 tool_running = [False]      # araç penceresi açık (izleme durdu; Esc çıkışı sayılmaz)
 mode_now = [""]             # o anki mod adı ("A" / "C"), arayüz için
 ax_ok = [True]              # macOS: Erişilebilirlik izni var mı (yoksa imleç oynamaz)
+camera_ok = [None]          # kamera açılabildi mi (None: henüz denenmedi)
+perms = {}                  # macOS izin denetimi sonucu: ad -> True / False / None (bilinmiyor)
 prefs = dict(panel_model.DEFAULT_PREFS)     # kalıcı tercihler (~/.tkt/app.json); main() okur
 
 
@@ -252,11 +254,13 @@ def track():
         try:
             s = open_live_source(vcfg)
         except RuntimeError as e:       # kamera takılı değil / izin yok: çökme, yeniden dene
+            camera_ok[0] = False
             log(f"kamera acilamadi: {e}")
             mode_txt[0] = "KAMERA ACILAMADI (takili mi, izin var mi?) - yeniden deneniyor"
             if stop.wait(CAMERA_RETRY_S):
                 break
             continue
+        camera_ok[0] = True
         use_area = mode_name == "A" and prefs["use_surface"] and surface is not None
         if use_area:
             s.set_surface(surface)      # parmak uçlarına alan koordinatı yazılsın

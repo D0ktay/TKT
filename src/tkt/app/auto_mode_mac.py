@@ -24,7 +24,6 @@
 Ortak durum (`stop`, `state_txt`, `hud_img`…) çekirdek modülde tutulur; `run(core)` o modülü
 alır (`python -m` ile çalışınca çekirdek `__main__` olur, yeniden import edilmez).
 """
-import contextlib
 import math
 import os
 import subprocess
@@ -342,6 +341,55 @@ def quit_app():
     os._exit(0)
 
 
+# Otomasyon + yardımcı erişim denetimi: dikte de menüyü System Events ile böyle okur.
+DICTATION_CHECK = ('tell application "System Events" to get name of menu bar items of '
+                   'menu bar 1 of (first application process whose frontmost is true)')
+PERM_CHECK_TIMEOUT_S = 20.0     # izin penceresi açıksa osascript yanıt bekler
+CAMERA_WAIT_S = 12.0            # izin kaydı, kameranın açılma sonucunu en çok bu kadar bekler
+
+
+def check_permissions():
+    """Her özelliğin iznini gerçekten deneyerek sınar; sonucu `core.perms`e ve kayda yazar.
+
+    - pointer: fare olayı gönderebiliyor mu (imleç, tık, kaydırma).
+    - hotkeys: klavye musluğu kurulu ve etkin mi (Control+N / Control+M yutulur).
+    - zoom: başka bir uygulamanın (Finder) menü çubuğu Erişilebilirlik ile okunabiliyor mu;
+      büyütme aynı yoldan menü öğesine basar.
+    - dictation: System Events ile öndeki uygulamanın menüleri okunabiliyor mu
+      (Otomasyon izni + yardımcı erişim); izin penceresi yanıtlanmadıysa None.
+    Yalnız okuma yapar; hiçbir şeye basmaz.
+    """
+    perms = {"pointer": bool(Quartz.CGPreflightPostEventAccess())}
+    tap = hotkey_refs[0] if hotkey_refs is not None and len(hotkey_refs) == 3 else None
+    perms["hotkeys"] = bool(tap is not None and Quartz.CGEventTapIsEnabled(tap))
+    finder = K.NSRunningApplication.runningApplicationsWithBundleIdentifier_("com.apple.finder")
+    if finder:
+        app = A.AXUIElementCreateApplication(finder[0].processIdentifier())
+        A.AXUIElementSetMessagingTimeout(app, ZOOM_AX_TIMEOUT_S)
+        perms["zoom"] = attr(app, "AXMenuBar") is not None
+    else:
+        perms["zoom"] = None
+    try:
+        proc = subprocess.run(["osascript", "-e", DICTATION_CHECK], capture_output=True,
+                              text=True, timeout=PERM_CHECK_TIMEOUT_S, check=False)
+        perms["dictation"] = proc.returncode == 0
+        if proc.returncode:
+            core.log(f"dikte izni denetimi: {proc.stderr.strip()[:160]}")
+    except (OSError, subprocess.SubprocessError):
+        perms["dictation"] = None
+    core.perms.update(perms)
+    deadline = time.monotonic() + CAMERA_WAIT_S     # kamera sonucu da kayda girsin
+    while core.camera_ok[0] is None and time.monotonic() < deadline:
+        time.sleep(0.25)
+    from tkt.app.panel import permissions_line
+    core.log("izinler: " + permissions_line({**perms, "camera": core.camera_ok[0]}))
+    return perms
+
+
+def check_permissions_async():
+    threading.Thread(target=check_permissions, daemon=True).start()
+
+
 def check_accessibility():
     """Erişilebilirlik izni sonradan verildiyse kısayolları kurar; izin durumunu döner."""
     global hotkey_refs
@@ -349,6 +397,7 @@ def check_accessibility():
     if ok and not core.ax_ok[0]:
         core.log("Erisilebilirlik izni verildi: kisayollar kuruluyor")
         hotkey_refs = install_zoom_hotkeys()
+        check_permissions_async()
     core.ax_ok[0] = ok
     return ok
 
@@ -428,14 +477,11 @@ def run(core_module):
     # - Erişilebilirlik: imleç, tık, kaydırma, kısayollar, hedef yardımı. macOS bunu yalnız
     #   kullanıcının Sistem Ayarları'nda işaretlemesiyle verir; burada yalnız sorulur.
     # - Otomasyon (System Events): dikteyi menüden açmak için. Zararsız bir sorgu izin
-    #   penceresini şimdi çıkarır; yoksa ilk dikte denemesinde sessizce başarısız olurdu.
+    #   penceresini şimdi çıkarır; yoksa ilk dikte denemesinde sessizce başarısız olurdu
+    #   (`check_permissions`, kısayollar kurulduktan sonra arka planda).
     core.ax_ok[0] = bool(A.AXIsProcessTrustedWithOptions({A.kAXTrustedCheckOptionPrompt: True}))
     if not core.ax_ok[0]:
         core.log("Erisilebilirlik izni yok: imlec, kisayollar ve hedef yardimi calismaz")
-    with contextlib.suppress(OSError):
-        subprocess.Popen(
-            ["osascript", "-e", 'tell application "System Events" to count processes'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     tick = Tick.alloc().init()
     timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.06, tick, "update:", None, True)
@@ -446,5 +492,6 @@ def run(core_module):
     panel.show()
     track_thread = threading.Thread(target=core.track, daemon=True)
     track_thread.start()
+    check_permissions_async()
     threading.Thread(target=find_targets, daemon=True).start()
     app.run()

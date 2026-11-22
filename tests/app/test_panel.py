@@ -71,3 +71,10 @@ def test_status_line():
     assert panel.status_line("C", gate, zoom) == "Kamera sana bakıyor · el faresi açık"
     assert panel.status_line("C", gate, zoom, tool_running=True) == "Kalibrasyon penceresi açık"
     assert "Erişilebilirlik" in panel.status_line("C", gate, zoom, trusted=False)
+
+
+def test_permissions_line_marks_each_feature():
+    line = panel.permissions_line({"camera": True, "pointer": True, "hotkeys": False,
+                                   "zoom": True, "dictation": None})
+    assert line == "kamera ✓   imleç ve tık ✓   kısayollar ✗   büyütme ✓   dikte ?"
+    assert panel.permissions_line({}).count("?") == 5

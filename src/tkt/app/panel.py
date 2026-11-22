@@ -91,6 +91,17 @@ def calibrations(repo, control_cfg, zoom=None):
     return out
 
 
+PERMISSION_LABELS = (("camera", "kamera"), ("pointer", "imleç ve tık"), ("hotkeys", "kısayollar"),
+                     ("zoom", "büyütme"), ("dictation", "dikte"))
+
+
+def permissions_line(perms):
+    """İzin denetimi sonucu tek satırda: ✓ var, ✗ yok, ? henüz bilinmiyor."""
+    marks = {True: "✓", False: "✗"}
+    return "   ".join(f"{label} {marks.get(perms.get(key), '?')}"
+                      for key, label in PERMISSION_LABELS)
+
+
 def status_line(mode, gate, zoom, tool_running=False, trusted=True):
     """Pencerenin üstündeki tek satırlık durum."""
     if not trusted:
