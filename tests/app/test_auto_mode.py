@@ -174,6 +174,48 @@ def test_face_measure_uses_largest_confident_face():
     assert am.face_measure([], 640, 360) == (0.0, None)
 
 
+def test_face_finder_keeps_far_face_by_searching_around_it():
+    """Uzak (küçük) yüz bütün görüntüde düşük güven alır, çevresi kırpılınca yüksek."""
+    face = [300, 100, 60, 60]                 # x, y, genişlik, yükseklik (640x360 görüntüde)
+    calls = []
+
+    def detect(img):
+        h, w = img.shape[:2]
+        calls.append((w, h))
+        x0, y0 = (0, 0) if w == 640 else roi_origin[0]
+        frac = face[2] / w                    # yüz, aranan görüntünün ne kadarı
+        return [(0.95 if frac >= 0.08 else 0.45, face[0] - x0, face[1] - y0, face[2], face[3])]
+
+    img = np.zeros((360, 640, 3), np.uint8)
+    roi_origin = [(0, 0)]
+    find = am.FaceFinder(detect)
+    sc, size = find(img)                      # yakın: bütün görüntüde bulunur
+    assert sc == 0.95 and size == pytest.approx((60 * 60 / (640 * 360)) ** 0.5)
+    face[:] = [310, 110, 40, 40]              # geriye yaslandı: 40/640 < 0.08
+    roi_origin[0] = (240, 40)                 # önceki yüzün çevresi: merkez (330,130) ± 90
+    calls.clear()
+    sc, size = find(img)
+    assert calls == [(180, 180)]              # yalnız çevrede arandı
+    assert sc == 0.95 and size == pytest.approx((40 * 40 / (640 * 360)) ** 0.5)
+    assert find.last == (sc, size)
+
+
+def test_face_finder_falls_back_to_full_image_and_forgets_lost_face():
+    seen = []
+
+    def detect(img):
+        seen.append(img.shape[1])
+        return [(0.9, 10, 10, 50, 50)] if len(seen) == 1 else []
+
+    img = np.zeros((360, 640, 3), np.uint8)
+    find = am.FaceFinder(detect)
+    assert find(img)[0] == 0.9
+    assert find(img) == (0.0, None)           # çevrede yok -> bütün görüntü -> yine yok
+    assert seen == [640, 110, 640]            # çevre (merkez 35 ± 75) kenarda kırpılır
+    find(img)
+    assert seen[-1] == 640 and len(seen) == 4  # yüz unutuldu: doğrudan bütün görüntü
+
+
 def test_make_zoom_reads_config(monkeypatch, tmp_path):
     monkeypatch.setattr(am, "zoom_config", lambda: {
         **am.tomllib.loads((am.REPO / "config/control.toml").read_text())["face_zoom"],

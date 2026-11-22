@@ -81,6 +81,9 @@ FACE_MODEL = str(REPO / "models/blaze_face_short_range.tflite")
 FACE_SCORE = 0.7            # bu güvenin üstünde yüz = kamera kullanıcıya bakıyor
 FACE_EVERY_S = 1.0          # yüz kontrolü aralığı
 SWITCH_AFTER = 3            # art arda bu kadar aynı karar gelince mod değişir
+FACE_DETECT_W = 640         # yüz araması en çok bu genişlikte yapılır
+FACE_ROI_SCALE = 3.0        # yüz bulununca aranan çevre: yüz boyutunun bu katı kenarlı kare
+FACE_ROI_MIN_PX = 16        # bundan küçük çevre aranmaz
 
 
 def load_surface(vcfg_path):
@@ -131,19 +134,58 @@ def make_face_detector():
     det = mpv.FaceDetector.create_from_options(mpv.FaceDetectorOptions(
         base_options=mpt.BaseOptions(model_asset_path=FACE_MODEL), min_detection_confidence=0.3))
 
-    def face_score(img):
-        """(en yüksek yüz güveni, o güvenle en büyük yüzün görüntüye oranı ya da None)."""
+    def detect(img):
+        """BGR / gri görüntüdeki yüzler: [(güven, x, y, genişlik, yükseklik)] piksel."""
         h, w = img.shape[:2]
-        small = cv2.resize(img, (640, int(640 * h / w))) if w > 640 else img
+        k = FACE_DETECT_W / w if w > FACE_DETECT_W else 1.0
+        small = cv2.resize(img, (FACE_DETECT_W, max(1, round(h * k)))) if k < 1.0 else img
         if small.ndim == 2:
             small = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
         r = det.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
                                 data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
-        sh, sw = small.shape[:2]
-        return face_measure(
-            [(d.categories[0].score, d.bounding_box.width, d.bounding_box.height)
-             for d in r.detections], sw, sh)
-    return face_score
+        return [(d.categories[0].score, d.bounding_box.origin_x / k, d.bounding_box.origin_y / k,
+                 d.bounding_box.width / k, d.bounding_box.height / k) for d in r.detections]
+    return FaceFinder(detect)
+
+
+class FaceFinder:
+    """Yüzü önce son görüldüğü yerin çevresinde, bulamazsa bütün görüntüde arar.
+
+    Yüz bulucu (BlazeFace kısa menzil) görüntüyü 128 piksele küçültür; kullanıcı geriye
+    yaslanınca yüz birkaç piksele iner, güven 0,4–0,5'e düşer ve mod yanlışlıkla A'ya geçerdi
+    (canlı deneme, 2026-11-22). Yüzün çevresi (`FACE_ROI_SCALE` × yüz boyutu) kırpılıp
+    aranınca yüz modelin girdisinde büyük kalır: güven düşmez, kutu boyutu da daha hassas olur.
+    Çağrı `(en yüksek güven, yüz boyutu ya da None)` döner (`face_measure`).
+    """
+
+    def __init__(self, detect):
+        self._detect = detect       # görüntü -> [(güven, x, y, genişlik, yükseklik)]
+        self._roi = None            # (x0, y0, x1, y1) son yüzün çevresi
+        self.last = (0.0, None)     # son sonuç (kayıt için)
+
+    def __call__(self, img):
+        h, w = img.shape[:2]
+        faces = []
+        if self._roi is not None:
+            x0, y0, x1, y1 = self._roi
+            x1, y1 = min(x1, w), min(y1, h)
+            if x1 - x0 >= FACE_ROI_MIN_PX and y1 - y0 >= FACE_ROI_MIN_PX:
+                faces = [(s, x + x0, y + y0, fw, fh)
+                         for s, x, y, fw, fh in self._detect(img[y0:y1, x0:x1])
+                         if s >= FACE_SCORE]
+        if not faces:
+            faces = self._detect(img)
+        good = [f for f in faces if f[0] >= FACE_SCORE and f[3] > 0 and f[4] > 0]
+        if good:
+            _, x, y, fw, fh = max(good, key=lambda f: f[3] * f[4])
+            half = FACE_ROI_SCALE * max(fw, fh) / 2
+            cx, cy = x + fw / 2, y + fh / 2
+            self._roi = (max(0, int(cx - half)), max(0, int(cy - half)),
+                         int(cx + half), int(cy + half))
+        else:
+            self._roi = None
+        self.last = face_measure([(s, fw, fh) for s, _, _, fw, fh in faces], w, h)
+        return self.last
 
 
 def face_measure(faces, w, h, min_score=None):
@@ -206,6 +248,7 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
     face_t, votes = 0.0, []
     zoom_t = 0.0
     zoom_min = cfg.get("face_zoom", {}).get("face_score", FACE_SCORE)
+    face_last, face_ms = (0.0, None), 0.0
     try:
         for f, hand, img in s.frames_raw():
             if stop.is_set():
@@ -217,7 +260,8 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
                         and now - zoom_t >= zoom.period)
             if vote_due or zoom_due:
                 got = face_score(cv2.rotate(img, cv2.ROTATE_180) if rotated else img)
-                sc, size = got if isinstance(got, tuple) else (got, None)
+                sc, size = face_last = got if isinstance(got, tuple) else (got, None)
+                face_ms = max(face_ms, 1000 * (time.monotonic() - now))
                 if zoom_due:
                     zoom_t = now
                     msg = zoom.update(now, size if sc >= zoom_min else None)
@@ -238,8 +282,13 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
                 log(f"olcum [{mode_name}]: isleme {s.process_fps():.1f} fps, "
                     f"takip {s.last_process_ms:.0f} ms, "
                     f"gecikme ort {1000*sum(ages)/len(ages):.0f} / maks {1000*max(ages):.0f} ms, "
-                    f"hedef arama maks {1000*ax_max[0]:.0f} ms")
-                stat_t, ages, ax_max[0] = now, [], 0.0
+                    f"hedef arama maks {1000*ax_max[0]:.0f} ms, "
+                    f"yuz guven {face_last[0]:.2f} boyut "
+                    + ("yok" if face_last[1] is None else f"{face_last[1]:.3f}")
+                    + f" arama maks {face_ms:.0f} ms"
+                    + ("" if zoom is None or zoom.ratio is None
+                       else f", uzaklik {zoom.ratio:.2f}x seviye {zoom.level:+d}"))
+                stat_t, ages, ax_max[0], face_ms = now, [], 0.0, 0.0
             dry.events.clear()
             dry.set_time(f.t)
             eng.process(f)
