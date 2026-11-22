@@ -18,6 +18,8 @@ Repo kökünden: python -m tkt.app.auto_mode   (macOS ve Windows)
 - El kapısı (`[hand_gate]`, yalnız C; `hand_gate` modülü): C'de el faresi kapalı başlar;
   barış işareti (işaret + orta açık, yüzük + serçe kıvrık) tutulunca açılır, yeniden
   yapılınca kapanır. Kapalıyken el jest motoruna verilmez, basılı tuşlar bırakılır.
+  İşaret öğretilebilir: `--teach-sign` ile başlat ya da macOS'ta Ctrl+Shift+B; ekrandaki
+  yönergeyle işaret 3 sn tutulur, parmak kıvrım aralıkları `~/.tkt/hand-gate.json`'a yazılır.
 
 Platform farkları:
 - macOS (`auto_mode_mac`): HUD bir Cocoa penceresinde (kapatmak gizler); ekranın sol
@@ -307,6 +309,8 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
             dry.set_time(f.t)
             if gated:
                 flip = gate.update(f)
+                for msg in gate.drain():
+                    act(msg)
                 if flip is True:
                     eng = GestureEngine(cfg, dry, s.info)     # temiz durumla başla
                     act("EL FARESI ACIK")
@@ -319,7 +323,8 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
             present = f.present and active
             update_state(eng, f)
             if gated:       # kapı durumu sol üstte, mod yazısının yanında; imleç yanı boş kalır
-                mode_txt[0] = f"{mode_base} - {GATE_ON_TXT if active else GATE_OFF_TXT}"
+                mode_txt[0] = (f"{mode_base} - "
+                               f"{gate.prompt or (GATE_ON_TXT if active else GATE_OFF_TXT)}")
                 if not active:
                     state_txt[0] = ""
             if state_txt[0] != prev_state:
@@ -531,6 +536,8 @@ def main():
     _set_dpi_awareness()                  # Windows: ölçekli ekranda imleç kaymasın
     backend = make_backend()
     gate = make_gate()
+    if "--teach-sign" in sys.argv[1:]:
+        gate.start_teach()                # C'ye girilince başlar; yönerge ekranda
     log("hazir: otomatik mod (yuz var -> C, yok -> A), Esc ile cikis")
     if sys.platform == "darwin":
         from tkt.app import auto_mode_mac

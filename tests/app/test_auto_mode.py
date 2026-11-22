@@ -219,10 +219,14 @@ def test_face_finder_falls_back_to_full_image_and_forgets_lost_face():
 class FakeGate:
     """3. karede açılır, 6. karede kapanır."""
     enabled = True
+    prompt = None
 
     def __init__(self):
         self.active = False
         self.n = 0
+
+    def drain(self):
+        return []
 
     def update(self, f):
         self.n += 1

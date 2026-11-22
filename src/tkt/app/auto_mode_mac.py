@@ -232,6 +232,7 @@ def install_zoom_hotkeys():
     """
     toggle = parse_hotkey(zoom_cfg["toggle_hotkey"])
     calibrate = parse_hotkey(zoom_cfg["calibrate_hotkey"])
+    teach = parse_hotkey(core.gate.teach_hotkey)
 
     def on_key(event):
         """Kısayolsa işler ve True döner."""
@@ -243,6 +244,10 @@ def install_zoom_hotkeys():
             if not event.isARepeat():
                 core.zoom.calibrate()
                 core.act("YAKINLASTIRMA kalibrasyonu basladi")
+        elif hotkey_matches(event, teach):
+            if not event.isARepeat():
+                core.gate.start_teach()
+                core.act("ISARET OGRETME basladi (C modunda)")
         else:
             return False
         core.zoom_txt[0] = core.zoom.text()
