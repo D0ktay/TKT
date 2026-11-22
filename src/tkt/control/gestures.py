@@ -14,7 +14,6 @@ from tkt.control.surface_pointer import SurfaceMotion, SurfacePointer
 from tkt.control.tap import TapDetector
 from tkt.core.types import FINGERS, Finger, HandFrame, SourceInfo
 
-
 # [swipe] left/right/up config'de yoksa kullanılan eylemler.
 SWIPE_DEFAULT_ACTIONS = {
     "left": "desktop_left",
