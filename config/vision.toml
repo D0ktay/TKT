@@ -16,7 +16,7 @@ min_tracking = 0.5
 [hand]
 side = "right"
 calibration = "~/.tkt/calibration.json"
-lift_off = 0.25           # masa modelinden sapma (log oran); aşılınca el kalkık sayılır. Anahtar yoksa kapalı
+# lift_off = 0.25         # masa modelinden sapma (log oran); aşılınca el kalkık sayılır. Kapalı (kullanıcı isteği)
 
 [lift]
 w_angle = 1.0
