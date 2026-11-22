@@ -784,10 +784,10 @@ def index_pinch_rig():
     backend = DryBackend()
     engine = GestureEngine(cfg, backend, SyntheticSource().info)
 
-    def feed(ms, distance=1, x=0.5, **kwargs):
+    def feed(ms, distance=1, x=0.5, middle=1, y=0.5, **kwargs):
         backend.set_time(ms / 1000)
-        engine.process(make_frame(t=ms / 1000, palm=(x, 0.5),
-                                  pinch={"index": distance, "middle": 0}, **kwargs))
+        engine.process(make_frame(t=ms / 1000, palm=(x, y),
+                                  pinch={"index": distance, "middle": middle}, **kwargs))
 
     return engine, backend, feed
 
@@ -880,3 +880,27 @@ def test_index_pinch_fist_carry_and_middle_contact(index_pinch_rig):
     assert backend.events == []
     feed(200, 1, 0.93)
     assert [e.kind for e in backend.events] == ["move"]
+
+
+def test_index_pinch_middle_hold_scrolls_without_clicks(index_pinch_rig):
+    engine, backend, feed = index_pinch_rig
+    feed(0)
+    for i, ms in enumerate(range(40, 640, 40)):
+        feed(ms, 0.6, middle=0.05, y=0.5 - 0.01 * i)     # başparmak-orta, el yukarı
+    assert engine.mode is Mode.SCROLL
+    kinds = [e.kind for e in backend.events]
+    assert "button" not in kinds and kinds.count("scroll") > 5
+    assert sum(e.args[1] for e in backend.events if e.kind == "scroll") < 0   # doğal yön
+    feed(700, 1, middle=1)
+    assert engine.mode is Mode.POINTER
+    n = len(backend.events)
+    feed(740, 1, middle=1)
+    assert all(e.kind != "scroll" for e in backend.events[n:])
+
+
+def test_index_pinch_middle_ignored_when_index_also_close(index_pinch_rig):
+    engine, backend, feed = index_pinch_rig
+    feed(0)
+    feed(40, 0.1, middle=0.05)          # ikisi de yakın: marj yok, kaydırma başlamaz
+    feed(80, 0.1, middle=0.05)
+    assert engine.mode is not Mode.SCROLL
