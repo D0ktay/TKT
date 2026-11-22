@@ -18,10 +18,12 @@ _SYSTEM_KEYS = {
 }
 # Değiştirici tuşsuz gönderilen eylemler (uygulama kısayolları, ör. önceki/sonraki).
 _KEY_TAB = 48
+_KEY_C = 8
 _PLAIN_KEYS = {
     "key_left": _KEY_LEFT,
     "key_right": _KEY_RIGHT,
     "key_tab": _KEY_TAB,
+    "key_c": _KEY_C,
 }
 _MAX_DISPLAYS = 16
 _DICTATION_ACTIONS = ("dictation_start", "dictation_stop")

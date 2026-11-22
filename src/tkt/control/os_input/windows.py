@@ -31,6 +31,7 @@ _VK_LEFT = 0x25
 _VK_RIGHT = 0x27
 _VK_LWIN = 0x5B
 _VK_H = 0x48
+_VK_C = 0x43
 _VK_RETURN = 0x0D
 _CHORDS = {
     # Sistem diktesi (Windows sesle yazma): Win+H aç/kapat.
@@ -42,6 +43,7 @@ _CHORDS = {
     "key_left": (_VK_LEFT,),
     "key_right": (_VK_RIGHT,),
     "key_tab": (_VK_TAB,),
+    "key_c": (_VK_C,),
 }
 
 

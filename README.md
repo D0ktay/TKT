@@ -141,7 +141,7 @@ all four fingers first.
 | J6 | Slide index and middle together | Scrolling (natural direction, with inertia). |
 | J7 | Lift the index finger and tap the desk | Experimental. Left click. |
 | J8 | Tap with index and middle together | Experimental. Right click. |
-| J9 | Three or four fingers open, swipe sideways or up | Switch desktop / Mission Control (Task View on Windows). `[swipe]` `left`, `right`, `up` in `control.toml` can send plain keys instead (`key_left`, `key_right`, `key_tab`), e.g. to step through moves in an app. |
+| J9 | Three or four fingers open, swipe sideways or up | Switch desktop / Mission Control (Task View on Windows). `[swipe]` `left`, `right`, `up` in `control.toml` can send plain keys instead (`key_left`, `key_right`, `key_c`, `key_tab`), e.g. to step through moves in an app. |
 | J10 | Take the hand out of view, or press Ctrl+Alt+P | Output stops; held buttons are released. |
 | J11 | Only the pinky open (thumb free) | Starts system dictation; speak. A fist stops dictation and presses Enter. |
 

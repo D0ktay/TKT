@@ -231,7 +231,7 @@ def test_system_action_sends_ctrl_chord(quartz, name, keycode):
 
 
 @pytest.mark.parametrize(
-    ("name", "keycode"), [("key_left", 123), ("key_right", 124), ("key_tab", 48)]
+    ("name", "keycode"), [("key_left", 123), ("key_right", 124), ("key_tab", 48), ("key_c", 8)]
 )
 def test_plain_key_action_sends_key_without_modifier(quartz, name, keycode):
     MacBackend().system_action(name)
