@@ -112,6 +112,7 @@ def test_full_step_scroll_and_reset(user32):
         ("key_left", [(0x25, 1)]),
         ("key_right", [(0x27, 1)]),
         ("key_tab", [(0x09, 0)]),
+        ("key_c", [(0x43, 0)]),
         ("dictation_start", [(0x5B, 1), (0x48, 0)]),
         ("dictation_stop", [(0x5B, 1), (0x48, 0)]),
     ],
