@@ -60,6 +60,7 @@ class GestureEngine:
         self._pinch = (
             cfg[self._click_method] if self._click_method in ("pinch", "index_pinch") else None
         )
+        self._pinch_margin = cfg.get("pinch", {}).get("margin", 0.15)
         self._confidence_min = general["confidence_min"]
         self._lost_release_s = general["lost_release_ms"] / 1000
         self._lock_s = mode["lock_ms"] / 1000
@@ -157,6 +158,7 @@ class GestureEngine:
         self.left_down = False
         self._index_state = _IndexPinch.DISARMED
         self._index_closed_at = 0.0
+        self._middle_scroll = False          # index_pinch: başparmak-orta tutuluyken kaydırma
         self._pinch_armed = False
         self._pinch_owner: str | None = None
         self._pinch_candidate: str | None = None
@@ -203,6 +205,8 @@ class GestureEngine:
             self.mode = Mode.WAIT
             return
 
+        if self._index_middle_scroll(frame):
+            return
         self.mode = Mode.POINTER
         if self._index_state is _IndexPinch.DISARMED:
             if distance < cfg["open"]:
@@ -229,6 +233,37 @@ class GestureEngine:
             self._index_state = _IndexPinch.HELD
 
         self._held_index_pinch(frame, distance)
+
+    def _index_middle_scroll(self, frame: HandFrame) -> bool:
+        """index_pinch: başparmak-orta teması tutulurken avuç hareketi kaydırmadır.
+
+        Başlar: orta <= closed, işaretten en az `margin` daha yakın ve işaret tıkı sürmüyor.
+        Biter: orta >= open; kaydırma durur, imleç yeniden referans alır.
+        """
+        cfg = self._pinch
+        pin = frame.pinch or {}
+        middle, index = pin.get("middle"), pin.get("index")
+        if middle is None or index is None:
+            return False
+        margin = self._pinch_margin
+        if not self._middle_scroll:
+            if (middle <= cfg["closed"] and index - middle >= margin and not self.left_down
+                    and self._index_state in (_IndexPinch.READY, _IndexPinch.DISARMED)):
+                self._middle_scroll = True
+                self._rebase_scroll()
+                self._scroll.update(frame.palm, frame.hand_size, frame.t)
+                self.mode = Mode.SCROLL
+                return True
+            return False
+        if middle >= cfg["open"]:
+            self._middle_scroll = False
+            self._stop_scroll()
+            self._pointer.rebase()
+            self.mode = Mode.POINTER
+            return True
+        self.mode = Mode.SCROLL
+        self._send_scroll(self._scroll.update(frame.palm, frame.hand_size, frame.t))
+        return True
 
     def _held_index_pinch(self, frame: HandFrame, distance: float) -> None:
         cfg = self._pinch
