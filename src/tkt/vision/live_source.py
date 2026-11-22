@@ -29,6 +29,9 @@ log = logging.getLogger(__name__)
 
 # process_fps() bu kadar saniyelik pencerede sayar.
 _FPS_WINDOW_S = 2.0
+# Açılışta ilk kare için beklenen süre. Yeni takılan kamera ve iPhone bağlıyken macOS ilk
+# kareyi 2–4 sn'de verdi (ölçüm 2026-11-22); 1 sn'lik bekleme "ilk kare alınamadı" veriyordu.
+FIRST_FRAME_TIMEOUT_S = 6.0
 
 # LiftEstimator'ın config'ten okuduğu anahtarlar ([lift]); doğrudan verilen tahmincinin
 # ayarlarını set_calibration'da korumak için kullanılır.
@@ -75,7 +78,7 @@ class LiveSource:
         self.last_process_ms: float = 0.0   # son karenin takip + özellik süresi
 
         camera.start()
-        first = camera.read()
+        first = camera.read(timeout=FIRST_FRAME_TIMEOUT_S)
         if first is None:
             camera.close()
             raise RuntimeError("kameradan ilk kare alınamadı")
