@@ -168,6 +168,35 @@ def test_mac_dictation_toggle_runs_osascript_without_blocking():
     assert kw1["stdout"] is not None and kw1["stderr"] is not None
 
 
+def test_mac_dictation_stop_passes_mic_state():
+    # Electron uygulamalarında menü adı hep "Start Dictation…" kalır; durdururken betik
+    # mikrofon kullanımdaysa Esc gönderir. Açarken mikrofona bakılmaz.
+    from tkt.control.os_input import mac_dictation
+
+    calls, asked = [], []
+
+    def mic(state):
+        return lambda: asked.append(state) or state
+
+    def popen(args, **kw):
+        calls.append(args)
+
+    mac_dictation.toggle(False, popen=popen, mic_active=mic(True))
+    mac_dictation.toggle(False, popen=popen, mic_active=mic(False))
+    mac_dictation.toggle(True, popen=popen, mic_active=mic(True))
+    assert [c[3:] for c in calls] == [["stop", "active"], ["stop", "idle"], ["start", "idle"]]
+    assert asked == [True, False]
+    script = calls[0][2]
+    assert '"Edit"' in script and "Stop" in script and "Cancel" in script
+    assert "key code 53" in script
+
+
+def test_mic_in_use_returns_bool():
+    from tkt.control.os_input import mac_dictation
+
+    assert mac_dictation.mic_in_use() in (True, False)
+
+
 def test_dictation_submit_stops_then_waits_then_enter():
     from tkt.control.os_input import dictation
 

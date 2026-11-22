@@ -1,6 +1,6 @@
 [general]
 panic_hotkey = "<ctrl>+<alt>+p"
-click_method = "thumb"      # thumb | tap | both
+click_method = "thumb"      # thumb | tap | both | pinch | index_pinch
 confidence_min = 0.5
 lost_release_ms = 300
 
@@ -49,6 +49,28 @@ cooldown_ms = 100
 distance = 0.5              # el boyu
 window_ms = 500
 
+[pinch]
+closed = 0.25
+open = 0.45
+debounce_ms = 30
+margin = 0.15
+drag_threshold = 0.03       # avuç hareketi, el boyu biriminde
+fist_curl = 0.6             # dört parmağın ortalama curl değeri
+
+[index_pinch]
+closed = 0.25
+open = 0.45
+debounce_ms = 30
+drag_threshold = 0.20       # avuç hareketi, el boyu biriminde
+hold_ms = 2000              # sabit tutuşta sağ tık
+fist_curl = 0.6
+
+[pointer_front]
+# Sürüm C (kamera kullanıcıya bakıyor, avuç izleniyor): [pointer] üzerine yazılan değerler.
+# Hedef yardımı denemeleri (data/samples/airC) bu değerlerle yapıldı.
+min_cutoff = 1.0
+gain_min = 500
+gain_max = 2500
 [surface_pointer]           # deney: işaret ucu aktif alanda (Finger.surface) touchpad gibi
 enabled = false             # true: surface varsa imleç alandan sürülür; yoksa [pointer] kullanılır
 aspect = 1.5                # alanın genişlik / yüksekliği; vision.toml [surface] aspect ile aynı olmalı

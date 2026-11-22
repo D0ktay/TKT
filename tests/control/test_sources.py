@@ -101,3 +101,12 @@ def test_synthetic_realtime(monkeypatch):
     frames = list(SyntheticSource(fps=20, realtime=True).rest(0.1).frames())
     assert [f.t for f in frames] == pytest.approx([100, 100.05])
     assert [call.args[0] for call in wait.call_args_list] == pytest.approx([0, 0.05])
+
+
+def test_pinch_script_keeps_independent_measurements_across_steps():
+    source = SyntheticSource(fps=10).open(4, 0.1).pinch("ring").move(0.1, 0, 0.1)
+    initial, held, moved, lost, opened = list(source.vanish(0.1).pinch(None).frames())
+    assert initial.pinch is lost.pinch is None
+    assert held.pinch == moved.pinch == {"index": 1, "middle": 1, "ring": 0, "pinky": 1}
+    assert held.pinch is not moved.pinch
+    assert all(value == 1 for value in opened.pinch.values())

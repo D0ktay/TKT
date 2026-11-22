@@ -14,7 +14,7 @@ import math
 import numpy as np
 
 from tkt.core.types import FINGERS, Finger, HandFrame, SourceInfo
-from tkt.vision.hand_calib import HandCalibration
+from tkt.vision.hand_calib import PINCH_CHANNELS, HandCalibration
 from tkt.vision.tracker import RawHand
 
 WRIST = 0
@@ -98,6 +98,74 @@ def thumb_raw(hand: RawHand, aspect: float = 1.0) -> float:
     if size < _EPS:
         return 0.0
     return float(np.linalg.norm(p[THUMB_TIP] - p[INDEX_PIP])) / size
+
+
+def pinch_raw(hand: RawHand, finger: str, aspect: float = 1.0) -> dict[str, float]:
+    """Başparmak ucu (4) ile parmak ucu arası mesafe, iki kanalda el boyuna oranlı.
+
+    - `"img"`: görüntüde (x `aspect` ile ölçeklenmiş piksel uzayı), bilek (0)–orta kök (9)
+      görüntü mesafesine bölünür.
+    - `"world"`: dünya noktalarıyla (3B), bilek–orta kök dünya mesafesine bölünür.
+
+    Ölçülemeyen kanal (sonlu olmayan nokta, sıfır el boyu, eksik nokta) NaN döner; bu
+    durumda `pinch_values` o kanalı "açık" sayar.
+    """
+    _mcp, _pip, _dip, tip = _joints(finger)
+    return {
+        "img": _tip_ratio(hand.image_pts, tip, (float(aspect), 1.0)),
+        "world": _tip_ratio(hand.world_pts, tip, None),
+    }
+
+
+def _tip_ratio(pts: object, tip: int, scale: tuple[float, float] | None) -> float:
+    """|p4 - p_tip| / |p9 - p0|; geçersizse NaN."""
+    try:
+        p = np.asarray(pts, dtype=float)
+        if p.ndim != 2 or p.shape[0] < 21:
+            return math.nan
+        if scale is not None:
+            p = p[:, :2] * scale
+        size = float(np.linalg.norm(p[MIDDLE_MCP] - p[WRIST]))
+        dist = float(np.linalg.norm(p[THUMB_TIP] - p[tip]))
+    except (TypeError, ValueError):
+        return math.nan
+    if not (math.isfinite(size) and math.isfinite(dist)) or size < _EPS:
+        return math.nan
+    return dist / size
+
+
+def pinch_norm(raw: float, touch: float, open_: float) -> float:
+    """Tek kanal: `touch`→0, `open_`→1, 0–1'e kırpılır. Geçersiz ölçüm veya referans 1.0.
+
+    Geçersiz değer "açık" sayılır (fail-safe): yanlışlıkla "değiyor" üretmez.
+    """
+    if not (math.isfinite(raw) and math.isfinite(touch) and math.isfinite(open_)):
+        return 1.0
+    span = open_ - touch
+    if not span > _EPS:
+        return 1.0
+    return min(1.0, max(0.0, (raw - touch) / span))
+
+
+def pinch_values(hand: RawHand, ref: dict[str, dict[str, float]],
+                 aspect: float = 1.0) -> dict[str, float]:
+    """Parmak başına pinch (0 uçlar değiyor, 1 açık): kanalların büyüğü (temkinli).
+
+    Her kanal kendi açık/değme referansıyla 0–1'e oturtulur; "değiyor" için iki kanal da
+    küçük olmalıdır. Referansı eksik parmak veya kanal 1.0 (açık) verir.
+    """
+    out: dict[str, float] = {}
+    for name in FINGERS:
+        r = ref.get(name)
+        if not r:
+            out[name] = 1.0
+            continue
+        raw = pinch_raw(hand, name, aspect)
+        out[name] = max(
+            pinch_norm(raw[ch], r.get(f"{ch}_touch", math.nan), r.get(f"{ch}_open", math.nan))
+            for ch in PINCH_CHANNELS
+        )
+    return out
 
 
 def palm_shape(hand: RawHand, aspect: float = 1.0) -> tuple[float, float, list[float]]:
@@ -184,6 +252,8 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
 
     `lift_off`: masa modelinden sapma eşiği (config `hand.lift_off`). Verilir ve
     `calib.table` doluysa, sapma eşiği aşan karede güven `LIFT_OFF_FACTOR` ile çarpılır.
+
+    `pinch`: `calib.pinch_ref` doluysa `pinch_values` (0 değiyor, 1 açık); yoksa None.
     """
     if hand is None:
         return _empty_frame(t, frame_id)
@@ -222,6 +292,11 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
         if table_deviation(hand, calib.table, aspect) > lift_off:
             confidence *= LIFT_OFF_FACTOR
 
+    # Pinch (Sürüm C) yalnızca pinch kalibrasyonu varsa; yoksa None (Sürüm A/B değişmez).
+    pinch = None
+    if calib.pinch_ref is not None:
+        pinch = pinch_values(hand, calib.pinch_ref, aspect)
+
     return HandFrame(
         t=t,
         frame_id=frame_id,
@@ -231,4 +306,5 @@ def build_frame(hand: RawHand | None, t: float, frame_id: int, calib: HandCalibr
         palm=(float(palm_xy[0]), float(palm_xy[1])),
         hand_size=hand_size,
         confidence=confidence,
+        pinch=pinch,
     )

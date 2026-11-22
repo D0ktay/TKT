@@ -1,13 +1,16 @@
 """Kayıt (JSONL) ve bip yan dosyasının tek okuma-yazma yeri (PART1, 1.3).
 
 Kayıt biçimi:
-    1. satır: {"type": "header", "schema": 1, "width": ..., "height": ..., "fps": ...,
+    1. satır: {"type": "header", "schema": 2, "width": ..., "height": ..., "fps": ...,
                "hand": ..., "note": ...}
-    sonraki her satır bir `HandFrame`.
+    sonraki her satır bir `HandFrame`. `pinch` anahtarı isteğe bağlıdır; yalnızca
+    `HandFrame.pinch` None değilse yazılır.
 
 Bip yan dosyası (`ad.prompts.json`): [{"t": 12.30, "kind": "tap1"}, ...]
 
-Şema sürümü `SCHEMA_VERSION` ile tutmayan kayıtlar `SchemaError` ile reddedilir.
+Şema sürümü `READABLE_SCHEMAS` içinde olmayan kayıtlar `SchemaError` ile reddedilir.
+Şema 1 kayıtları dönüştürülerek okunur: okunan `SourceInfo.schema` `SCHEMA_VERSION` olur,
+kareler `pinch=None` taşır. Yazma yalnızca `SCHEMA_VERSION` ile yapılır.
 """
 
 from __future__ import annotations
@@ -20,7 +23,14 @@ from pathlib import Path
 from types import TracebackType
 from typing import IO, Any
 
-from tkt.core.types import FINGERS, SCHEMA_VERSION, Finger, HandFrame, SourceInfo
+from tkt.core.types import (
+    FINGERS,
+    READABLE_SCHEMAS,
+    SCHEMA_VERSION,
+    Finger,
+    HandFrame,
+    SourceInfo,
+)
 
 PROMPT_KINDS = ("tap1", "tap2")
 
@@ -71,13 +81,18 @@ def info_to_header(info: SourceInfo) -> dict[str, Any]:
 
 
 def header_to_info(d: dict[str, Any], source: str = "<kayıt>") -> SourceInfo:
-    """Başlık sözlüğünü `SourceInfo`'ya çevirir; şema tutmuyorsa `SchemaError`."""
+    """Başlık sözlüğünü `SourceInfo`'ya çevirir; şema okunamıyorsa `SchemaError`.
+
+    Eski şemalı (`READABLE_SCHEMAS`) başlıklar güncel sürüme dönüştürülür: dönen
+    `schema` her zaman `SCHEMA_VERSION`'dır.
+    """
     if not isinstance(d, dict) or d.get("type") != "header":
         raise SchemaError(f"{source}: ilk satır başlık değil (type='header' bekleniyordu)")
     schema = d.get("schema")
-    if type(schema) is not int or schema != SCHEMA_VERSION:
+    if type(schema) is not int or schema not in READABLE_SCHEMAS:
+        supported = ", ".join(str(v) for v in READABLE_SCHEMAS)
         raise SchemaError(
-            f"{source}: şema sürümü {schema!r}, desteklenen {SCHEMA_VERSION}. "
+            f"{source}: şema sürümü {schema!r}, desteklenen {supported}. "
             "Kaydı güncel araçla yeniden üretin."
         )
     try:
@@ -95,7 +110,7 @@ def header_to_info(d: dict[str, Any], source: str = "<kayıt>") -> SourceInfo:
         if hand not in ("right", "left"):
             raise ValueError("hand: 'right' veya 'left' bekleniyordu")
         return SourceInfo(
-            schema=schema,
+            schema=SCHEMA_VERSION,
             width=d["width"],
             height=d["height"],
             fps=fps,
@@ -119,7 +134,7 @@ def frame_to_dict(frame: HandFrame) -> dict[str, Any]:
             "curl": float(f.curl),
             "lift": None if f.lift is None else float(f.lift),
         }
-    return {
+    row: dict[str, Any] = {
         "t": round(float(frame.t), _T_DIGITS),
         "frame_id": int(frame.frame_id),
         "present": bool(frame.present),
@@ -129,12 +144,40 @@ def frame_to_dict(frame: HandFrame) -> dict[str, Any]:
         "hand_size": float(frame.hand_size),
         "confidence": float(frame.confidence),
     }
+    # pinch açık değilse satır şema 1 satırıyla aynı kalır.
+    if frame.pinch is not None:
+        row["pinch"] = {name: float(v) for name, v in frame.pinch.items()}
+    return row
+
+
+def _pinch_from(value: Any) -> dict[str, float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("pinch: nesne veya null bekleniyordu")
+    unknown = [name for name in value if name not in FINGERS]
+    if unknown:
+        raise ValueError(f"pinch: bilinmeyen parmak adı: {unknown[0]!r}")
+    missing = [name for name in FINGERS if name not in value]
+    if missing:
+        raise ValueError(f"pinch: eksik parmaklar: {', '.join(missing)}")
+    pinch: dict[str, float] = {}
+    for name in FINGERS:
+        v = value[name]
+        if type(v) not in (int, float):
+            raise ValueError(f"pinch.{name}: sayı bekleniyordu")
+        v = _finite_float(v, f"pinch.{name}")
+        if v < 0.0:
+            raise ValueError(f"pinch.{name}: negatif olamaz")
+        pinch[name] = v
+    return pinch
 
 
 def frame_from_dict(d: dict[str, Any]) -> HandFrame:
     """Kayıt satırı sözlüğünü `HandFrame`'e çevirir.
 
     `present=False` satırlarında eksik alanlar sıfırla doldurulur; bu alanlar okunmaz.
+    `pinch` yoksa veya null ise None olur (şema 1 satırları); `present=False` ise yok sayılır.
     """
     present = bool(d["present"])
     finger_rows = d.get("fingers")
@@ -161,6 +204,8 @@ def frame_from_dict(d: dict[str, Any]) -> HandFrame:
         if missing:
             raise ValueError(f"eksik parmaklar: {', '.join(missing)}")
 
+    pinch = _pinch_from(d.get("pinch")) if present else None
+
     confidence = _finite_float(d.get("confidence", 0.0), "confidence")
     if not 0.0 <= confidence <= 1.0:
         raise ValueError("confidence: 0–1 arasında olmalı")
@@ -173,6 +218,7 @@ def frame_from_dict(d: dict[str, Any]) -> HandFrame:
         palm=_pair(d.get("palm", (0.0, 0.0)), "palm"),
         hand_size=_finite_float(d.get("hand_size", 0.0), "hand_size"),
         confidence=confidence,
+        pinch=pinch,
     )
 
 

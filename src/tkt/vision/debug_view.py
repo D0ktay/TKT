@@ -2,8 +2,9 @@
 
 macOS'ta `cv2.imshow` ana thread'de çalışmalıdır; `run` döngüyü çağıran thread'de kurar.
 Çizim saf fonksiyonlardadır (`draw_overlay`, `draw_tap_prompt`, `render_lift_graph`);
-pencere ve klavye yalnızca `run` içindedir. Tuşlar: `c` kalibrasyon, `t` tap kalibrasyonu,
-`m` masa modeli, `s` aktif alan (yüzey) kalibrasyonu, `q`/ESC veya pencere X düğmesi çıkış.
+pencere ve klavye yalnızca `run` içindedir. Tuşlar: `c` kalibrasyon, `p` pinch dahil
+kalibrasyon (isteğe bağlı, Sürüm C), `t` tap kalibrasyonu, `m` masa modeli, `s` aktif alan
+(yüzey) kalibrasyonu, `q`/ESC veya pencere X düğmesi çıkış.
 
 cv2.putText yalnızca ASCII çizer; ekran metinleri bu yüzden Türkçe karaktersizdir.
 
@@ -30,7 +31,13 @@ import numpy as np
 from tkt.core.types import FINGERS, HandFrame
 from tkt.vision import calibration, hand_calib
 from tkt.vision.calibration import CORNER_NAMES, SurfaceCalibration
-from tkt.vision.hand_calib import STEPS, CalibrationSession, HandCalibration
+from tkt.vision.hand_calib import (
+    PINCH_STEP_FINGER,
+    PINCH_STEPS,
+    STEPS,
+    CalibrationSession,
+    HandCalibration,
+)
 from tkt.vision.live_source import LiveSource, load_vision_config, open_live_source
 from tkt.vision.tracker import RawHand
 
@@ -51,6 +58,10 @@ STEP_TITLES: dict[str, str] = {
     "open": "Acik el",
     "fist": "Yumruk",
     "thumb_closed": "Basparmak kapali",
+    "touch_index": "Pinch: isaret",
+    "touch_middle": "Pinch: orta",
+    "touch_ring": "Pinch: yuzuk",
+    "touch_pinky": "Pinch: serce",
 }
 
 # Adım adım kalibrasyon: her adım boşlukla başlar, önce geri sayım (örnek yok), sonra kayıt.
@@ -60,6 +71,10 @@ STEP_HINTS: dict[str, str] = {
     "open": "Elini masaya koy, parmaklar duz ve acik",
     "fist": "Yumruk yap, parmaklar tam kivrik",
     "thumb_closed": "Isaret parmagi acik, basparmagi ele yapistir",
+    "touch_index": "Basparmak ucunu isaret parmagi ucuna degdir",
+    "touch_middle": "Basparmak ucunu orta parmak ucuna degdir",
+    "touch_ring": "Basparmak ucunu yuzuk parmagi ucuna degdir",
+    "touch_pinky": "Basparmak ucunu serce parmak ucuna degdir",
 }
 
 # Masa modeli kalibrasyonu: geri sayım, sonra elin mousepad'de gezdirildiği süre.
@@ -93,6 +108,7 @@ KEY_CALIB = ord("c")
 KEY_NEXT = ord(" ")          # adım adım kalibrasyonda sonraki adımı başlatır
 KEY_TAP = ord("t")
 KEY_TABLE = ord("m")         # masa (mousepad) modeli kalibrasyonu
+KEY_PINCH = ord("p")         # el + pinch kalibrasyonu (tek oturum, isteğe bağlı)
 KEY_SURFACE = ord("s")       # aktif alan (yüzey) kalibrasyonu
 KEY_REDO = ord("g")          # yüzey kalibrasyonunda köşeyi tekrarla / bir köşe geri
 
@@ -102,6 +118,7 @@ _BLACK = (0, 0, 0)
 _GREEN = (80, 220, 80)
 _RED = (60, 60, 240)
 _YELLOW = (60, 220, 240)
+_MAGENTA = (220, 90, 220)
 _CYAN = (230, 200, 60)
 _GRAY = (150, 150, 150)
 _BAR_BG = (50, 50, 50)
@@ -124,6 +141,7 @@ class CalibState:
     total_progress: float    # tüm oturum, 0–1
     samples: int = 0         # geçerli adımda toplanan örnek sayısı
     message: str = ""        # sonuç / hata mesajı
+    steps: tuple[str, ...] = STEPS   # oturumun adımları (pinch kalibrasyonunda daha uzun)
 
 
 # ---------------------------------------------------------------------- çizim
@@ -190,7 +208,9 @@ def draw_overlay(image: np.ndarray, frame: HandFrame, hand: RawHand | None,
 
     Girdi görüntüyü değiştirmez; aynı boyutta yeni bir BGR görüntü döner. Görüntü renkli
     veya gri olabilir. El yoksa (`frame.present=False` veya `hand=None`) yalnızca fps ve
-    durum yazıları çizilir; `lift` None ise çubuk yerine "--" yazılır.
+    durum yazıları çizilir; `lift` veya `pinch` None ise çubuk boş kalır ve "--" yazılır.
+    Parmak başına üç çubuk: curl, lift, pinch (0 değiyor, 1 açık; pinch kalibrasyonu yoksa
+    dördü de "--").
     """
     out = to_bgr(image)
     h, w = out.shape[:2]
@@ -212,21 +232,23 @@ def draw_overlay(image: np.ndarray, frame: HandFrame, hand: RawHand | None,
     label_w = int(u * 4.2)
     bar_w = int(u * 5)
     val_w = int(u * 2.4)
+    col = bar_w + val_w + pad           # sütun aralığı
     _text(out, "curl", (pad + label_w, y), fs * 0.8, _CYAN)
-    _text(out, "lift", (pad + label_w + bar_w + val_w + pad, y), fs * 0.8, _YELLOW)
+    _text(out, "lift", (pad + label_w + col, y), fs * 0.8, _YELLOW)
+    _text(out, "pinch", (pad + label_w + 2 * col, y), fs * 0.8, _MAGENTA)
     y += u
     show_fingers = frame.present
+    pinch = frame.pinch if show_fingers else None
     for name in FINGERS:
         finger = frame.fingers.get(name) if show_fingers else None
         curl = None if finger is None else finger.curl
         lift = None if finger is None else finger.lift
+        p = None if pinch is None else pinch.get(name)
         _text(out, name, (pad, y), fs * 0.85)
-        x = pad + label_w
-        _bar(out, x, y - u + 4, bar_w, u - 6, curl, _CYAN)
-        _text(out, _fmt(curl), (x + bar_w + 4, y), fs * 0.8)
-        x2 = x + bar_w + val_w + pad
-        _bar(out, x2, y - u + 4, bar_w, u - 6, lift, _YELLOW)
-        _text(out, _fmt(lift), (x2 + bar_w + 4, y), fs * 0.8)
+        for k, (v, color) in enumerate(((curl, _CYAN), (lift, _YELLOW), (p, _MAGENTA))):
+            x = pad + label_w + k * col
+            _bar(out, x, y - u + 4, bar_w, u - 6, v, color)
+            _text(out, _fmt(v), (x + bar_w + 4, y), fs * 0.8)
         y += u + 2
     thumb = frame.thumb_out if frame.present else None
     _text(out, "thumb", (pad, y), fs * 0.85)
@@ -249,7 +271,7 @@ def draw_overlay(image: np.ndarray, frame: HandFrame, hand: RawHand | None,
     if calib_state is not None:
         _draw_calibration(out, calib_state, u, fs, pad)
     else:
-        _text(out, "c: kalibrasyon  t: tap  m: masa  s: alan  q/ESC: cikis",
+        _text(out, "c: kalibrasyon  p: +pinch  t: tap  m: masa  s: alan  q/ESC: cikis",
               (pad, h - pad), fs * 0.8, _GRAY)
     return out
 
@@ -262,9 +284,10 @@ def _draw_calibration(out: np.ndarray, cs: CalibState, u: int, fs: float, pad: i
         y -= u
     if cs.step is None:
         return
-    n = STEPS.index(cs.step) + 1 if cs.step in STEPS else 0
+    steps = cs.steps or STEPS
+    n = steps.index(cs.step) + 1 if cs.step in steps else 0
     title = STEP_TITLES.get(cs.step, cs.step)
-    _text(out, f"KALIBRASYON {n}/{len(STEPS)}: {title}", (pad, y), fs * 1.1, _YELLOW)
+    _text(out, f"KALIBRASYON {n}/{len(steps)}: {title}", (pad, y), fs * 1.1, _YELLOW)
     y -= u
     _bar(out, pad, y - u + 4, max(10, w - 2 * pad), u - 6, cs.progress, _YELLOW)
     y -= u
@@ -695,15 +718,21 @@ class GuidedCalibration:
     toplanmaz), sonra `record_s` saniye kayıt. Kayıt bitince sonraki adım yeniden
     `start()` bekler. Zaman yalnızca `add` ile verilen kare zamanından gelir.
     `done`, `samples` ve `result()` `CalibrationSession` ile aynı anlamdadır.
+
+    `pinch=True` (isteğe bağlı): `STEPS`'in ardından `PINCH_STEPS` (başparmak ucu sırayla
+    her parmak ucuna) aynı oturumda gelir; `result()` `pinch_ref`'i de doldurur. Açık el
+    adımı pinch'in "açık" referansıdır.
     """
 
     def __init__(self, countdown_s: float = GUIDED_COUNTDOWN_SECONDS,
-                 record_s: float = GUIDED_RECORD_SECONDS) -> None:
+                 record_s: float = GUIDED_RECORD_SECONDS, pinch: bool = False) -> None:
         if not (countdown_s >= 0 and record_s > 0):
             raise ValueError("countdown_s >= 0 ve record_s > 0 olmalı")
         self.countdown_s = float(countdown_s)
         self.record_s = float(record_s)
-        self.samples: dict[str, list[RawHand]] = {s: [] for s in STEPS}
+        self.pinch = bool(pinch)
+        self.steps: tuple[str, ...] = STEPS + PINCH_STEPS if self.pinch else STEPS
+        self.samples: dict[str, list[RawHand]] = {s: [] for s in self.steps}
         self._index = 0
         self._pending = False            # start() çağrıldı, ilk karede zaman başlar
         self._t0: float | None = None    # geçerli adımın başlangıcı (geri sayım dahil)
@@ -711,11 +740,11 @@ class GuidedCalibration:
 
     @property
     def done(self) -> bool:
-        return self._index >= len(STEPS)
+        return self._index >= len(self.steps)
 
     @property
     def current_step(self) -> str | None:
-        return None if self.done else STEPS[self._index]
+        return None if self.done else self.steps[self._index]
 
     @property
     def phase(self) -> str:
@@ -745,7 +774,7 @@ class GuidedCalibration:
 
     @property
     def total_progress(self) -> float:
-        return min(1.0, (self._index + self.progress) / len(STEPS))
+        return min(1.0, (self._index + self.progress) / len(self.steps))
 
     def start(self) -> None:
         """Beklemedeki adımı başlatır; geri sayım ya da kayıt sürerken etkisizdir."""
@@ -769,13 +798,19 @@ class GuidedCalibration:
             self._pending, self._t0 = False, None
             return
         if el >= self.countdown_s and hand is not None:
-            self.samples[STEPS[self._index]].append(hand)
+            self.samples[self.steps[self._index]].append(hand)
 
     def result(self, aspect: float = 1.0) -> HandCalibration:
+        """El kalibrasyonu; `pinch=True` ise `pinch_ref` de. Biri başarısızsa `ValueError`."""
         if not self.done:
             raise ValueError("kalibrasyon oturumu bitmedi")
-        return hand_calib.fit_hand(self.samples["open"], self.samples["fist"],
-                                   self.samples["thumb_closed"], aspect)
+        calib = hand_calib.fit_hand(self.samples["open"], self.samples["fist"],
+                                    self.samples["thumb_closed"], aspect)
+        if not self.pinch:
+            return calib
+        touch = {PINCH_STEP_FINGER[s]: self.samples[s] for s in PINCH_STEPS}
+        ref = hand_calib.fit_pinch(self.samples["open"], touch, aspect)
+        return dataclasses.replace(calib, pinch_ref=ref)
 
 
 def _guided_state(g: GuidedCalibration) -> CalibState:
@@ -791,7 +826,7 @@ def _guided_state(g: GuidedCalibration) -> CalibState:
     return CalibState(step=g.current_step, progress=g.progress,
                       total_progress=g.total_progress,
                       samples=len(g.samples.get(step, [])) if phase == "record" else -1,
-                      message=msg)
+                      message=msg, steps=g.steps)
 
 
 def _calib_state(session: CalibrationSession, samples: int, message: str = "") -> CalibState:
@@ -866,9 +901,10 @@ def _window_visible() -> bool | None:
 
 def run(source: LiveSource, calib_path: Path, surface_path: Path | None = None,
         surface_aspect: float = calibration.DEFAULT_ASPECT) -> None:
-    """İskelet, curl/lift çubukları, lift grafiği, fps. Ana thread'de çalışır.
+    """İskelet, curl/lift/pinch çubukları, lift grafiği, fps. Ana thread'de çalışır.
 
-    Tuşlar: `c` kalibrasyon, `t` tap kalibrasyonu, `m` masa, `s` aktif alan, `q`/ESC çıkış;
+    Tuşlar: `c` kalibrasyon, `p` el + pinch kalibrasyonu (tek oturum), `t` tap kalibrasyonu,
+    `m` masa, `s` aktif alan, `q`/ESC çıkış;
     pencerenin X düğmesi de çıkartır. Kalibrasyon bitince yeni değerler
     `source.set_calibration` ile hemen geçerli olur ve `calib_path` dosyasına yazılır.
     Aktif alan (`s`) bitince `source.set_surface` ile uygulanır ve `surface_path`
@@ -904,6 +940,11 @@ def run(source: LiveSource, calib_path: Path, surface_path: Path | None = None,
                         session, source, calib, calib_path, frame.t)
                     counts = {k: len(v) for k, v in session.samples.items()}
                     _log(f"kalibrasyon bitti: ornekler={counts} -> {message} ({calib_path})")
+                    if isinstance(session, GuidedCalibration) and session.pinch \
+                            and calib.pinch_ref is not None:
+                        _log("pinch_ref: " + ", ".join(
+                            f"{f}=" + "/".join(f"{v:.3f}" for v in r.values())
+                            for f, r in calib.pinch_ref.items()))
                     session = None
                 elif isinstance(session, GuidedCalibration):
                     calib_state = _guided_state(session)
@@ -982,6 +1023,10 @@ def run(source: LiveSource, calib_path: Path, surface_path: Path | None = None,
                 session, tap, table, surf = GuidedCalibration(), None, None, None
                 message = ""
                 _log("c: kalibrasyon basladi")
+            elif key == KEY_PINCH:
+                session, tap, table, surf = GuidedCalibration(pinch=True), None, None, None
+                message = ""
+                _log("p: el + pinch kalibrasyonu basladi")
             elif key == KEY_NEXT and surf is not None:
                 surf.start()
                 _log(f"bosluk: kose {surf.index + 1} -> {surf.phase}")
@@ -1026,15 +1071,18 @@ def _finish_calibration(session: CalibrationSession | GuidedCalibration, source:
                         t: float) -> tuple[str, float, HandCalibration]:
     """Oturum sonucunu uygular ve kaydeder; (ekran mesajı, bitiş zamanı, geçerli kalibrasyon).
 
-    Daha önce çıkarılmış `tap_ref`/`angle_sign` korunur: eğri kalibrasyonu lift'i etkilemez.
+    Daha önce çıkarılmış `tap_ref`/`angle_sign` ve masa modeli korunur: eğri kalibrasyonu
+    lift'i etkilemez. `pinch_ref`: oturum pinch içeriyorsa yenisi, yoksa eskisi korunur.
+    Pinch kısmı başarısızsa hiçbir şey yazılmaz (eski kalibrasyon geçerli kalır).
     """
     try:
         result = session.result(aspect=_source_aspect(source))
     except ValueError as e:
         # Örn. örnek yok (el görünmedi) veya yumruk açık elden büyük değil.
         return f"Kalibrasyon basarisiz: {e}"[:90], t + MESSAGE_SECONDS, calib
+    pinch_ref = result.pinch_ref if result.pinch_ref is not None else calib.pinch_ref
     result = dataclasses.replace(result, tap_ref=calib.tap_ref, angle_sign=calib.angle_sign,
-                                 table=calib.table)
+                                 table=calib.table, pinch_ref=pinch_ref)
     err = _apply(source, result, calib_path)
     return err or "Kaydedildi ve uygulandi", t + MESSAGE_SECONDS, result
 

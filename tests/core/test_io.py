@@ -9,7 +9,9 @@ from tkt.core.io import (
     RecordFormatError,
     RecordingWriter,
     SchemaError,
+    frame_from_dict,
     frame_to_dict,
+    header_to_info,
     info_to_header,
     iter_frames,
     prompts_path,
@@ -20,7 +22,14 @@ from tkt.core.io import (
     write_recording,
 )
 from tkt.core.source import HandFrameSource
-from tkt.core.types import FINGERS, SCHEMA_VERSION, Finger, HandFrame, SourceInfo
+from tkt.core.types import (
+    FINGERS,
+    READABLE_SCHEMAS,
+    SCHEMA_VERSION,
+    Finger,
+    HandFrame,
+    SourceInfo,
+)
 
 INFO = SourceInfo(schema=SCHEMA_VERSION, width=1280, height=720, fps=60.0, hand="right",
                   note="aci25 tap50")
@@ -94,7 +103,7 @@ def test_header_line_matches_contract(tmp_path):
     path = tmp_path / "rec.jsonl"
     write_recording(path, INFO, [_frame(0)])
     lines = path.read_text(encoding="utf-8").splitlines()
-    assert json.loads(lines[0]) == {"type": "header", "schema": 1, "width": 1280,
+    assert json.loads(lines[0]) == {"type": "header", "schema": 2, "width": 1280,
                                     "height": 720, "fps": 60.0, "hand": "right",
                                     "note": "aci25 tap50"}
     row = json.loads(lines[1])
@@ -308,3 +317,136 @@ def test_source_protocol_runtime_check():
 
     assert isinstance(Fake(), HandFrameSource)
     assert not isinstance(object(), HandFrameSource)
+
+
+# --------------------------------------------------------------------------- şema 2: pinch
+
+PINCH = {"index": 0.0, "middle": 0.35, "ring": 0.7, "pinky": 1.25}
+
+V1_RECORDING = (
+    '{"type":"header","schema":1,"width":1280,"height":720,"fps":60,"hand":"right",'
+    '"note":"eski"}\n'
+    '{"t":12.3456,"frame_id":741,"present":true,"fingers":{'
+    '"index":{"img":[0.512,0.431],"surface":null,"curl":0.08,"lift":null},'
+    '"middle":{"img":[0.55,0.43],"surface":null,"curl":0.1,"lift":null},'
+    '"ring":{"img":[0.58,0.44],"surface":null,"curl":0.2,"lift":null},'
+    '"pinky":{"img":[0.62,0.45],"surface":null,"curl":0.3,"lift":null}},'
+    '"thumb_out":0.91,"palm":[0.5,0.62],"hand_size":0.21,"confidence":0.97}\n'
+    '{"t":12.3623,"frame_id":742,"present":false,"fingers":{},"thumb_out":0.0,'
+    '"palm":[0.0,0.0],"hand_size":0.0,"confidence":0.0}\n'
+)
+
+
+def test_schema_version_is_2_and_v1_still_readable():
+    assert SCHEMA_VERSION == 2
+    assert READABLE_SCHEMAS == (1, 2)
+
+
+def test_pinch_defaults_to_none_and_positional_constructor_still_works():
+    frame = HandFrame(1.0, 0, False, {}, 0.0, (0.0, 0.0), 0.0, 0.0)
+    assert frame.pinch is None
+    assert _frame(0).pinch is None
+
+
+def test_pinch_roundtrip(tmp_path):
+    frames = [replace(_frame(0), pinch=PINCH), _frame(1), _frame(2, present=False)]
+    path = tmp_path / "pinch.jsonl"
+    write_recording(path, INFO, frames)
+
+    info, got = read_recording(path)
+    assert info.schema == SCHEMA_VERSION
+    assert got[0].pinch == PINCH
+    assert got[0].pinch["index"] == 0.0           # 0 = uçlar değiyor
+    assert got[1].pinch is None
+    assert got[2].pinch is None
+    assert got[0] == frames[0]
+
+
+def test_frame_without_pinch_writes_v1_identical_row(tmp_path):
+    """pinch kapalıyken (Sürüm A/B) satır biçimi değişmez, yalnızca başlık şeması artar."""
+    row = frame_to_dict(_frame(3))
+    assert "pinch" not in row
+    assert set(row) == {"t", "frame_id", "present", "fingers", "thumb_out", "palm",
+                        "hand_size", "confidence"}
+    assert frame_to_dict(replace(_frame(3), pinch=PINCH))["pinch"] == PINCH
+
+
+def test_pinch_null_row_reads_as_none():
+    row = {**frame_to_dict(_frame(0)), "pinch": None}
+    assert frame_from_dict(row).pinch is None
+
+
+def test_pinch_ignored_when_hand_absent():
+    row = {**frame_to_dict(_frame(0, present=False)), "pinch": {"bozuk": -1}}
+    assert frame_from_dict(row).pinch is None
+
+
+def test_legacy_v1_recording_reads_and_converts(tmp_path):
+    path = tmp_path / "eski_v1.jsonl"
+    path.write_text(V1_RECORDING, encoding="utf-8")
+
+    info = read_header(path)
+    assert info.schema == SCHEMA_VERSION      # okunurken güncel sürüme dönüştürülür
+    assert (info.width, info.height, info.fps, info.hand, info.note) == (
+        1280, 720, 60.0, "right", "eski")
+
+    frames = list(iter_frames(path))
+    assert [f.frame_id for f in frames] == [741, 742]
+    assert frames[0].present and frames[0].fingers["index"].img == (0.512, 0.431)
+    assert all(f.pinch is None for f in frames)
+
+
+def test_legacy_v1_recording_can_be_rewritten_as_v2(tmp_path):
+    """Okunan eski başlık doğrudan yazıcıya verilebilir (from-raw, replay yeniden yazımı)."""
+    src = tmp_path / "eski_v1.jsonl"
+    src.write_text(V1_RECORDING, encoding="utf-8")
+    info, frames = read_recording(src)
+
+    dst = tmp_path / "yeni_v2.jsonl"
+    assert write_recording(dst, info, frames) == 2
+    assert json.loads(dst.read_text(encoding="utf-8").splitlines()[0])["schema"] == 2
+    info2, frames2 = read_recording(dst)
+    assert info2 == info
+    for a, b in zip(frames, frames2, strict=True):
+        _assert_same(a, b)
+        assert b.pinch is None
+
+
+def test_legacy_v1_header_through_header_to_info():
+    """Ham kayıt okuyucusu (record.py) da header_to_info kullanır; eski ham başlık açılır."""
+    d = {**info_to_header(INFO), "schema": 1, "raw": True}
+    assert header_to_info(d).schema == SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("schema", [0, 3, 99])
+def test_unknown_schemas_rejected(tmp_path, schema):
+    path = tmp_path / "bilinmeyen.jsonl"
+    path.write_text(json.dumps({**info_to_header(INFO), "schema": schema}) + "\n",
+                    encoding="utf-8")
+    with pytest.raises(SchemaError, match="desteklenen 1, 2"):
+        read_header(path)
+
+
+def test_writer_refuses_legacy_schema(tmp_path):
+    with pytest.raises(SchemaError):
+        RecordingWriter(tmp_path / "x.jsonl", replace(INFO, schema=1))
+
+
+@pytest.mark.parametrize(("pinch", "message"), [
+    ([0.1, 0.2, 0.3, 0.4], "nesne"),
+    ({"index": 0.1, "middle": 0.2, "ring": 0.3}, "eksik parmaklar: pinky"),
+    ({**PINCH, "thumb": 0.1}, "bilinmeyen parmak"),
+    ({**PINCH, "ring": -0.01}, "negatif"),
+    ({**PINCH, "ring": None}, "sayı"),
+    ({**PINCH, "ring": "0.3"}, "sayı"),
+    ({**PINCH, "ring": True}, "sayı"),
+    ({**PINCH, "ring": float("nan")}, "sonlu"),
+    ({**PINCH, "ring": float("inf")}, "sonlu"),
+])
+def test_invalid_pinch_rejected(tmp_path, pinch, message):
+    path = tmp_path / "bozuk_pinch.jsonl"
+    row = {**frame_to_dict(_frame(0)), "pinch": pinch}
+    path.write_text(json.dumps(info_to_header(INFO)) + "\n" + json.dumps(row) + "\n",
+                    encoding="utf-8")
+    with pytest.raises(RecordFormatError, match=message):
+        list(iter_frames(path))

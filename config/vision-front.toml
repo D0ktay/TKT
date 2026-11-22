@@ -1,0 +1,25 @@
+[camera]
+index = 0                 # name boşsa veya bulunamazsa son çare
+name = "LVNext"           # aygıt adında geçen alt dize (büyük/küçük harf duyarsız); "" = index kullan
+kind = "any"              # any | rgb | ir: ad bulunamazsa yoklamayla seç (ir = gri+dikey, rgb = renkli)
+width = 1920
+height = 1080
+fps = 60
+rotate_180 = false
+backend = "auto"          # auto | avfoundation | dshow | pyav
+
+[tracker]
+model = "models/hand_landmarker.task"
+min_detection = 0.5
+min_tracking = 0.5
+
+[hand]
+side = "right"
+calibration = "~/.tkt/calibration-pinch-front.json"
+lift_off = 0.25           # masa modelinden sapma (log oran); aşılınca el kalkık sayılır. Anahtar yoksa kapalı
+
+[lift]
+w_angle = 1.0
+w_length = 1.0
+baseline_s = 1.0
+curl_rate_suppress = 3.0  # 1/sn; curl bundan hızlı artıyorsa lift bastırılır

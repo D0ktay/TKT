@@ -19,8 +19,13 @@ def make_frame(
     surfaces: Mapping[str, tuple[float, float] | None] | None = None,
     hand_size: float = 0.2,
     confidence: float = 1.0,
+    pinch: Mapping[str, float] | None = None,
 ) -> HandFrame:
-    """Eksik parmak ölçümlerini varsayılanlarla doldur ve geçerli bir kare kur."""
+    """Eksik parmak ölçümlerini varsayılanlarla doldur ve geçerli bir kare kur.
+
+    `pinch` verilmezse kare pinch taşımaz (None). Verilirse eksik parmaklar 1.0 (açık)
+    ile doldurulur; `present=False` ise yok sayılır.
+    """
     curls = curls or {}
     positions = positions or {}
     surfaces = surfaces or {}
@@ -46,4 +51,9 @@ def make_frame(
         palm=palm,
         hand_size=hand_size,
         confidence=confidence,
+        pinch=(
+            {name: pinch.get(name, 1.0) for name in FINGERS}
+            if present and pinch is not None
+            else None
+        ),
     )
