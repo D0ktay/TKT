@@ -15,6 +15,9 @@
   böyle bir çift olmayan uygulamaya dokunulmaz; Biçim menüsü (`skip_menus`) aranmaz, çünkü
   oradaki Büyüt belgedeki yazıyı değiştirir. Kısayollar (`toggle_hotkey`,
   `calibrate_hotkey`) her yerden çalışır ve yutulur (öndeki uygulamaya gitmez).
+- Kontrol penceresi (`panel_mac`): ayarlar ve kalibrasyonlar; `[panel] hotkey`
+  (Control+N) ve menü çubuğundaki "TKT" açıp kapatır. Kalibrasyon aracı açıkken izleme
+  durur ve Esc çıkış sayılmaz (araç penceresini kapatır).
 - Esc (her yerden) çıkartır; basılı tuşlar bırakılır, dokunulan uygulamaların yakınlaştırması
   geri alınır.
 
@@ -22,6 +25,8 @@ Ortak durum (`stop`, `state_txt`, `hud_img`…) çekirdek modülde tutulur; `run
 alır (`python -m` ile çalışınca çekirdek `__main__` olur, yeniden import edilmez).
 """
 import math
+import os
+import subprocess
 import threading
 import time
 
@@ -32,6 +37,7 @@ import Quartz
 from Foundation import NSObject, NSTimer
 
 from tkt.app.face_zoom import parse_hotkey, pick_zoom_items, skip_menu
+from tkt.app.panel_mac import Panel
 
 SNAP_PX = 8                 # hedef yardımı: imlecin bu kadar yakınındaki tek düğme
 ZOOM_POLL_S = 0.3           # istenen seviye ile uygulananın karşılaştırılma aralığı
@@ -39,12 +45,18 @@ ZOOM_MENU_DEPTH = 2         # menü araması kaç alt menü derine iner
 ZOOM_AX_TIMEOUT_S = 0.5
 ZOOM_RETRY_S = 3.0          # basılamayan (pasif / bayat) öğe için yeniden deneme aralığı
 ESC_KEYCODE = 53
+PANEL_REFRESH_TICKS = 16    # kontrol penceresi bu kadar Tick'te bir yenilenir (~1 sn)
 
 core = None                 # tkt.app.auto_mode (çalışan kopya); run() kurar
 screen = None
 H = 0.0
 view = None
 hud_view = None
+panel = None                # kontrol penceresi (Panel)
+track_thread = None
+hotkey_refs = None          # kısayol musluğu / dinleyicileri (çöp toplanmasın)
+QUIT_JOIN_S = 3.0           # çıkışta iz thread'inin kamerayı bırakması için beklenen süre
+ticks = [0]
 shown_seq = [-1]            # pencereye en son konan HUD görüntüsünün sıra no'su
 zoom_cfg = {}               # [face_zoom]
 zoom_applied = {}           # pid -> o uygulamaya uygulanmış seviye
@@ -232,6 +244,7 @@ def install_zoom_hotkeys():
     """
     toggle = parse_hotkey(zoom_cfg["toggle_hotkey"])
     calibrate = parse_hotkey(zoom_cfg["calibrate_hotkey"])
+    show_panel = parse_hotkey(core.control_config()["panel"]["hotkey"])
 
     def on_key(event):
         """Kısayolsa işler ve True döner."""
@@ -243,6 +256,9 @@ def install_zoom_hotkeys():
             if not event.isARepeat():
                 core.zoom.calibrate()
                 core.act("YAKINLASTIRMA kalibrasyonu basladi")
+        elif hotkey_matches(event, show_panel):
+            if not event.isARepeat() and panel is not None:
+                panel.toggle_(None)
         else:
             return False
         core.zoom_txt[0] = core.zoom.text()
@@ -309,18 +325,96 @@ class Canvas(K.NSView):
             path.stroke()
 
 
+def quit_app(reason="dugme"):
+    """Çıkış: basılı tuşlar bırakılır, yakınlaştırma geri alınır."""
+    core.stop.set()
+    core.backend.release_all()
+    try:
+        zoom_restore()
+    except Exception as e:
+        core.log(f"yakinlastirma geri alinamadi: {e}")
+    # İz thread'i kamerayı ve el izleyiciyi kapatsın. Kapanmadan çıkılırsa yerel kütüphaneler
+    # çıkışta abort ediyordu ("Fatal Python error: Aborted", canlı 2026-11-22).
+    if track_thread is not None:
+        track_thread.join(QUIT_JOIN_S)
+    core.log(f"cikis ({reason})")
+    os._exit(0)
+
+
+# Otomasyon + yardımcı erişim denetimi: dikte de menüyü System Events ile böyle okur.
+DICTATION_CHECK = ('tell application "System Events" to get name of menu bar items of '
+                   'menu bar 1 of (first application process whose frontmost is true)')
+PERM_CHECK_TIMEOUT_S = 20.0     # izin penceresi açıksa osascript yanıt bekler
+CAMERA_WAIT_S = 12.0            # izin kaydı, kameranın açılma sonucunu en çok bu kadar bekler
+
+
+def check_permissions():
+    """Her özelliğin iznini gerçekten deneyerek sınar; sonucu `core.perms`e ve kayda yazar.
+
+    - pointer: fare olayı gönderebiliyor mu (imleç, tık, kaydırma).
+    - hotkeys: klavye musluğu kurulu ve etkin mi (Control+N / Control+M yutulur).
+    - zoom: başka bir uygulamanın (Finder) menü çubuğu Erişilebilirlik ile okunabiliyor mu;
+      büyütme aynı yoldan menü öğesine basar.
+    - dictation: System Events ile öndeki uygulamanın menüleri okunabiliyor mu
+      (Otomasyon izni + yardımcı erişim); izin penceresi yanıtlanmadıysa None.
+    Yalnız okuma yapar; hiçbir şeye basmaz.
+    """
+    perms = {"pointer": bool(Quartz.CGPreflightPostEventAccess())}
+    tap = hotkey_refs[0] if hotkey_refs is not None and len(hotkey_refs) == 3 else None
+    perms["hotkeys"] = bool(tap is not None and Quartz.CGEventTapIsEnabled(tap))
+    finder = K.NSRunningApplication.runningApplicationsWithBundleIdentifier_("com.apple.finder")
+    if finder:
+        app = A.AXUIElementCreateApplication(finder[0].processIdentifier())
+        A.AXUIElementSetMessagingTimeout(app, ZOOM_AX_TIMEOUT_S)
+        perms["zoom"] = attr(app, "AXMenuBar") is not None
+    else:
+        perms["zoom"] = None
+    try:
+        proc = subprocess.run(["osascript", "-e", DICTATION_CHECK], capture_output=True,
+                              text=True, timeout=PERM_CHECK_TIMEOUT_S, check=False)
+        perms["dictation"] = proc.returncode == 0
+        if proc.returncode:
+            core.log(f"dikte izni denetimi: {proc.stderr.strip()[:160]}")
+    except (OSError, subprocess.SubprocessError):
+        perms["dictation"] = None
+    core.perms.update(perms)
+    deadline = time.monotonic() + CAMERA_WAIT_S     # kamera sonucu da kayda girsin
+    while core.camera_ok[0] is None and time.monotonic() < deadline:
+        time.sleep(0.25)
+    from tkt.app.panel import permissions_line
+    core.log("izinler: " + permissions_line({**perms, "camera": core.camera_ok[0]}))
+    return perms
+
+
+def check_permissions_async():
+    threading.Thread(target=check_permissions, daemon=True).start()
+
+
+def check_accessibility():
+    """Erişilebilirlik izni sonradan verildiyse kısayolları kurar; izin durumunu döner."""
+    global hotkey_refs
+    ok = bool(A.AXIsProcessTrusted())
+    if ok and not core.ax_ok[0]:
+        core.log("Erisilebilirlik izni verildi: kisayollar kuruluyor")
+        hotkey_refs = install_zoom_hotkeys()
+        check_permissions_async()
+    core.ax_ok[0] = ok
+    return ok
+
+
 class Tick(NSObject):
     def update_(self, timer):
-        if Quartz.CGEventSourceKeyState(Quartz.kCGEventSourceStateCombinedSessionState,
-                                        ESC_KEYCODE):
-            core.stop.set()
-            core.backend.release_all()
-            try:
-                zoom_restore()
-            except Exception as e:
-                core.log(f"yakinlastirma geri alinamadi: {e}")
-            K.NSApp.terminate_(None)
+        # Kalibrasyon aracı açıkken Esc onun penceresini kapatır; uygulamayı kapatmaz.
+        if not core.tool_running[0] and Quartz.CGEventSourceKeyState(
+                Quartz.kCGEventSourceStateCombinedSessionState, ESC_KEYCODE):
+            quit_app("Esc")
             return
+        ticks[0] += 1
+        if ticks[0] % PANEL_REFRESH_TICKS == 0:
+            if not core.ax_ok[0]:
+                check_accessibility()
+            if panel is not None and panel.window.isVisible():
+                panel.refresh()
         view.setNeedsDisplay_(True)
         img, seq = core.hud_img
         if img is not None and seq != shown_seq[0]:
@@ -354,7 +448,7 @@ def make_hud_window():
 
 def run(core_module):
     """Cocoa uygulamasını kurar, iz ve hedef bulucu thread'lerini başlatır; Esc'ye kadar döner."""
-    global core, screen, H, view, zoom_cfg
+    global core, screen, H, view, zoom_cfg, panel, track_thread, hotkey_refs
     core = core_module
     core.target_click = click_target
     core.zoom = core.make_zoom()
@@ -375,12 +469,29 @@ def run(core_module):
     win.setContentView_(view)
     win.orderFrontRegardless()
     hud_win = make_hud_window()
+    panel = Panel.alloc().initWithCore_onQuit_(core, quit_app)
+    panel.hud_window = hud_win
+    panel.applyHud()
+    panel.addStatusItem()
+    # İzinler açılışta istenir (kamera izni, kamera ilk açılırken sorulur):
+    # - Erişilebilirlik: imleç, tık, kaydırma, kısayollar, hedef yardımı. macOS bunu yalnız
+    #   kullanıcının Sistem Ayarları'nda işaretlemesiyle verir; burada yalnız sorulur.
+    # - Otomasyon (System Events): dikteyi menüden açmak için. Zararsız bir sorgu izin
+    #   penceresini şimdi çıkarır; yoksa ilk dikte denemesinde sessizce başarısız olurdu
+    #   (`check_permissions`, kısayollar kurulduktan sonra arka planda).
+    core.ax_ok[0] = bool(A.AXIsProcessTrustedWithOptions({A.kAXTrustedCheckOptionPrompt: True}))
+    if not core.ax_ok[0]:
+        core.log("Erisilebilirlik izni yok: imlec, kisayollar ve hedef yardimi calismaz")
     tick = Tick.alloc().init()
     timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.06, tick, "update:", None, True)
-    monitors = install_zoom_hotkeys()
-    run.keep = (win, hud_win, tick, timer, monitors)   # pyobjc nesneleri çöp toplamaya gitmesin
+    # İzin yoksa kısayollar izin gelince kurulur (check_accessibility); yoksa hiç çalışmazlar.
+    hotkey_refs = install_zoom_hotkeys() if core.ax_ok[0] else None
+    run.keep = (win, hud_win, tick, timer)      # pyobjc nesneleri çöp toplamaya gitmesin
     threading.Thread(target=zoom_worker, daemon=True).start()
-    threading.Thread(target=core.track, daemon=True).start()
+    panel.show()
+    track_thread = threading.Thread(target=core.track, daemon=True)
+    track_thread.start()
+    check_permissions_async()
     threading.Thread(target=find_targets, daemon=True).start()
     app.run()

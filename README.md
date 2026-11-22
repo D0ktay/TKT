@@ -64,6 +64,25 @@ Use `--list` to find the camera, then set `index` (or `name`), `width` and
 uv run python -m tkt.app.auto_mode
 ```
 
+On macOS you can also build a double-clickable app that runs the same thing:
+
+```bash
+uv run python -m tkt.tools.make_mac_app     # writes ~/Applications/TKT.app
+```
+
+The app has no Dock icon; it shows **TKT** in the menu bar. On first launch
+macOS asks for Camera access for TKT, and Accessibility has to be granted in
+System Settings. Output goes to `~/Library/Logs/TKT.log`. Rebuild the app if you
+move the repository.
+
+**Control window (macOS).** **Ctrl+N** or the menu bar item shows or hides it.
+It has the hand-mouse switch, distance zoom, "drive the pointer from the selected
+desk area" for Version A, the camera window switch, and one row per calibration
+(desk area, hand, pinch, peace sign, normal distance) with whether it is saved
+and a button to redo just that one. A calibration opens in its own window;
+tracking pauses until you close it. Calibrations are kept in `~/.tkt/`, so
+nothing has to be redone on the next start.
+
 - Once a second the camera image is checked for a face. A face with confidence
   ≥ 0.7 in three checks in a row switches to C; three checks without one switch
   back to A. Each version uses its own settings: A uses `vision.toml` and the

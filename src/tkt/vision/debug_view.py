@@ -111,6 +111,8 @@ KEY_TABLE = ord("m")         # masa (mousepad) modeli kalibrasyonu
 KEY_PINCH = ord("p")         # el + pinch kalibrasyonu (tek oturum, isteğe bağlı)
 KEY_SURFACE = ord("s")       # aktif alan (yüzey) kalibrasyonu
 KEY_REDO = ord("g")          # yüzey kalibrasyonunda köşeyi tekrarla / bir köşe geri
+# `--start` seçenekleri: pencere açılınca basılmış sayılacak tuş.
+START_KEYS = {"hand": KEY_CALIB, "pinch": KEY_PINCH, "surface": KEY_SURFACE}
 
 # BGR renkler
 _WHITE = (255, 255, 255)
@@ -900,7 +902,8 @@ def _window_visible() -> bool | None:
 
 
 def run(source: LiveSource, calib_path: Path, surface_path: Path | None = None,
-        surface_aspect: float = calibration.DEFAULT_ASPECT) -> None:
+        surface_aspect: float = calibration.DEFAULT_ASPECT,
+        start_key: int | None = None) -> None:
     """İskelet, curl/lift/pinch çubukları, lift grafiği, fps. Ana thread'de çalışır.
 
     Tuşlar: `c` kalibrasyon, `p` el + pinch kalibrasyonu (tek oturum), `t` tap kalibrasyonu,
@@ -909,6 +912,7 @@ def run(source: LiveSource, calib_path: Path, surface_path: Path | None = None,
     `source.set_calibration` ile hemen geçerli olur ve `calib_path` dosyasına yazılır.
     Aktif alan (`s`) bitince `source.set_surface` ile uygulanır ve `surface_path`
     (verilmezse `~/.tkt/surface.json`) dosyasına yazılır; en-boy `surface_aspect`.
+    `start_key` verilirse pencere açılınca o tuşa basılmış gibi başlanır (`--start`).
     """
     if surface_path is None:
         surface_path = Path(calibration.DEFAULT_PATH).expanduser()
@@ -1010,6 +1014,8 @@ def run(source: LiveSource, calib_path: Path, surface_path: Path | None = None,
                 shown = True
                 cocoa = _enable_cocoa_close()
             key = cv2.waitKey(1) & 0xFF
+            if start_key is not None and key in (255, -1):
+                key, start_key = start_key, None
             if key in KEY_QUIT:
                 _log("cikis tusu")
                 break
@@ -1150,17 +1156,22 @@ def _finish_table(table: TableSession, source: LiveSource, calib: HandCalibratio
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m tkt.vision.debug_view")
     parser.add_argument("--config", default="config/vision.toml")
+    parser.add_argument("--start", choices=sorted(START_KEYS), default=None,
+                        help="pencere açılınca doğrudan bu kalibrasyonu başlat")
     args = parser.parse_args(argv)
+    start_key = START_KEYS.get(args.start)
     cfg = load_vision_config(args.config)
     calib_path = Path(cfg["hand"]["calibration"]).expanduser()
     source = open_live_source(args.config)
     surface_cfg = cfg.get("surface")
+    extra = {} if start_key is None else {"start_key": start_key}
     if surface_cfg is None:
-        run(source, calib_path)
+        run(source, calib_path, **extra)
     else:
         run(source, calib_path,
             surface_path=Path(surface_cfg.get("file", calibration.DEFAULT_PATH)).expanduser(),
-            surface_aspect=float(surface_cfg.get("aspect", calibration.DEFAULT_ASPECT)))
+            surface_aspect=float(surface_cfg.get("aspect", calibration.DEFAULT_ASPECT)),
+            **extra)
 
 
 if __name__ == "__main__":

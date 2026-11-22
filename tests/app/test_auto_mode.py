@@ -5,6 +5,7 @@ sahte motor kullanılır. macOS arayüzü (`auto_mode_mac`) burada import edilme
 """
 import dataclasses
 import threading
+import types
 
 import numpy as np
 import pytest
@@ -256,6 +257,87 @@ def test_hand_gate_blocks_engine_until_opened_and_releases_on_close(core, monkey
     FakeEngine.script = [[("move_rel", (1, 0))]] * 4
     am.run_mode(FakeSource(2), am.profile("A")[1], False, False, lambda img: 0.1, "A")
     assert [e.kind for e in core.events] == ["move", "move"]
+
+
+def test_tool_request_stops_tracking_runs_tool_and_reloads_sign(core, monkeypatch):
+    cfg = am.profile("C")[1]
+    monkeypatch.setattr(am, "pending_tool", [None])
+    monkeypatch.setattr(am, "tool_running", [False])
+    am.request_tool(("-m", "tkt.app.sign_calib"))
+    assert am.run_mode(FakeSource(5), cfg, True, False, lambda img: 0.9, "C") == am.TOOL
+
+    calls, reloaded = [], []
+    monkeypatch.setattr(am, "gate", types.SimpleNamespace(
+        enabled=False, reload=lambda: reloaded.append(1)))
+
+    def run(cmd, **kw):
+        calls.append((cmd, kw, am.tool_running[0]))
+
+    am.run_tool(run=run)
+    cmd, kw, running = calls[0]
+    assert cmd == [am.sys.executable, "-m", "tkt.app.sign_calib"] and kw["cwd"] == str(am.REPO)
+    assert running and not am.tool_running[0] and am.pending_tool[0] is None
+    assert reloaded == [1]
+
+    am.request_reopen()                       # ayar değişti: araç yok, yalnız yeniden açılır
+    assert am.run_mode(FakeSource(5), cfg, True, False, lambda img: 0.9, "C") == am.TOOL
+    am.run_tool(run=run)
+    assert len(calls) == 1 and am.pending_tool[0] is None
+
+
+def test_track_retries_when_camera_is_missing(core, monkeypatch):
+    opened = []
+
+    def open_source(path):
+        opened.append(path)
+        if len(opened) < 3:
+            raise RuntimeError("kameradan ilk kare alınamadı")
+        am.stop.set()
+        source = FakeSource(1)
+        source.close = lambda: None
+        return source
+
+    monkeypatch.setattr(am, "open_live_source", open_source)
+    monkeypatch.setattr(am, "make_face_detector", lambda: (lambda img: 0.0))
+    monkeypatch.setattr(am, "CAMERA_RETRY_S", 0.0)
+    monkeypatch.setattr(am, "mode_txt", [""])
+    am.track()
+    assert len(opened) == 3                   # iki başarısız denemeden sonra açıldı, çökmedi
+
+
+def test_panel_checkbox_opens_and_closes_the_hand(core, monkeypatch):
+    from tkt.app.hand_gate import HandGate
+    cfg = am.profile("C")[1]
+    monkeypatch.setattr(am, "FACE_EVERY_S", 99.0)
+    monkeypatch.setattr(am, "GestureEngine", FakeEngine)
+    monkeypatch.setattr(am, "mode_txt", ["MOD C"])
+    gate = HandGate({**cfg["hand_gate"], "file": ""}, 0.5)
+    monkeypatch.setattr(am, "gate", gate)
+    FakeEngine.script = [[("move_rel", (5, 0))]] * 8
+
+    class Source(FakeSource):
+        def frames_raw(self):
+            for i, item in enumerate(super().frames_raw()):
+                if i == 2:
+                    gate.set_active(True)     # arayüzdeki kutu işaretlendi
+                if i == 5:
+                    gate.set_active(False)
+                yield item
+
+    am.history.clear()
+    am.run_mode(Source(8), cfg, True, False, lambda img: 0.9, "C")
+    assert [e.kind for e in core.events] == ["move"] * 3      # yalnız açıkken (kare 2-4)
+    msgs = [m for _, m in am.history]
+    assert msgs.index("EL FARESI ACIK") < msgs.index("EL FARESI KAPALI")
+
+
+def test_use_surface_pref_enables_surface_pointer_in_a(core, monkeypatch):
+    monkeypatch.setattr(am, "prefs", {"use_surface": False, "hud": True})
+    assert am.profile("A")[1]["surface_pointer"]["enabled"] is False
+    am.prefs["use_surface"] = True
+    assert am.profile("A")[1]["surface_pointer"]["enabled"] is True
+    assert am.profile("C")[1]["surface_pointer"]["enabled"] is False
+    assert am.panel_hotkey_text() == "Control+N"
 
 
 def test_make_gate_reads_config():

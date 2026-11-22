@@ -108,6 +108,9 @@ skip_menus = ["Format", "Biçim"]        # bu üst menüler aranmaz: oradaki Bü
 zoom_in_titles = ["Zoom In", "Bigger", "Make Text Bigger", "Increase Font Size", "Yakınlaştır", "Büyüt", "Daha Büyük"]
 zoom_out_titles = ["Zoom Out", "Smaller", "Make Text Smaller", "Decrease Font Size", "Uzaklaştır", "Küçült", "Daha Küçük"]
 
+[panel]                     # otomatik modun kontrol penceresi (macOS)
+hotkey = "<ctrl>+n"         # pencereyi aç / kapat (her uygulamada; tuş yutulur)
+
 [hand_gate]                 # deney (otomatik mod, C): barış işareti el faresini açar / kapatır
 enabled = true
 start_active = false        # C'ye girildiğinde el faresi kapalı başlar
