@@ -71,3 +71,16 @@ fist_curl = 0.6
 min_cutoff = 1.0
 gain_min = 500
 gain_max = 2500
+[surface_pointer]           # deney: işaret ucu aktif alanda (Finger.surface) touchpad gibi
+enabled = false             # true: surface varsa imleç alandan sürülür; yoksa [pointer] kullanılır
+aspect = 1.5                # alanın genişlik / yüksekliği; vision.toml [surface] aspect ile aynı olmalı
+gain_min = 600              # ekran pikseli / alan yüksekliği (yavaş hareket)
+gain_max = 3000             # ekran pikseli / alan yüksekliği (hızlı hareket)
+speed_lo = 0.15             # alan yüksekliği / sn
+speed_hi = 1.5
+min_cutoff = 0.3            # One Euro, Hz
+beta = 5.0                  # One Euro hız katsayısı, 1 / (alan yüksekliği); [pointer] beta kamera pikseli içindir
+edge_margin = 0.03          # alan kenarından bu kadar dışarısı hâlâ içeri sayılır
+absolute = false            # true: alan ekrana mutlak eşlenir (yalnız karşılaştırma için)
+screen_w = 1920             # mutlak mod ekran boyutu
+screen_h = 1080

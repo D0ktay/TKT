@@ -10,6 +10,7 @@ from typing import Any
 from tkt.control.os_input.base import InputBackend
 from tkt.control.pointer import PointerMotion
 from tkt.control.scroll import ScrollMotion
+from tkt.control.surface_pointer import SurfaceMotion, SurfacePointer
 from tkt.control.tap import TapDetector
 from tkt.core.types import FINGERS, Finger, HandFrame, SourceInfo
 
@@ -79,6 +80,13 @@ class GestureEngine:
         self._rollback_ms = cfg["pointer"]["rollback_ms"]
         self._backend = backend
         self._pointer = PointerMotion(cfg["pointer"], info)
+        # Deney: aktif alan imleci. Kapalıyken (varsayılan) hiç kurulmaz, davranış aynıdır.
+        self._surface_pointer: SurfacePointer | None = None
+        surface_cfg = cfg.get("surface_pointer", {})
+        if surface_cfg.get("enabled", False):
+            self._surface_pointer = SurfacePointer(
+                self._pointer, SurfaceMotion(surface_cfg, cfg["pointer"]))
+            self._pointer = self._surface_pointer
         self._scroll = ScrollMotion(cfg["scroll"], info)
         self._tap = TapDetector(cfg) if self._click_method in ("tap", "both") else None
         if self._tap is not None:
@@ -676,6 +684,10 @@ class GestureEngine:
         if self._pointer_needs_rebase:
             self._pointer.rebase()
             self._pointer_needs_rebase = False
+        if self._surface_pointer is not None:
+            for delta in self._surface_pointer.update_finger(index, hand_size, t):
+                self._send_move(delta)
+            return
         self._send_move(self._pointer.update(index.img, hand_size, t))
 
     def _send_move(self, delta: tuple[int, int]) -> None:

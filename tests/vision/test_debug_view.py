@@ -966,3 +966,214 @@ def test_run_pinch_failure_writes_nothing(rec, tmp_path, monkeypatch):
     dv.run(src, path)
     assert src.calibrations == [] and path.read_text() == before
     assert any("basarisiz" in cs.message for cs in seen if cs is not None and cs.message)
+
+
+# ---------------------------------------------------------------- aktif alan (yüzey)
+
+SURF_CORNERS = [(0.35, 0.20), (0.65, 0.20), (0.85, 0.80), (0.15, 0.80)]
+
+
+def tip_frame(tip, t, frame_id=1):
+    if tip is None:
+        return make_frame(present=False, t=t, frame_id=frame_id)
+    fingers = {f: Finger(tip if f == "index" else (0.5, 0.5), None, 0.3, None)
+               for f in FINGERS}
+    return HandFrame(t, frame_id, True, fingers, 0.9, (0.5, 0.5), 0.2, 0.97)
+
+
+class SurfaceFakeSource(FakeSource):
+    def __init__(self, items, **kw):
+        super().__init__(items, **kw)
+        self.surface = None
+        self.surfaces = []
+
+    def set_surface(self, surface):
+        self.surface = surface
+        self.surfaces.append(surface)
+
+
+class SurfaceFlow:
+    """`s` akışı: kareler ve tuşlar (kare sırasıyla hizalı)."""
+
+    def __init__(self, dt=0.25):
+        self.dt = dt
+        self.items, self.keys = [], []
+        self.img = np.zeros((512, 640, 3), np.uint8)
+
+    def add(self, tip, key=-1, n=1):
+        for _ in range(n):
+            i = len(self.items)
+            frame = tip_frame(tip, 50.0 + i * self.dt, i)
+            self.items.append((frame, make_hand() if tip is not None else None, self.img))
+            self.keys.append(key)
+            key = -1
+        return self
+
+    def corner(self, tip, frames=None):
+        per = frames if frames is not None else int(
+            (dv.SURFACE_COUNTDOWN_SECONDS + dv.SURFACE_RECORD_SECONDS) / self.dt) + 1
+        self.add(tip, ord(" "))
+        return self.add(tip, n=per)
+
+
+def test_surface_session_records_median_per_corner():
+    s = dv.SurfaceSession(countdown_s=1.0, record_s=1.0)
+    assert s.phase == "wait" and s.index == 0
+    s.add((0.9, 0.9), 0.0)              # beklemede örnek yok
+    s.start()
+    assert s.phase == "countdown"
+    s.add((0.9, 0.9), 1.0)              # geri sayım başlar
+    s.add((0.9, 0.9), 1.5)              # hâlâ geri sayım: örnek yok
+    assert s.samples == []
+    for k, t in enumerate((2.0, 2.25, 2.5, 2.75)):
+        s.add((0.3 + 0.01 * k, 0.2), t)
+    assert s.phase == "record" and len(s.samples) == 4
+    s.add((0.3, 0.2), 3.0)              # kayıt biter
+    assert s.phase == "wait" and s.index == 1
+    assert s.corners[0] == pytest.approx((0.315, 0.2))
+
+
+def test_surface_session_no_tip_repeats_corner():
+    s = dv.SurfaceSession(countdown_s=0.0, record_s=1.0)
+    s.start()
+    for t in (0.0, 0.5, 1.0):
+        s.add(None, t)
+    assert s.index == 0 and not s.corners and "gorunmedi" in s.message()
+
+
+def test_surface_session_redo_during_record_and_back_in_wait():
+    s = dv.SurfaceSession(countdown_s=0.0, record_s=1.0)
+    s.start()
+    s.add((0.1, 0.1), 0.0)
+    s.add((0.1, 0.1), 0.5)
+    s.redo()                            # kayıt sürerken: aynı köşe baştan
+    assert s.phase == "wait" and s.index == 0 and s.samples == []
+    s.start()
+    s.add((0.2, 0.2), 1.0)
+    s.add((0.2, 0.2), 2.0)
+    assert s.corners == [(0.2, 0.2)]
+    s.redo()                            # beklemede: bir önceki köşeye dön
+    assert s.corners == [] and s.index == 0
+
+
+def test_surface_session_validates_and_result_before_done():
+    with pytest.raises(ValueError):
+        dv.SurfaceSession(countdown_s=-1.0)
+    with pytest.raises(ValueError):
+        dv.SurfaceSession().result(1.5, 1.25)
+
+
+def test_run_surface_flow_saves_and_applies(rec, tmp_path, monkeypatch):
+    seen = []
+    real = dv.draw_overlay
+
+    def spy(image, frame, hand, stats, calib_state=None):
+        seen.append(calib_state.message if calib_state is not None else "")
+        return real(image, frame, hand, stats, calib_state)
+
+    monkeypatch.setattr(dv, "draw_overlay", spy)
+    flow = SurfaceFlow()
+    flow.add(SURF_CORNERS[0], ord("s"))
+    for c in SURF_CORNERS:
+        flow.corner(c)
+    flow.add((0.5, 0.5), n=2)             # alan içi
+    flow.add((0.5, 0.05), n=2)            # alan dışı
+    r = rec(flow.keys)
+    src = SurfaceFakeSource(flow.items)
+    path = tmp_path / "sub" / "surface.json"
+    dv.run(src, tmp_path / "cal.json", surface_path=path, surface_aspect=1.5)
+
+    from tkt.vision import calibration
+    saved = calibration.load(path)
+    assert saved is not None and saved.aspect == 1.5
+    assert saved.image_aspect == pytest.approx(640 / 512)
+    for got, want in zip(saved.corners_img, SURF_CORNERS, strict=True):
+        assert got == pytest.approx(want)
+    assert src.surfaces == [saved]
+    assert any("1/4 SOL-UZAK kose" in m and "BOSLUK" in m for m in seen)
+    assert any("4/4 SOL-YAKIN" in m for m in seen)
+    assert any("Alan kaydedildi" in m and "30x20" in m for m in seen)
+    assert all(m.isascii() for m in seen)
+    assert src.closed and len(r.shown) == len(flow.items)
+    # Kalibrasyon sonrası alan çizilir: içerideyken yeşil, dışarıdayken kırmızı dörtgen.
+    poly = np.array([(round(x * 640), round(y * 512)) for x, y in SURF_CORNERS], np.int32)
+    mask = np.zeros((512, 640), np.uint8)
+    cv2.polylines(mask, [poly], True, 255, 1)
+    edge = mask > 0
+    inside_img, outside_img = r.shown[-3][1], r.shown[-1][1]
+    green = np.array(dv._GREEN, np.uint8)
+    red = np.array(dv._RED, np.uint8)
+    assert np.all(inside_img[edge] == green, axis=1).mean() > 0.5
+    assert np.all(outside_img[edge] == red, axis=1).mean() > 0.5
+
+
+def test_run_surface_redo_with_g(rec, tmp_path):
+    flow = SurfaceFlow()
+    flow.add(SURF_CORNERS[0], ord("s"))
+    flow.corner(SURF_CORNERS[0])
+    # 2. köşe yanlış yerde başladı: kayıt sırasında g, sonra doğru yerde tekrar
+    flow.add((0.9, 0.5), ord(" "))
+    flow.add((0.9, 0.5), n=6)             # geri sayım (1 sn) + kayıdın bir kısmı
+    flow.add((0.9, 0.5), ord("g"))
+    flow.corner(SURF_CORNERS[1])
+    flow.corner(SURF_CORNERS[2])
+    flow.corner(SURF_CORNERS[3])
+    flow.add((0.5, 0.5), n=2)
+    rec(flow.keys)
+    src = SurfaceFakeSource(flow.items)
+    path = tmp_path / "surface.json"
+    dv.run(src, tmp_path / "cal.json", surface_path=path)
+    from tkt.vision import calibration
+    saved = calibration.load(path)
+    assert saved is not None
+    assert saved.corners_img[1] == pytest.approx(SURF_CORNERS[1])
+
+
+def test_run_surface_bad_quad_reports_failure(rec, tmp_path, monkeypatch):
+    seen = []
+    real = dv.draw_overlay
+
+    def spy(image, frame, hand, stats, calib_state=None):
+        seen.append(calib_state.message if calib_state is not None else "")
+        return real(image, frame, hand, stats, calib_state)
+
+    monkeypatch.setattr(dv, "draw_overlay", spy)
+    flow = SurfaceFlow()
+    flow.add(SURF_CORNERS[0], ord("s"))
+    for c in SURF_CORNERS[::-1]:          # ters sıra
+        flow.corner(c)
+    flow.add((0.5, 0.5), n=2)
+    rec(flow.keys)
+    src = SurfaceFakeSource(flow.items)
+    path = tmp_path / "surface.json"
+    dv.run(src, tmp_path / "cal.json", surface_path=path)
+    assert not path.exists() and src.surfaces == []
+    assert any("Alan kalibrasyonu basarisiz" in m for m in seen)
+
+
+def test_draw_surface_colors_and_partial():
+    from tkt.vision.calibration import SurfaceCalibration
+    s = SurfaceCalibration(SURF_CORNERS, image_aspect=1.25)
+    img = np.zeros((512, 640, 3), np.uint8)
+    dv.draw_surface(img, s, (0.5, 0.5))
+    assert np.any(np.all(img == np.array(dv._GREEN, np.uint8), axis=2))
+    img = np.zeros((512, 640, 3), np.uint8)
+    dv.draw_surface(img, s, (0.5, 0.02))
+    assert np.any(np.all(img == np.array(dv._RED, np.uint8), axis=2))
+    img = np.zeros((512, 640, 3), np.uint8)
+    dv.draw_surface(img, None, None, SURF_CORNERS[:2])
+    assert np.any(np.all(img == np.array(dv._YELLOW, np.uint8), axis=2))
+
+
+def test_main_passes_surface_config(monkeypatch, tmp_path):
+    cfg = tmp_path / "vision.toml"
+    calib = tmp_path / "cal.json"
+    surf = tmp_path / "surf.json"
+    cfg.write_text(f'[hand]\ncalibration = "{calib.as_posix()}"\nside = "right"\n'
+                   f'[surface]\nenabled = false\nfile = "{surf.as_posix()}"\naspect = 1.4\n')
+    calls = {}
+    monkeypatch.setattr(dv, "open_live_source", lambda path: "src")
+    monkeypatch.setattr(dv, "run", lambda *a, **kw: calls.update(a=a, kw=kw))
+    dv.main(["--config", str(cfg)])
+    assert calls["a"] == ("src", calib)
+    assert calls["kw"] == {"surface_path": surf, "surface_aspect": 1.4}

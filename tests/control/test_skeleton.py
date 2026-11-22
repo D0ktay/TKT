@@ -117,8 +117,9 @@ def test_control_config_sections():
         config = tomllib.load(file)
     assert set(config) == {
         "general", "mode", "thumb", "pointer", "scroll", "tap", "swipe", "pinch", "index_pinch",
-        "pointer_front",
+        "pointer_front", "surface_pointer",
     }
+    assert config["surface_pointer"]["enabled"] is False   # deney: varsayılan kapalı
 
 
 @pytest.mark.parametrize("name", CLI_MODULES)

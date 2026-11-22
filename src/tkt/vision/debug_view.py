@@ -3,8 +3,8 @@
 macOS'ta `cv2.imshow` ana thread'de çalışmalıdır; `run` döngüyü çağıran thread'de kurar.
 Çizim saf fonksiyonlardadır (`draw_overlay`, `draw_tap_prompt`, `render_lift_graph`);
 pencere ve klavye yalnızca `run` içindedir. Tuşlar: `c` kalibrasyon, `p` pinch dahil
-kalibrasyon (isteğe bağlı, Sürüm C), `t` tap kalibrasyonu, `m` masa, `q`/ESC veya pencere X
-düğmesi çıkış.
+kalibrasyon (isteğe bağlı, Sürüm C), `t` tap kalibrasyonu, `m` masa modeli, `s` aktif alan
+(yüzey) kalibrasyonu, `q`/ESC veya pencere X düğmesi çıkış.
 
 cv2.putText yalnızca ASCII çizer; ekran metinleri bu yüzden Türkçe karaktersizdir.
 
@@ -29,7 +29,8 @@ import cv2
 import numpy as np
 
 from tkt.core.types import FINGERS, HandFrame
-from tkt.vision import hand_calib
+from tkt.vision import calibration, hand_calib
+from tkt.vision.calibration import CORNER_NAMES, SurfaceCalibration
 from tkt.vision.hand_calib import (
     PINCH_STEP_FINGER,
     PINCH_STEPS,
@@ -82,6 +83,10 @@ TABLE_RECORD_SECONDS = 12.0
 # Taranan alan: örnekler bu ızgarada sayılır (kapsama yüzdesi ve kareler).
 TABLE_GRID = 8
 
+# Aktif alan kalibrasyonu: her köşe boşlukla başlar, geri sayım, sonra işaret ucunun kaydı.
+SURFACE_COUNTDOWN_SECONDS = 1.0
+SURFACE_RECORD_SECONDS = 1.0
+
 # Kalibrasyon sonuç mesajının ekranda kalma süresi (kare zamanı, sn).
 MESSAGE_SECONDS = 4.0
 
@@ -104,6 +109,8 @@ KEY_NEXT = ord(" ")          # adım adım kalibrasyonda sonraki adımı başlat
 KEY_TAP = ord("t")
 KEY_TABLE = ord("m")         # masa (mousepad) modeli kalibrasyonu
 KEY_PINCH = ord("p")         # el + pinch kalibrasyonu (tek oturum, isteğe bağlı)
+KEY_SURFACE = ord("s")       # aktif alan (yüzey) kalibrasyonu
+KEY_REDO = ord("g")          # yüzey kalibrasyonunda köşeyi tekrarla / bir köşe geri
 
 # BGR renkler
 _WHITE = (255, 255, 255)
@@ -264,7 +271,7 @@ def draw_overlay(image: np.ndarray, frame: HandFrame, hand: RawHand | None,
     if calib_state is not None:
         _draw_calibration(out, calib_state, u, fs, pad)
     else:
-        _text(out, "c: kalibrasyon  p: +pinch  t: tap  m: masa  q/ESC: cikis",
+        _text(out, "c: kalibrasyon  p: +pinch  t: tap  m: masa  s: alan  q/ESC: cikis",
               (pad, h - pad), fs * 0.8, _GRAY)
     return out
 
@@ -442,6 +449,173 @@ def draw_table_area(out: np.ndarray, points: Sequence[tuple[float, float]],
     if len(px) >= 3:
         hull = cv2.convexHull(px)
         cv2.polylines(out, [hull], True, _YELLOW, 2)
+
+
+class SurfaceSession:
+    """Aktif alan kalibrasyonu: 4 köşe, her biri BOŞLUK -> geri sayım -> kayıt (kamera/GUI yok).
+
+    Köşe sırası `CORNER_NAMES` (sol-uzak, sağ-uzak, sağ-yakın, sol-yakın). Kayıtta işaret
+    parmağı ucunun görüntü konumu (`Finger.img`) toplanır; köşe değeri medyandır. Kayıtta hiç
+    örnek yoksa aynı köşe yeniden BOŞLUK bekler. `redo()` (`g`): geri sayım/kayıt sürerken o
+    köşeyi baştan alır; beklemedeyse bir önceki köşeye döner. Zaman yalnızca `add` ile verilen
+    kare zamanından gelir.
+    """
+
+    def __init__(self, countdown_s: float = SURFACE_COUNTDOWN_SECONDS,
+                 record_s: float = SURFACE_RECORD_SECONDS) -> None:
+        if not (countdown_s >= 0 and record_s > 0):
+            raise ValueError("countdown_s >= 0 ve record_s > 0 olmalı")
+        self.countdown_s = float(countdown_s)
+        self.record_s = float(record_s)
+        self.corners: list[tuple[float, float]] = []
+        self.samples: list[tuple[float, float]] = []   # geçerli köşenin kayıtları
+        self.note = ""                                  # son uyarı (ör. parmak görünmedi)
+        self._pending = False
+        self._t0: float | None = None
+        self._now: float | None = None
+
+    @property
+    def done(self) -> bool:
+        return len(self.corners) >= len(CORNER_NAMES)
+
+    @property
+    def index(self) -> int:
+        return min(len(self.corners), len(CORNER_NAMES) - 1)
+
+    @property
+    def phase(self) -> str:
+        """"wait" (boşluk bekleniyor), "countdown", "record" veya "done"."""
+        if self.done:
+            return "done"
+        if self._t0 is None or self._now is None:
+            return "countdown" if self._pending else "wait"
+        return "countdown" if self._now - self._t0 < self.countdown_s else "record"
+
+    @property
+    def remaining(self) -> float:
+        if self._t0 is None or self._now is None:
+            return self.countdown_s if self._pending else 0.0
+        el = self._now - self._t0
+        if el < self.countdown_s:
+            return self.countdown_s - el
+        return max(0.0, self.countdown_s + self.record_s - el)
+
+    def start(self) -> None:
+        """Beklemedeki köşeyi başlatır; geri sayım/kayıt sürerken etkisizdir."""
+        if not self.done and self.phase == "wait":
+            self._pending = True
+            self.note = ""
+
+    def redo(self) -> None:
+        """Sürmekte olan köşeyi baştan alır; beklemedeyse bir önceki köşeye döner."""
+        if self.done:
+            return
+        if self.phase == "wait":
+            if self.corners:
+                self.corners.pop()
+                self.note = f"{CORNER_NAMES[len(self.corners)]} kosesi tekrar"
+        else:
+            self.note = f"{CORNER_NAMES[self.index]} kosesi tekrar"
+        self.samples = []
+        self._pending, self._t0 = False, None
+
+    def add(self, tip: tuple[float, float] | None, t: float) -> None:
+        """Kare zamanını ilerletir; kayıt evresinde işaret ucunu (`None`: görünmüyor) ekler."""
+        if self.done:
+            return
+        t = float(t)
+        if self._pending and self._t0 is None:
+            self._t0 = t
+        if self._now is None or t > self._now:
+            self._now = t
+        if self._t0 is None:
+            return
+        el = self._now - self._t0
+        if el >= self.countdown_s + self.record_s:
+            if self.samples:
+                pts = np.asarray(self.samples, dtype=float)
+                med = np.median(pts, axis=0)
+                self.corners.append((float(med[0]), float(med[1])))
+            else:
+                self.note = "isaret parmagi gorunmedi, tekrar BOSLUK"
+            self.samples = []
+            self._pending, self._t0 = False, None
+            return
+        if el >= self.countdown_s and tip is not None:
+            self.samples.append((float(tip[0]), float(tip[1])))
+
+    def message(self, aspect: float = calibration.DEFAULT_ASPECT) -> str:
+        """Ekranda gösterilen yönerge (ASCII)."""
+        n, total = self.index + 1, len(CORNER_NAMES)
+        name = CORNER_NAMES[self.index]
+        phase = self.phase
+        if phase == "wait":
+            msg = f"{n}/{total} {name} kose: isaret parmagi ucunu koseye koy, BOSLUK"
+            if self.note:
+                msg = f"{self.note} -- {msg}"
+            return msg
+        if phase == "countdown":
+            return f"{n}/{total} {name}: basliyor {math.ceil(self.remaining)}"
+        if phase == "record":
+            return (f"{n}/{total} {name}: KAYIT, kipirdama ({self.remaining:.1f} sn, "
+                    f"{len(self.samples)})")
+        return f"ALAN tamam: {_aspect_text(aspect)}"
+
+    def hint(self, aspect: float) -> str:
+        """İkinci satır: tuşlar ve en-boy varsayımı (ASCII)."""
+        return f"ALAN KALIBRASYONU  g: kose tekrar/geri  ({_aspect_text(aspect)})"
+
+    def result(self, aspect: float, image_aspect: float) -> SurfaceCalibration:
+        if not self.done:
+            raise ValueError("yüzey kalibrasyonu bitmedi")
+        return SurfaceCalibration(tuple(self.corners), aspect=aspect, image_aspect=image_aspect)
+
+
+def _aspect_text(aspect: float) -> str:
+    """Ekranda gösterilen alan en-boy açıklaması (ASCII)."""
+    if math.isclose(aspect, 1.5):
+        return "alan 30x20 kabul edildi"
+    return f"alan en/boy {aspect:.2f} kabul edildi"
+
+
+def draw_surface(out: np.ndarray, surface: SurfaceCalibration | None,
+                 tip: tuple[float, float] | None = None,
+                 partial: Sequence[tuple[float, float]] = ()) -> None:
+    """Aktif alanı çizer (yerinde): dörtgen, parmak ucu alan içindeyse yeşil, dışındaysa kırmızı.
+
+    `partial`: kalibrasyon sürerken toplanan köşeler (numaralı nokta ve çizgi).
+    """
+    h, w = out.shape[:2]
+    thick = max(1, round(min(h, w) / 240))
+
+    def px(p: tuple[float, float]) -> tuple[int, int]:
+        return int(round(p[0] * w)), int(round(p[1] * h))
+
+    if partial:
+        pts = [px(p) for p in partial]
+        for a, b in zip(pts, pts[1:], strict=False):
+            cv2.line(out, a, b, _YELLOW, thick, cv2.LINE_AA)
+        for i, p in enumerate(pts):
+            cv2.circle(out, p, thick + 3, _YELLOW, -1, cv2.LINE_AA)
+            _text(out, str(i + 1), (p[0] + 6, p[1] - 6), 0.5, _YELLOW)
+    if surface is None:
+        return
+    uv = surface.to_surface(tip) if tip is not None else None
+    inside = SurfaceCalibration.contains(uv)
+    color = _GREEN if inside else _RED
+    poly = np.array([px(c) for c in surface.corners_img], dtype=np.int32)
+    cv2.polylines(out, [poly], True, color, thick + 1, cv2.LINE_AA)
+    if tip is not None and uv is not None:
+        p = px(tip)
+        cv2.circle(out, p, thick + 4, color, 2, cv2.LINE_AA)
+        _text(out, f"u {uv[0]:4.2f} v {uv[1]:4.2f}", (p[0] + 10, p[1] + 4), 0.5, color)
+
+
+def _draw_hint(out: np.ndarray, s: str) -> None:
+    """Alt mesaj satırının bir üstüne gri yardım satırı."""
+    h = out.shape[0]
+    u = max(12, round(h / 36))
+    _text(out, s, (u // 2, h - u // 2 - u), u / 30.0 * 0.8, _GRAY)
 
 
 def draw_tap_prompt(out: np.ndarray, ts: TapState) -> None:
@@ -725,14 +899,21 @@ def _window_visible() -> bool | None:
     return v >= 1
 
 
-def run(source: LiveSource, calib_path: Path) -> None:
+def run(source: LiveSource, calib_path: Path, surface_path: Path | None = None,
+        surface_aspect: float = calibration.DEFAULT_ASPECT) -> None:
     """İskelet, curl/lift/pinch çubukları, lift grafiği, fps. Ana thread'de çalışır.
 
     Tuşlar: `c` kalibrasyon, `p` el + pinch kalibrasyonu (tek oturum), `t` tap kalibrasyonu,
-    `m` masa, `q`/ESC çıkış; pencerenin X düğmesi de
-    çıkartır. Kalibrasyon bitince yeni değerler `source.set_calibration` ile hemen
-    geçerli olur ve `calib_path` dosyasına yazılır.
+    `m` masa, `s` aktif alan, `q`/ESC çıkış;
+    pencerenin X düğmesi de çıkartır. Kalibrasyon bitince yeni değerler
+    `source.set_calibration` ile hemen geçerli olur ve `calib_path` dosyasına yazılır.
+    Aktif alan (`s`) bitince `source.set_surface` ile uygulanır ve `surface_path`
+    (verilmezse `~/.tkt/surface.json`) dosyasına yazılır; en-boy `surface_aspect`.
     """
+    if surface_path is None:
+        surface_path = Path(calibration.DEFAULT_PATH).expanduser()
+    surf: SurfaceSession | None = None
+    surface: SurfaceCalibration | None = getattr(source, "surface", None)
     session: CalibrationSession | GuidedCalibration | None = None
     tap: TapSession | None = None
     table: TableSession | None = None
@@ -791,6 +972,16 @@ def run(source: LiveSource, calib_path: Path) -> None:
                     table = None
                 else:
                     calib_state = CalibState(None, 0.0, 0.0, 0, table.message())
+            if surf is not None:
+                index = frame.fingers.get("index") if frame.present else None
+                surf.add(None if index is None else index.img, frame.t)
+                if surf.done:
+                    message, message_until, surface = _finish_surface(
+                        surf, source, surface, surface_path, surface_aspect, frame.t)
+                    _log(f"alan bitti: koseler={surf.corners} -> {message}")
+                    surf = None
+                else:
+                    calib_state = CalibState(None, 0.0, 0.0, -1, surf.message(surface_aspect))
             if calib_state is None and message:
                 calib_state = CalibState(None, 0.0, 0.0, 0, message)
 
@@ -803,6 +994,13 @@ def run(source: LiveSource, calib_path: Path) -> None:
             draw_lift_graph(out, history)
             if tap_state is not None:
                 draw_tap_prompt(out, tap_state)
+            if surf is not None or surface is not None:
+                index = frame.fingers.get("index") if frame.present else None
+                draw_surface(out, surface if surf is None else None,
+                             None if index is None else index.img,
+                             surf.corners if surf is not None else ())
+            if surf is not None:
+                _draw_hint(out, surf.hint(surface_aspect))
             if table is not None:
                 draw_table_area(out, table.points)
             elif table_points and message:
@@ -822,24 +1020,34 @@ def run(source: LiveSource, calib_path: Path) -> None:
                 _log("pencere kapatildi")
                 break          # pencere X düğmesiyle kapatıldı
             if key == KEY_CALIB:
-                session, tap, table = GuidedCalibration(), None, None
+                session, tap, table, surf = GuidedCalibration(), None, None, None
                 message = ""
                 _log("c: kalibrasyon basladi")
             elif key == KEY_PINCH:
-                session, tap, table = GuidedCalibration(pinch=True), None, None
+                session, tap, table, surf = GuidedCalibration(pinch=True), None, None, None
                 message = ""
                 _log("p: el + pinch kalibrasyonu basladi")
+            elif key == KEY_NEXT and surf is not None:
+                surf.start()
+                _log(f"bosluk: kose {surf.index + 1} -> {surf.phase}")
             elif key == KEY_NEXT and isinstance(session, GuidedCalibration):
                 session.start()
                 _log(f"bosluk: adim {session.current_step} -> {session.phase}")
+            elif key == KEY_REDO and surf is not None:
+                surf.redo()
+                _log(f"g: kose {surf.index + 1} tekrar")
             elif key == KEY_TAP:
-                tap, session, table = TapSession(), None, None
+                tap, session, table, surf = TapSession(), None, None, None
                 message = ""
                 _log("t: tap kalibrasyonu basladi")
             elif key == KEY_TABLE:
-                table, session, tap = TableSession(), None, None
+                table, session, tap, surf = TableSession(), None, None, None
                 message = ""
                 _log("m: masa kalibrasyonu basladi")
+            elif key == KEY_SURFACE:
+                surf, session, tap, table = SurfaceSession(), None, None, None
+                message = ""
+                _log(f"s: alan kalibrasyonu basladi ({_aspect_text(surface_aspect)})")
             elif key not in (255, -1):
                 _log(f"tus: {key!r} ({chr(key) if 32 <= key < 127 else '?'})")
     finally:
@@ -877,6 +1085,25 @@ def _finish_calibration(session: CalibrationSession | GuidedCalibration, source:
                                  table=calib.table, pinch_ref=pinch_ref)
     err = _apply(source, result, calib_path)
     return err or "Kaydedildi ve uygulandi", t + MESSAGE_SECONDS, result
+
+
+def _finish_surface(surf: SurfaceSession, source: LiveSource,
+                    surface: SurfaceCalibration | None, surface_path: Path, aspect: float,
+                    t: float) -> tuple[str, float, SurfaceCalibration | None]:
+    """4 köşeden yüzey kalibrasyonu kurar, uygular ve kaydeder; (mesaj, bitiş, geçerli alan)."""
+    until = t + MESSAGE_SECONDS
+    try:
+        result = surf.result(aspect=aspect, image_aspect=_source_aspect(source))
+    except ValueError as e:
+        return f"Alan kalibrasyonu basarisiz: {e}"[:90], until, surface
+    set_surface = getattr(source, "set_surface", None)
+    if set_surface is not None:
+        set_surface(result)
+    try:
+        calibration.save(result, surface_path)
+    except OSError as e:
+        return f"Alan uygulandi ama kayit hatasi: {e}"[:90], until, result
+    return f"Alan kaydedildi ve uygulandi ({_aspect_text(aspect)})", until, result
 
 
 def _source_aspect(source: LiveSource) -> float:
@@ -927,7 +1154,13 @@ def main(argv: list[str] | None = None) -> None:
     cfg = load_vision_config(args.config)
     calib_path = Path(cfg["hand"]["calibration"]).expanduser()
     source = open_live_source(args.config)
-    run(source, calib_path)
+    surface_cfg = cfg.get("surface")
+    if surface_cfg is None:
+        run(source, calib_path)
+    else:
+        run(source, calib_path,
+            surface_path=Path(surface_cfg.get("file", calibration.DEFAULT_PATH)).expanduser(),
+            surface_aspect=float(surface_cfg.get("aspect", calibration.DEFAULT_ASPECT)))
 
 
 if __name__ == "__main__":
