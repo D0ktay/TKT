@@ -19,9 +19,6 @@ from pathlib import Path
 
 from tkt.core.types import FINGERS
 
-EDGE = 0.30                 # öğretilen aralık uca bu kadar yakınsa o yanı sınırsız sayılır
-
-
 OPEN_FINGERS = ("index", "middle")
 CLOSED_FINGERS = ("ring", "pinky")
 
@@ -29,16 +26,21 @@ CLOSED_FINGERS = ("ring", "pinky")
 def learn_ranges(samples, margin):
     """Kıvrım örneklerinden ({parmak: kıvrım} listesi) parmak başına kabul aralığı.
 
-    Aralık, örneklerin %10–%90 dilimi ± `margin`dir. Dilim 0'a ya da 1'e `EDGE` kadar
-    yakınsa o yan sınırsızdır (dümdüz parmak daha da düz, sıkı yumruk daha da sıkı olabilir).
+    Parmaklar işaretin kendi ortasına göre "düz" ve "kıvrık" diye ayrılır (orta: en düz ve en
+    kıvrık parmağın ortancalarının ortası). Düz parmak için yalnız üst sınır (%90 + `margin`),
+    kıvrık parmak için yalnız alt sınır (%10 − `margin`) konur: daha düz ya da daha kıvrık
+    tutmak işareti bozmaz. İki yanlı aralık canlıda dardı: kalibrasyonda serçe 0,56 ölçüldü
+    (üst sınır 0,73), aynı kullanıcının önceki işaretlerinde 0,72–0,94'tü (2026-11-22).
     """
+    mids = {n: statistics.median(s[n] for s in samples) for n in FINGERS}
+    middle = (min(mids.values()) + max(mids.values())) / 2
     out = {}
     for name in FINGERS:
-        values = sorted(s[name] for s in samples)
-        deciles = statistics.quantiles(values, n=10)
-        lo, hi = deciles[0], deciles[-1]
-        out[name] = (-math.inf if lo <= EDGE else lo - margin,
-                     math.inf if hi >= 1 - EDGE else hi + margin)
+        deciles = statistics.quantiles(sorted(s[name] for s in samples), n=10)
+        if mids[name] >= middle:
+            out[name] = (deciles[0] - margin, math.inf)
+        else:
+            out[name] = (-math.inf, deciles[-1] + margin)
     return out
 
 

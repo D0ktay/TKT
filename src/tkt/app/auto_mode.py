@@ -527,7 +527,11 @@ def run_cv_ui(show=None, poll_key=None, window_open=None, worker_target=None):
 
 def main():
     global backend, gate
+    import faulthandler
+
     from tkt.app.main import _set_dpi_awareness
+
+    faulthandler.enable()                 # yerel çökme (abort / segfault) olursa yığın kayda düşsün
 
     _set_dpi_awareness()                  # Windows: ölçekli ekranda imleç kaymasın
     backend = make_backend()

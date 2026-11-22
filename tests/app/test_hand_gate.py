@@ -126,15 +126,15 @@ def test_taught_sign_replaces_fixed_thresholds(tmp_path):
         assert flips == []
 
 
-def test_learn_ranges_open_ended_at_extremes():
-    samples = [{"index": 0.02 + i * 0.001, "middle": 0.5, "ring": 0.95, "pinky": 0.4 + i * 0.01}
+def test_learn_ranges_one_sided_per_finger():
+    samples = [{"index": 0.02 + i * 0.001, "middle": 0.0, "ring": 0.66, "pinky": 0.5 + i * 0.01}
                for i in range(20)]
-    r = learn_ranges(samples, 0.1)
-    assert r["index"][0] == -math.inf
-    assert r["index"][1] == pytest.approx(0.02 + 0.0179 + 0.1, abs=0.01)
-    assert r["middle"] == (pytest.approx(0.4), pytest.approx(0.6))
-    assert r["ring"][1] == math.inf
-    assert r["pinky"][0] < 0.4 < 0.59 < r["pinky"][1]
+    r = learn_ranges(samples, 0.15)
+    # Düz parmaklar: yalnız üst sınır. Kıvrık parmaklar: yalnız alt sınır.
+    assert r["index"][0] == -math.inf and r["index"][1] == pytest.approx(0.19, abs=0.01)
+    assert r["middle"] == (-math.inf, pytest.approx(0.15))
+    assert r["ring"] == (pytest.approx(0.51), math.inf)
+    assert r["pinky"][1] == math.inf and r["pinky"][0] == pytest.approx(0.36, abs=0.01)
 
 
 def test_corrupt_sign_file_falls_back(tmp_path):
