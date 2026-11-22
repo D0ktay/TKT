@@ -7,9 +7,13 @@ Kamera seçimi: config `[camera]` içinde `index` sabittir; `name` (alt dize) do
 adlarından eşleşen ilk index kullanılır, `kind` (any | rgb | ir) ad bulunamazsa yoklamayla
 seçer (bkz. `resolve_camera`). Ad listesi:
 - Windows: DirectShow (ICreateDevEnum, ctypes + COM); sıra OpenCV DSHOW index'iyle aynıdır.
-- macOS: `ffmpeg -f avfoundation -list_devices` (ffmpeg PATH'teyse). Bu sıranın OpenCV
-  AVFoundation index'iyle aynı olması garanti DEĞİLDİR (ölçümde ffmpeg sırası çalıştırmalar
-  arasında değişti); doğrulanmamıştır. macOS'ta güvenilir yol `kind` yoklamasıdır.
+- macOS: `system_profiler SPCameraDataType -json`; adlar aygıtın benzersiz kimliğine
+  (unique ID) göre sıralanır, çünkü OpenCV AVFoundation index'i bu sıradır. Ölçüm
+  (2026-11-22, FaceTime + LVNext + iPhone): index 0 = LVNext (0x1000…, 1080p verdi),
+  1 = FaceTime (0x8020…, en çok 720p), 2 = iPhone (1535…). Kimlik USB girişine bağlıdır:
+  kamera başka girişe takılınca index değişir. system_profiler yoksa
+  `ffmpeg -f avfoundation -list_devices` kullanılır; onun sırası OpenCV index'iyle aynı
+  DEĞİLDİR (aynı ölçümde LVNext ffmpeg'de 1, OpenCV'de 0'dı).
 - Diğer: ad listesi yok; yalnızca `kind` yoklaması ve `index`.
 
 CLI: python -m tkt.vision.camera --probe
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import logging
 import re
 import shutil
@@ -407,11 +412,43 @@ def parse_avfoundation_list(text: str) -> list[str]:
     return [names.get(i, "") for i in range(max(names) + 1)]
 
 
-def avfoundation_device_names(run=subprocess.run, which=shutil.which) -> list[str] | None:
-    """ffmpeg PATH'teyse AVFoundation video aygıt adları; yoksa/başarısızsa None.
+def parse_system_profiler_cameras(text: str) -> list[str]:
+    """`system_profiler SPCameraDataType -json` çıktısından OpenCV index sırasıyla adlar.
 
-    Sıra OpenCV AVFoundation index'iyle aynı olmayabilir (doğrulanmadı); modül notuna bakın.
+    OpenCV (AVFoundation) aygıtları benzersiz kimliklerine göre sıralar; aynı sıra kurulur.
     """
+    try:
+        items = json.loads(text).get("SPCameraDataType", [])
+        pairs = sorted((str(d.get("spcamera_unique-id", "")), str(d.get("_name", "")))
+                       for d in items)
+    except (ValueError, AttributeError, TypeError):
+        return []
+    return [name for _, name in pairs]
+
+
+def system_profiler_device_names(run=subprocess.run, which=shutil.which) -> list[str] | None:
+    """macOS kamera adları, OpenCV index sırasıyla; alınamazsa None."""
+    exe = which("system_profiler")
+    if not exe:
+        return None
+    try:
+        proc = run([exe, "SPCameraDataType", "-json"], capture_output=True, text=True,
+                   timeout=_NAME_LIST_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("system_profiler kamera listesi alınamadı: %s", exc)
+        return None
+    return parse_system_profiler_cameras(proc.stdout or "") or None
+
+
+def avfoundation_device_names(run=subprocess.run, which=shutil.which) -> list[str] | None:
+    """AVFoundation video aygıt adları; alınamazsa None.
+
+    Önce `system_profiler` (OpenCV index sırasıyla), o yoksa ffmpeg (sırası OpenCV'yle aynı
+    olmayabilir; modül notuna bakın).
+    """
+    names = system_profiler_device_names(run=run, which=which)
+    if names:
+        return names
     exe = which("ffmpeg")
     if not exe:
         return None

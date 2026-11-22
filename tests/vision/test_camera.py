@@ -587,9 +587,36 @@ def test_avfoundation_device_names_runs_ffmpeg_and_reads_stderr():
 
     names = cam_mod.avfoundation_device_names(run=run, which=lambda n: "/usr/bin/ffmpeg")
     assert names[0] == "LVNext CPD Camera"
-    cmd, kw = calls[0]
+    assert calls[0][0][0].endswith("ffmpeg") and "SPCameraDataType" in calls[0][0]
+    cmd, kw = calls[-1]             # önce system_profiler denendi (çıktısı boş), sonra ffmpeg
     assert cmd[0] == "/usr/bin/ffmpeg" and "avfoundation" in cmd and "-list_devices" in cmd
     assert kw["timeout"] == cam_mod._NAME_LIST_TIMEOUT_S
+
+
+SP_OUT = """{"SPCameraDataType": [
+ {"_name": "FaceTime HD Camera (Built-in)", "spcamera_unique-id": "0x8020000005ac8514"},
+ {"_name": "LVNext Camera", "spcamera_unique-id": "0x100000046d094f"},
+ {"_name": "Oktay  Camera", "spcamera_unique-id": "1535E9B0-CC8C-4A0D-8564-4B6000000001"}]}"""
+
+
+def test_system_profiler_names_are_in_opencv_order():
+    # OpenCV aygıtları benzersiz kimliğe göre sıralar: LVNext (0x10…) FaceTime'dan (0x80…) önce.
+    assert cam_mod.parse_system_profiler_cameras(SP_OUT) == [
+        "LVNext Camera", "FaceTime HD Camera (Built-in)", "Oktay  Camera"]
+    assert cam_mod.parse_system_profiler_cameras("bozuk") == []
+    assert cam_mod.parse_system_profiler_cameras("{}") == []
+
+
+def test_avfoundation_device_names_prefers_system_profiler():
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=SP_OUT, stderr="")
+
+    names = cam_mod.avfoundation_device_names(run=run, which=lambda n: f"/usr/sbin/{n}")
+    assert cam_mod.match_device_name(names, "LVNext") == 0
+    assert calls == [["/usr/sbin/system_profiler", "SPCameraDataType", "-json"]]
 
 
 def test_avfoundation_device_names_none_without_ffmpeg_or_on_failure():
