@@ -12,11 +12,17 @@ Tüm sistemde pinch ile gerçek imleç: hareket, tık (hedef yardımlı), sürü
 - 2 sn sabit pinch = sağ tık. Yumruk = imleç durur.
 - Başparmak-orta parmak tutulurken el hareketi = kaydırma (doğal yön).
 - Esc: çıkış (basılı tuşlar bırakılır).
+
+HUD penceresi ("TKT HUD"): kamera görüntüsü, iskelet, o anki hareket ve son eylemler listesi.
+A modunda masadaki aktif alan (`[surface].file`, debug penceresinde `s` ile çizilir) da
+gösterilir; parmak ucu alanın içindeyse yeşil, dışındaysa kırmızı. Pencereyi kapatmak yalnızca
+gizler; çıkış Esc.
 """
 import math
 import threading
 import time
 import tomllib
+from collections import deque
 from pathlib import Path
 
 import AppKit as K
@@ -25,9 +31,14 @@ import cv2
 import Quartz
 from Foundation import NSObject, NSTimer
 
+from tkt.app.hud import ActionTap
+from tkt.app.hud import draw as hud_draw
+from tkt.app.hud import status as hud_status
 from tkt.control.gestures import GestureEngine
 from tkt.control.os_input.dry_backend import DryBackend
 from tkt.control.os_input.macos import MacBackend
+from tkt.vision import calibration
+from tkt.vision.debug_view import draw_surface
 from tkt.vision.live_source import open_live_source
 
 CLICK_DEBOUNCE_S = 0.15     # bundan kısa arayla gelen ikinci tık pinch titremesidir
@@ -44,10 +55,23 @@ state_since = [0.0]           # imlecin yanında gösterilen motor durumu
 scrolled = [0.0]           # 2 sn içindeki toplam kaydırma (piksel)
 ax_max = [0.0]             # hedef aramanın 2 sn içindeki en uzun süresi
 mac = MacBackend()
+HUD_EVERY_S = 1 / 15       # HUD görüntüsünün yenilenme aralığı
+HUD_H = 400                # HUD'daki kamera görüntüsünün yüksekliği (piksel)
+HUD_PANEL_W = 320          # sağdaki eylem listesi genişliği
+HUD_HISTORY = 12           # listede tutulan eylem sayısı
+hud_img = [None, 0]        # [son HUD görüntüsü (BGR), sıra no] — iz thread'i yazar, Tick okur
+history = deque(maxlen=HUD_HISTORY)   # (zaman, metin)
+shown_seq = [-1]           # pencereye en son konan HUD görüntüsünün sıra no'su
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+def act(msg):
+    """Eylemi hem kayda yazar hem HUD'daki listeye ekler."""
+    log(msg)
+    history.append((time.monotonic(), msg))
 
 
 def cursor():
@@ -55,11 +79,11 @@ def cursor():
     return loc.x, loc.y
 
 
-def click_at(cx, cy):
+def click_at(out, cx, cy):
     Quartz.CGWarpMouseCursorPosition((cx, cy))
     Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-    mac.button("left", True)
-    mac.button("left", False)
+    out.button("left", True)
+    out.button("left", False)
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -67,6 +91,17 @@ FACE_MODEL = str(REPO / "models/blaze_face_short_range.tflite")
 FACE_SCORE = 0.7            # bu güvenin üstünde yüz = kamera kullanıcıya bakıyor
 FACE_EVERY_S = 1.0          # yüz kontrolü aralığı
 SWITCH_AFTER = 3            # art arda bu kadar aynı karar gelince mod değişir
+
+
+def load_surface(vcfg_path):
+    """Vision config'deki aktif alan dosyası (yalnız HUD'da çizmek için; `enabled`a bakmaz)."""
+    surface_cfg = tomllib.loads(Path(vcfg_path).read_text()).get("surface", {})
+    path = Path(surface_cfg.get("file", calibration.DEFAULT_PATH)).expanduser()
+    try:
+        return calibration.load(path)
+    except Exception as e:     # bozuk dosya HUD'u durdurmasın
+        log(f"aktif alan okunamadi ({path}): {e}")
+        return None
 
 
 def profile(name):
@@ -117,23 +152,30 @@ def track():
         mode_txt[0] = (
             "MOD A: masa (basparmak tik)" if mode_name == "A"
             else "MOD C: pinch (kamera sana bakiyor)")
-        log(f"mod: {mode_name}")
+        surface = load_surface(vcfg) if mode_name == "A" else None
+        act(f"MOD {mode_name}: {Path(vcfg).name}"
+            + ("" if mode_name == "C" else ", alan var" if surface else ", alan yok"))
         s = open_live_source(vcfg)
-        switch_to = run_mode(s, cfg, mirror, assist, face_score, mode_name)
+        switch_to = run_mode(s, cfg, mirror, assist, face_score, mode_name, surface)
         s.close()
         if switch_to is None:
             break
-        log(f"mod degisiyor: {mode_name} -> {switch_to}")
+        act(f"mod degisiyor: {mode_name} -> {switch_to}")
         mode_name = switch_to
     mac.release_all()
 
 
-def run_mode(s, cfg, mirror, assist, face_score, mode_name):
+def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None):
     """Bir modu çalıştırır; mod değişecekse yeni modun adını, çıkışta None döner."""
     global present
     sx = -1 if mirror else 1
     dry = DryBackend()
     eng = GestureEngine(cfg, dry, s.info)
+    out = ActionTap(mac, time.monotonic)      # gerçek imleç + HUD için son eylem
+    conf_min = cfg["general"]["confidence_min"]
+    hud_t = 0.0
+    scroll_sum = [0.0, 0.0]
+    prev_state = ""
     pin = cfg.get("index_pinch", {})
     locked = None
     was_closed = False
@@ -142,7 +184,7 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name):
     face_t, votes = 0.0, []
     s_rotated = mode_name == "A"          # A profili görüntüyü 180° döndürüyor
     try:
-        for f, _hand, img in s.frames_raw():
+        for f, hand, img in s.frames_raw():
             if stop.is_set():
                 return None
             now = time.monotonic()
@@ -166,6 +208,13 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name):
             eng.process(f)
             present = f.present
             update_state(eng, f)
+            if state_txt[0] != prev_state:
+                if prev_state == "KAYDIRMA":
+                    act(f"KAYDIRMA bitti (dikey {scroll_sum[1]:+.0f}, yatay {scroll_sum[0]:+.0f})")
+                elif state_txt[0] == "KAYDIRMA":
+                    scroll_sum = [0.0, 0.0]
+                    act("KAYDIRMA basladi")
+                prev_state = state_txt[0]
             dist = (f.pinch or {}).get("index") if (f.present and pin) else None
             closed = dist is not None and dist <= pin["closed"]
             if closed and not was_closed:
@@ -177,7 +226,7 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name):
                 v = evs[i]
                 if v.kind == "move":
                     dx, dy = v.args
-                    mac.move_rel(sx * dx, dy)
+                    out.move_rel(sx * dx, dy)
                 elif v.kind == "button":
                     name, down = v.args
                     nxt = evs[i + 1] if i + 1 < len(evs) else None
@@ -185,27 +234,38 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name):
                             and nxt.args == ("left", False)):
                         t = time.monotonic()
                         if t - last_click < CLICK_DEBOUNCE_S:
-                            log("tik yok sayildi (titreme)")
+                            act("tik yok sayildi (titreme)")
                         elif locked is not None and selected == locked:
                             (a, b, w, h), _el = locked
-                            click_at(a + w / 2, b + h / 2)
-                            log("tik (hedef)")
+                            click_at(out, a + w / 2, b + h / 2)
+                            act("SOL TIK (hedef)")
                         else:
-                            mac.button("left", True)
-                            mac.button("left", False)
-                            log("tik (imlec)")
+                            out.button("left", True)
+                            out.button("left", False)
+                            act("SOL TIK")
                         last_click = t
                         locked = None
                         i += 2
                         continue
-                    mac.button(name, down)
-                    log(f"tus {name} {'bas' if down else 'birak'}")
+                    out.button(name, down)
+                    if down:
+                        log(f"tus {name} bas")
+                    else:     # ActionTap kısa basışı TIK, uzunu SURUKLEME/BIRAKILDI sayar
+                        act(out.action.replace("SOL TUS BIRAKILDI", "SURUKLEME bitti"))
                 elif v.kind == "scroll":
                     sdx, sdy = v.args
-                    mac.scroll(sx * sdx, sdy)
+                    out.scroll(sx * sdx, sdy)
+                    scroll_sum[0] += sx * sdx
+                    scroll_sum[1] += sdy
                 elif v.kind == "system":
-                    mac.system_action(*v.args)
+                    out.system_action(*v.args)
+                    act(out.action)
                 i += 1
+            if now - hud_t >= HUD_EVERY_S:
+                hud_t = now
+                st = hud_status(f, eng, out, now, conf_min, False)
+                hud_img[0] = render_hud(img, hand, f, st, mode_name, surface)
+                hud_img[1] += 1
     finally:
         eng.release()
         for v in dry.events:
@@ -213,6 +273,38 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name):
                 mac.button(v.args[0], False)
         mac.release_all()
     return None
+
+
+def render_hud(img, hand, f, st, mode_name, surface):
+    """Kamera görüntüsü + iskelet + durum (hud.draw), A'da aktif alan, sağda eylem listesi."""
+    import numpy as np
+    h, w = img.shape[:2]
+    small = cv2.resize(img, (round(w * HUD_H / h), HUD_H), interpolation=cv2.INTER_AREA)
+    view = hud_draw(small, hand, st)
+    if surface is not None:
+        index = f.fingers.get("index") if f.present else None
+        draw_surface(view, surface, None if index is None else index.img)
+    panel = np.zeros((HUD_H, HUD_PANEL_W, 3), np.uint8)
+    title = "MOD A: masa" if mode_name == "A" else "MOD C: pinch (yuz)"
+    cv2.putText(panel, title, (12, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (40, 150, 250), 2,
+                cv2.LINE_AA)
+    if mode_name == "A":
+        note = "alan: yesil ic / kirmizi dis" if surface else "alan yok (debug'da s)"
+        cv2.putText(panel, note, (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1,
+                    cv2.LINE_AA)
+    cv2.putText(panel, "son eylemler", (12, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (150, 150, 150), 1, cv2.LINE_AA)
+    now = time.monotonic()
+    y = 114
+    for t, msg in reversed(list(history)):
+        age = now - t
+        c = (60, 220, 240) if age < 1.0 else (255, 255, 255) if age < 10 else (150, 150, 150)
+        txt = f"{age:4.0f}s  {msg}".encode("ascii", "replace").decode("ascii")
+        cv2.putText(panel, txt[:34], (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, c, 1, cv2.LINE_AA)
+        y += 24
+        if y > HUD_H - 8:
+            break
+    return np.hstack([view, panel])
 
 
 def update_state(eng, f):
@@ -325,6 +417,34 @@ class Tick(NSObject):
             K.NSApp.terminate_(None)
             return
         view.setNeedsDisplay_(True)
+        img, seq = hud_img
+        if img is not None and seq != shown_seq[0]:
+            shown_seq[0] = seq
+            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                data = K.NSData.dataWithBytes_length_(buf.tobytes(), len(buf))
+                hud_view.setImage_(K.NSImage.alloc().initWithData_(data))
+
+
+def make_hud_window():
+    """Sağ üstte, taşınabilir ve boyutlanabilir "TKT HUD" penceresi; kapatınca gizlenir."""
+    global hud_view
+    w, h = 533 + HUD_PANEL_W, HUD_H
+    frame = ((screen.origin.x + screen.size.width - w - 20,
+              screen.origin.y + screen.size.height - h - 60), (w, h))
+    style = (K.NSWindowStyleMaskTitled | K.NSWindowStyleMaskClosable
+             | K.NSWindowStyleMaskMiniaturizable | K.NSWindowStyleMaskResizable)
+    win = K.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        frame, style, K.NSBackingStoreBuffered, False)
+    win.setTitle_("TKT HUD")
+    win.setReleasedWhenClosed_(False)
+    win.setLevel_(K.NSFloatingWindowLevel)
+    hud_view = K.NSImageView.alloc().initWithFrame_(((0, 0), (w, h)))
+    hud_view.setImageScaling_(K.NSImageScaleProportionallyUpOrDown)
+    hud_view.setAutoresizingMask_(K.NSViewWidthSizable | K.NSViewHeightSizable)
+    win.setContentView_(hud_view)
+    win.orderFrontRegardless()
+    return win
 
 
 def main():
@@ -341,10 +461,11 @@ def main():
     view = Canvas.alloc().initWithFrame_(((0, 0), screen.size))
     win.setContentView_(view)
     win.orderFrontRegardless()
+    hud_win = make_hud_window()
     tick = Tick.alloc().init()
     timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.06, tick, "update:", None, True)
-    main.keep = (win, tick, timer)      # pyobjc nesneleri çöp toplamaya gitmesin
+    main.keep = (win, hud_win, tick, timer)      # pyobjc nesneleri çöp toplamaya gitmesin
     threading.Thread(target=track, daemon=True).start()
     threading.Thread(target=find_targets, daemon=True).start()
     log("hazir: otomatik mod (yuz var -> C, yok -> A), Esc ile cikis")
