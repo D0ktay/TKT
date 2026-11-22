@@ -660,3 +660,118 @@ def test_low_confidence_pointer_pose_still_counts_as_missing(rig):
     pointer.update.assert_not_called()
     engine.process(pose(0.5, "pinky", confidence=0.0))      # imleç modu kilitli: dikte değil
     assert engine.mode is not Mode.DICTATE
+
+
+@pytest.fixture
+def pinch_rig():
+    cfg = load_control_config()
+    cfg["general"]["click_method"] = "pinch"
+    backend = DryBackend()
+    return GestureEngine(cfg, backend, SyntheticSource().info), backend
+
+
+def test_pinch_dry_run(pinch_rig):
+    engine, backend = pinch_rig
+    source = (
+        SyntheticSource().open(4).pinch(None)
+        .pinch("index").pinch(None).pinch("index").pinch(None)
+        .pinch("index").move(0.001, 0, 0.1).move(0.04, 0, 0.2).pinch(None)
+        .pinch("middle").pinch(None)
+        .pinch("middle").move(0, 0.05, 0.2).pinch(None)
+    )
+    for frame in source.frames():
+        backend.set_time(frame.t)
+        engine.process(frame)
+    buttons = [e for e in backend.events if e.kind == "button"]
+    assert [e.args for e in buttons] == [
+        *[("left", True), ("left", False)] * 3, ("right", True), ("right", False),
+    ]
+    moves = [e for e in backend.events if e.kind == "move"]
+    assert moves and all(buttons[4].t + 0.15 < e.t < buttons[5].t for e in moves)
+    assert any(e.kind == "scroll" and e.t > buttons[-1].t for e in backend.events)
+
+
+@pytest.mark.parametrize("other", ["middle", "ring", "pinky"])
+def test_pinch_margin_and_finger_lock(pinch_rig, other):
+    engine, backend = pinch_rig
+    for t, distances in [
+        (0, {}), (0.02, {"index": 0.1, other: 0.2}), (0.07, {"index": 0.1, other: 0.2}),
+        (0.1, {"index": 0.1}), (0.11, {}),  # short contact
+        (0.14, {"index": 0.1}), (0.18, {"index": 0.1}),
+        (0.21, {"index": 0.35, other: 0}), (0.25, {other: 0}),
+        (0.27, {"index": 0.2, other: 0}),  # brief release bounces
+        (0.3, {other: 0}), (0.34, {other: 0}), (0.40, {other: 0}),
+        (0.44, {}), (0.50, {}),
+    ]:
+        backend.set_time(t)
+        engine.process(make_frame(t=t, pinch=distances))
+    assert [(e.t, e.args) for e in backend.events] == [
+        (0.18, ("left", True)), (0.34, ("left", False)),
+    ]
+
+
+@pytest.mark.parametrize("owner", ["index", "middle"])
+@pytest.mark.parametrize("interrupt", [
+    {"present": False}, {"confidence": 0}, {"pinch": None}, {"palm": (1.01, 0.5)}, "pause",
+])
+def test_pinch_interruption_requires_open_hand(pinch_rig, owner, interrupt):
+    engine, backend = pinch_rig
+    def feed(t, **kwargs):
+        engine.process(make_frame(t=t, **kwargs))
+
+    feed(0, pinch={})
+    feed(0.02, pinch={owner: 0})
+    feed(0.06, pinch={owner: 0})
+    if interrupt == "pause":
+        engine.release()
+    else:
+        feed(0.08, **({"pinch": {owner: 0}} | interrupt))
+    assert not engine.left_down
+    for t in (0.10, 0.15, 0.20):
+        feed(t, pinch={owner: 0}, palm=(0.95, 0.1))
+    feed(0.25, pinch={}, palm=(0.95, 0.1))
+    expected = [("button", "left", True), ("button", "left", False)] if owner == "index" else []
+    assert backend_events(backend) == expected
+
+
+def test_pinch_fist_carry_and_palm_tracking(pinch_rig):
+    engine, backend = pinch_rig
+    def feed(t, x, curl, index_x, pinch=None):
+        engine.process(make_frame(t=t, palm=(x, 0.5), index_pos=(index_x, 0.4),
+                                  curls=dict.fromkeys(FINGERS, curl), pinch=pinch or {}))
+
+    feed(0, 0.4, 0, 0.3)
+    feed(0.02, 0.4, 0, 0.6)
+    feed(0.04, 0.5, 0.7, 0.6)
+    feed(0.06, 0.8, 0.7, 0.6)
+    feed(0.08, 0.9, 0, 0.6)
+    assert backend.events == []
+    feed(0.10, 0.91, 0, 0.6)
+    assert backend.events[-1].kind == "move"
+    feed(0.12, 0.91, 0, 0.6, {"index": 0})
+    feed(0.16, 0.91, 0, 0.6, {"index": 0})
+    feed(0.18, 0.92, 0.9, 0.6, {"index": 0})
+    assert engine.left_down and backend.events[-1].kind == "move"
+
+
+@pytest.mark.parametrize("inactive", ["ring", "pinky"])
+def test_reserved_pinch_cannot_transfer_to_index(pinch_rig, inactive):
+    engine, backend = pinch_rig
+    for t, distances in [
+        (0, {}), (0.02, {inactive: 0}), (0.06, {inactive: 0}),
+        (0.08, {inactive: 0.35, "index": 0}), (0.12, {"index": 0}),
+        (0.16, {"index": 0}), (0.20, {"index": 0}), (0.25, {}),
+    ]:
+        engine.process(make_frame(t=t, pinch=distances))
+    assert backend.events == []
+
+
+def test_pinch_measurements_do_not_enable_pinch_in_default_config():
+    cfg = load_control_config()
+    assert cfg["general"]["click_method"] == "thumb"
+    backend = DryBackend()
+    source = SyntheticSource().open(1).pinch(None).pinch("index").pinch(None)
+    engine = GestureEngine(cfg, backend, source.info)
+    for frame in source.frames():
+        engine.process(frame)
+    assert backend.events == []

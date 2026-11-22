@@ -1,6 +1,6 @@
 [general]
 panic_hotkey = "<ctrl>+<alt>+p"
-click_method = "thumb"      # thumb | tap | both
+click_method = "thumb"      # thumb | tap | both | pinch
 confidence_min = 0.5
 lost_release_ms = 300
 
@@ -62,3 +62,11 @@ edge_margin = 0.03          # alan kenarından bu kadar dışarısı hâlâ içe
 absolute = false            # true: alan ekrana mutlak eşlenir (yalnız karşılaştırma için)
 screen_w = 1920             # mutlak mod ekran boyutu
 screen_h = 1080
+
+[pinch]
+closed = 0.25
+open = 0.45
+debounce_ms = 30
+margin = 0.15
+drag_threshold = 0.03       # avuç hareketi, el boyu biriminde
+fist_curl = 0.6             # dört parmağın ortalama curl değeri

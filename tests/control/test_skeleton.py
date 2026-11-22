@@ -116,7 +116,8 @@ def test_control_config_sections():
     with (ROOT / "config" / "control.toml").open("rb") as file:
         config = tomllib.load(file)
     assert set(config) == {
-        "general", "mode", "thumb", "pointer", "scroll", "tap", "swipe", "surface_pointer"}
+        "general", "mode", "thumb", "pointer", "scroll", "tap", "swipe", "pinch",
+        "surface_pointer"}
     assert config["surface_pointer"]["enabled"] is False   # deney: varsayılan kapalı
 
 
