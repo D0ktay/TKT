@@ -1,6 +1,7 @@
 """Kişisel el kalibrasyonu (V2). PART2 2.2, 2.4.
 
-`curl`, `thumb_out` ve `lift` ham değerlerini 0–1 aralığına oturtan referanslar.
+`curl`, `thumb_out`, `lift` ve (isteğe bağlı) `pinch` ham değerlerini 0–1 aralığına
+oturtan referanslar.
 """
 
 from __future__ import annotations
@@ -28,6 +29,21 @@ class HandCalibration:
     # Masa modeli: el masadayken avuç uzunluğu ve genişliğinin (log) avuç konumuna göre
     # ikinci derece katsayıları ("length", "width" → 6 sayı). None: kalkış algılama kapalı.
     table: dict[str, list[float]] | None = None
+    # Pinch (Sürüm C, isteğe bağlı): parmak adı → {"img_open", "img_touch", "world_open",
+    # "world_touch"}; `features.pinch_raw` değerleri. None: pinch ölçülmez (frame.pinch None).
+    pinch_ref: dict[str, dict[str, float]] | None = None
+
+
+# Pinch ölçüm kanalları (features.pinch_raw) ve her parmağın referans anahtarları.
+PINCH_CHANNELS: tuple[str, ...] = ("img", "world")
+PINCH_REF_KEYS: tuple[str, ...] = tuple(
+    f"{ch}_{kind}" for ch in PINCH_CHANNELS for kind in ("open", "touch"))
+# Pinch kalibrasyon adımları: başparmak ucu sırayla her parmağın ucuna değer.
+PINCH_STEPS: tuple[str, ...] = ("touch_index", "touch_middle", "touch_ring", "touch_pinky")
+PINCH_STEP_FINGER: dict[str, str] = {
+    "touch_index": "index", "touch_middle": "middle",
+    "touch_ring": "ring", "touch_pinky": "pinky",
+}
 
 
 # Masa modeli: anahtarlar ve terim sayısı (1, x, y, x², y², xy).
@@ -69,7 +85,35 @@ def _from_dict(d: dict) -> HandCalibration:
         tap_ref=None if tap_ref is None else _floats(tap_ref, "tap_ref"),
         angle_sign=float(d.get("angle_sign", 1.0)),
         table=None if table is None else _table(table),
+        pinch_ref=_pinch_ref(d.get("pinch_ref")),
     )
+
+
+def _pinch_ref(d: object) -> dict[str, dict[str, float]] | None:
+    """Dosyadaki pinch referansları; yoksa None (eski kalibrasyon dosyaları)."""
+    if d is None:
+        return None
+    if not isinstance(d, dict):
+        raise ValueError("kalibrasyon: 'pinch_ref' sözlük olmalı")
+    out: dict[str, dict[str, float]] = {}
+    for finger in PINCH_STEP_FINGER.values():
+        r = d.get(finger)
+        if not isinstance(r, dict):
+            raise ValueError(f"kalibrasyon: pinch_ref[{finger!r}] sözlük olmalı")
+        vals: dict[str, float] = {}
+        for key in PINCH_REF_KEYS:
+            v = r.get(key)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"kalibrasyon: pinch_ref[{finger!r}][{key!r}] sayı olmalı")
+            if not math.isfinite(float(v)):
+                raise ValueError(f"kalibrasyon: pinch_ref[{finger!r}][{key!r}] sonlu olmalı")
+            vals[key] = float(v)
+        for ch in PINCH_CHANNELS:
+            if not vals[f"{ch}_open"] > vals[f"{ch}_touch"]:
+                raise ValueError(
+                    f"kalibrasyon: pinch_ref[{finger!r}] {ch}: açık değmeden büyük olmalı")
+        out[finger] = vals
+    return out
 
 
 def _table(d: object) -> dict[str, list[float]]:
@@ -167,6 +211,63 @@ def fit_hand(open_s: list[RawHand], fist_s: list[RawHand],
     )
 
 
+def fit_pinch(open_s: list[RawHand], touch_s: dict[str, list[RawHand]],
+              aspect: float = 1.0) -> dict[str, dict[str, float]]:
+    """Açık el ve parmak başına değme örneklerinden pinch referansları (medyan).
+
+    `open_s`: açık el (başparmak açık) örnekleri; `touch_s[f]`: başparmak ucu `f` parmağının
+    ucuna değerken. Her parmak ve kanal (`PINCH_CHANNELS`) için `features.pinch_raw`
+    medyanları `"<kanal>_open"` ve `"<kanal>_touch"` olur; ölçülemeyen (NaN) örnekler atlanır.
+
+    Şunlarda `ValueError` (kalibrasyon yazılmaz, pinch kapalı kalır):
+    - bir parmak veya kanalda geçerli örnek yok,
+    - açık değer değme değerinden büyük değil,
+    - değme adımında başka bir parmak ölçülebilen tüm kanallarda başparmağa daha yakın
+      (yanlış parmağa değildi).
+    `aspect`: görüntü genişliği / yüksekliği (`build_frame` ile aynı olmalı).
+    """
+    from tkt.vision.features import pinch_raw
+
+    if not open_s:
+        raise ValueError("fit_pinch: açık el örneği yok")
+    fingers = tuple(PINCH_STEP_FINGER.values())
+    open_raw = [{f: pinch_raw(h, f, aspect) for f in fingers} for h in open_s]
+    out: dict[str, dict[str, float]] = {}
+    for finger in fingers:
+        samples = touch_s.get(finger) or []
+        if not samples:
+            raise ValueError(f"fit_pinch: {finger} için değme örneği yok")
+        touch_raw = [{f: pinch_raw(h, f, aspect) for f in fingers} for h in samples]
+        ref: dict[str, float] = {}
+        for ch in PINCH_CHANNELS:
+            o = _finite_median([r[finger][ch] for r in open_raw])
+            t = _finite_median([r[finger][ch] for r in touch_raw])
+            if o is None or t is None:
+                raise ValueError(f"fit_pinch: {finger} {ch} ölçülemedi")
+            if not o > t:
+                raise ValueError(
+                    f"fit_pinch: {finger} {ch}: açık ({o:.3f}) değmeden ({t:.3f}) büyük değil")
+            ref[f"{ch}_open"] = o
+            ref[f"{ch}_touch"] = t
+        # Yanlış parmağa değildiyse başka bir parmak başparmağa daha yakın görünür. Görüntüde
+        # örtüşme olabileceğinden yalnızca ölçülebilen tüm kanallarda daha yakınsa reddedilir.
+        for other in fingers:
+            if other == finger:
+                continue
+            closer = [d < ref[f"{ch}_touch"] for ch in PINCH_CHANNELS
+                      if (d := _finite_median([r[other][ch] for r in touch_raw])) is not None]
+            if closer and all(closer):
+                raise ValueError(
+                    f"fit_pinch: {finger} adımında başparmak {other} parmağına daha yakın")
+        out[finger] = ref
+    return out
+
+
+def _finite_median(values: list[float]) -> float | None:
+    ok = [v for v in values if math.isfinite(v)]
+    return _median(ok) if ok else None
+
+
 def fit_table(samples: list[RawHand], aspect: float = 1.0) -> dict[str, list[float]]:
     """El masada gezinirken toplanan örneklerden masa modeli (en küçük kareler).
 
@@ -190,7 +291,8 @@ def fit_table(samples: list[RawHand], aspect: float = 1.0) -> dict[str, list[flo
     return out
 
 
-# Kalibrasyon adımları sırayla: açık el, yumruk, başparmak kapalı.
+# Kalibrasyon adımları sırayla: açık el, yumruk, başparmak kapalı. Pinch kalibrasyonu
+# (isteğe bağlı) bunların ardına `PINCH_STEPS` ekler.
 STEPS: tuple[str, ...] = ("open", "fist", "thumb_closed")
 # Her adımın varsayılan süresi (saniye).
 STEP_SECONDS = 2.0
