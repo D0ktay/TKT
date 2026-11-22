@@ -23,3 +23,8 @@ w_angle = 1.0
 w_length = 1.0
 baseline_s = 1.0
 curl_rate_suppress = 3.0  # 1/sn; curl bundan hızlı artıyorsa lift bastırılır
+
+[surface]                 # aktif alan (deney): masadaki 4 köşeli alan -> Finger.surface (u, v)
+enabled = false           # true: dosya varsa her karede parmak uçlarına (u, v) yazılır
+file = "~/.tkt/surface.json"  # debug penceresinde `s` ile oluşturulur
+aspect = 1.5              # alanın genişlik / yüksekliği (30x20 cm); control.toml [surface_pointer] aspect ile aynı olmalı

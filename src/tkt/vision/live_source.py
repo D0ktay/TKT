@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import threading
@@ -17,7 +18,8 @@ from pathlib import Path
 import numpy as np
 
 from tkt.core.types import SCHEMA_VERSION, HandFrame, SourceInfo
-from tkt.vision import features, hand_calib
+from tkt.vision import calibration, features, hand_calib
+from tkt.vision.calibration import SurfaceCalibration
 from tkt.vision.camera import Camera, CapturedFrame, format_choice, resolve_camera
 from tkt.vision.hand_calib import HandCalibration
 from tkt.vision.lift import LiftEstimator
@@ -66,6 +68,8 @@ class LiveSource:
         # lift_cfg yoksa kurulumda verilen tahmincinin ayarları kullanılır.
         self._lift_settings = _lift_settings(lift)
         self._calib_lock = threading.Lock()
+        # Aktif alan (yüzey) kalibrasyonu; None: kapalı, `surface` alanları None kalır.
+        self._surface: SurfaceCalibration | None = None
         self._closed = False
         self._proc_times: deque[float] = deque()
         self.last_process_ms: float = 0.0   # son karenin takip + özellik süresi
@@ -122,6 +126,19 @@ class LiveSource:
             self._calib = calib
             self._lift = lift
 
+    @property
+    def surface(self) -> SurfaceCalibration | None:
+        """Geçerli yüzey kalibrasyonu (None: kapalı)."""
+        return self._surface
+
+    def set_surface(self, surface: SurfaceCalibration | None) -> None:
+        """Sonraki karelerden itibaren parmak uçlarının `surface` alanını doldurur.
+
+        None verilirse kapanır (`surface` alanları None). Başka thread'den çağrılabilir.
+        """
+        with self._calib_lock:
+            self._surface = surface
+
     # ------------------------------------------------------------------ akış
 
     def frames(self) -> Iterator[HandFrame]:
@@ -141,7 +158,7 @@ class LiveSource:
 
             t0 = time.perf_counter()
             with self._calib_lock:      # kare boyunca aynı kalibrasyon + lift çifti
-                calib, lift_est = self._calib, self._lift
+                calib, lift_est, surface = self._calib, self._lift, self._surface
             hand = self._tracker.process(cap.image, cap.t)
             if hand is None and lift_est is not None:
                 lift_est.reset()
@@ -154,6 +171,8 @@ class LiveSource:
                     hand, cap.t, cap.frame_id, calib, self.info,
                     lift=lift_est.update(hand, cap.t, curls), prev_hand_size=prev_size,
                     lift_off=self.lift_off)
+            if surface is not None and frame.present:
+                frame = with_surface(frame, surface)
             done = time.perf_counter()
             self.last_process_ms = (done - t0) * 1000.0
             self._proc_times.append(time.monotonic())
@@ -171,6 +190,15 @@ class LiveSource:
         self._tracker.close()
 
 
+def with_surface(frame: HandFrame, surface: SurfaceCalibration) -> HandFrame:
+    """Karenin parmak uçlarına alan koordinatını (u, v) yazar (yeni kare döner)."""
+    fingers = {
+        name: dataclasses.replace(f, surface=surface.to_surface(f.img))
+        for name, f in frame.fingers.items()
+    }
+    return dataclasses.replace(frame, fingers=fingers)
+
+
 # ---------------------------------------------------------------------- yapılandırma
 
 
@@ -183,6 +211,21 @@ def _lift_off(hand_cfg: Mapping) -> float | None:
     if not (math.isfinite(v) and v > 0):
         raise ValueError(f"hand.lift_off pozitif olmalı: {v!r}")
     return v
+
+
+def _load_surface(surface_cfg: Mapping) -> SurfaceCalibration | None:
+    """Config `[surface]`: `enabled` ve dosya varsa yüzey kalibrasyonu, yoksa None."""
+    if not surface_cfg.get("enabled", False):
+        return None
+    path = Path(surface_cfg.get("file", calibration.DEFAULT_PATH)).expanduser()
+    try:
+        surface = calibration.load(path)
+    except ValueError as e:
+        log.warning("yüzey kalibrasyonu okunamadı, kapalı: %s", e)
+        return None
+    if surface is None:
+        log.warning("yüzey açık ama kalibrasyon dosyası yok: %s (debug penceresinde s)", path)
+    return surface
 
 
 def load_vision_config(path: str | Path) -> dict:
@@ -213,6 +256,7 @@ def open_live_source(config_path: str | Path = "config/vision.toml") -> LiveSour
         source = LiveSource(camera, tracker, calib, hand_cfg["side"], lift)
         source.lift_cfg = cfg["lift"]
         source.lift_off = _lift_off(hand_cfg)
+        source.set_surface(_load_surface(cfg.get("surface", {})))
         return source
     except BaseException:
         # Kurulum yarıda kaldı: sahiplik henüz kimseye geçmedi, açılanları kapat.

@@ -449,3 +449,81 @@ def test_lift_off_config():
     assert ls._lift_off({"lift_off": 0.25}) == 0.25
     with pytest.raises(ValueError):
         ls._lift_off({"lift_off": 0})
+
+
+# ---------------------------------------------------------------- aktif alan (yüzey)
+
+SURFACE_CORNERS = ((0.35, 0.20), (0.65, 0.20), (0.85, 0.80), (0.15, 0.80))
+
+
+def _surface():
+    from tkt.vision.calibration import SurfaceCalibration
+    return SurfaceCalibration(SURFACE_CORNERS, image_aspect=512 / 640)
+
+
+def test_surface_off_leaves_none():
+    src = LiveSource(FakeCamera(n=3), FakeTracker([True, False, True]), DEFAULT, "right")
+    assert src.surface is None
+    frames = list(src.frames())
+    assert all(f.surface is None for fr in frames for f in fr.fingers.values())
+
+
+def test_surface_on_fills_fingers_and_can_be_turned_off():
+    surface = _surface()
+    src = LiveSource(FakeCamera(n=4), FakeTracker([True, False, True, True]), DEFAULT, "right")
+    src.set_surface(surface)
+    assert src.surface is surface
+    it = src.frames()
+    f0, f1, f2 = next(it), next(it), next(it)
+    expected = surface.to_surface((0.5, 0.5))
+    for f in (f0, f2):
+        assert set(f.fingers) == set(FINGERS)
+        for finger in f.fingers.values():
+            assert finger.surface == pytest.approx(expected)
+            assert finger.img == (0.5, 0.5) and finger.curl == 0.1   # diğer alanlar aynı
+    assert not f1.present and f1.fingers == {}
+    src.set_surface(None)
+    f3 = next(it)
+    assert all(f.surface is None for f in f3.fingers.values())
+
+
+def _surface_cfg(tmp_path, enabled, file):
+    cfg = tmp_path / "v.toml"
+    cfg.write_text(
+        '[camera]\nindex = 0\nwidth = 640\nheight = 512\nfps = 60\n[tracker]\nmodel = "m"\n'
+        'min_detection = 0.5\nmin_tracking = 0.5\n[hand]\nside = "right"\ncalibration = "c"\n'
+        f'[lift]\nw_angle = 1.0\n[surface]\nenabled = {str(enabled).lower()}\n'
+        f'file = "{file.as_posix()}"\n', encoding="utf-8")
+    return cfg
+
+
+@pytest.mark.parametrize("enabled, exists, on", [
+    (True, True, True), (False, True, False), (True, False, False)])
+def test_open_live_source_surface_config(tmp_path, monkeypatch, enabled, exists, on):
+    from tkt.vision import calibration
+
+    path = tmp_path / "surface.json"
+    if exists:
+        calibration.save(_surface(), path)
+    monkeypatch.setattr(ls, "Camera", lambda *a: FakeCamera(n=1))
+    monkeypatch.setattr(ls, "HandTracker", lambda *a: FakeTracker([True]))
+    monkeypatch.setattr(ls.hand_calib, "load", lambda p: None)
+    src = ls.open_live_source(_surface_cfg(tmp_path, enabled, path))
+    assert (src.surface is not None) == on
+    frame = next(src.frames())
+    assert (frame.fingers["index"].surface is not None) == on
+
+
+def test_open_live_source_bad_surface_file_is_off(tmp_path, monkeypatch):
+    path = tmp_path / "surface.json"
+    path.write_text("{bozuk")
+    monkeypatch.setattr(ls, "Camera", lambda *a: FakeCamera(n=1))
+    monkeypatch.setattr(ls, "HandTracker", lambda *a: FakeTracker([]))
+    monkeypatch.setattr(ls.hand_calib, "load", lambda p: None)
+    assert ls.open_live_source(_surface_cfg(tmp_path, True, path)).surface is None
+
+
+def test_repo_config_surface_is_off():
+    cfg = load_vision_config("config/vision.toml")
+    assert cfg["surface"]["enabled"] is False
+    assert cfg["surface"]["aspect"] == 1.5
