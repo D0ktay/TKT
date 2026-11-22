@@ -118,8 +118,6 @@ grace_ms = 150              # bu kadar kısa takip kopması işareti bozmaz
 file = "~/.tkt/hand-gate.json"          # öğretilmiş işaret; varsa curl_open / curl_closed yerine kullanılır
 # İşaret kalibrasyonu: python -m tkt.app.sign_calib
 teach_margin = 0.15         # kaydedilen kıvrım aralığının iki yanına eklenen pay
-teach_min_gap = 0.20        # işaret, öteki pozlardan en az bir parmakta bu kadar farklı olmalı
+teach_min_gap = 0.20        # kaydedilen elde en düz ve en kıvrık parmak arasındaki en az fark
 teach_still = 0.10          # kayıt sırasında bir parmağın kıvrımı en çok bu kadar oynayabilir
-teach_still_ms = 500        # kayıt, el bu kadar süre sabit kalınca başlar
 teach_sign_ms = 2000        # işaretin kaydedildiği süre
-teach_pose_ms = 1200        # öteki pozların (rahat el, tık, yumruk) kaydedildiği süre
