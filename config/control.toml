@@ -1,6 +1,6 @@
 [general]
 panic_hotkey = "<ctrl>+<alt>+p"
-click_method = "thumb"      # thumb | tap | both | pinch
+click_method = "thumb"      # thumb | tap | both | pinch | index_pinch
 confidence_min = 0.5
 lost_release_ms = 300
 
@@ -70,3 +70,11 @@ debounce_ms = 30
 margin = 0.15
 drag_threshold = 0.03       # avuç hareketi, el boyu biriminde
 fist_curl = 0.6             # dört parmağın ortalama curl değeri
+
+[index_pinch]
+closed = 0.25
+open = 0.45
+debounce_ms = 30
+drag_threshold = 0.20       # avuç hareketi, el boyu biriminde
+hold_ms = 2000              # sabit tutuşta sağ tık
+fist_curl = 0.6

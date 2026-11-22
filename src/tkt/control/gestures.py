@@ -26,6 +26,14 @@ class Mode(Enum):
     DICTATE = 5
 
 
+class _IndexPinch(Enum):
+    DISARMED = 0
+    READY = 1
+    CLOSING = 2
+    HELD = 3
+    CONSUMED = 4
+
+
 _MODES_BY_FINGERS = {
     ("index",): Mode.POINTER,
     ("index", "middle"): Mode.SCROLL,
@@ -50,7 +58,9 @@ class GestureEngine:
         thumb = cfg["thumb"]
         swipe = cfg["swipe"]
         self._click_method = general.get("click_method", "thumb")
-        self._pinch = cfg["pinch"] if self._click_method == "pinch" else None
+        self._pinch = (
+            cfg[self._click_method] if self._click_method in ("pinch", "index_pinch") else None
+        )
         self._confidence_min = general["confidence_min"]
         self._lost_release_s = general["lost_release_ms"] / 1000
         self._lock_s = mode["lock_ms"] / 1000
@@ -89,7 +99,10 @@ class GestureEngine:
             reliable = frame.present and frame.confidence >= self._confidence_min
             if self._pinch is not None:
                 if reliable and frame.pinch is not None and self._inside(frame):
-                    self._process_pinch(frame, frame.pinch)
+                    if self._click_method == "index_pinch":
+                        self._process_index_pinch(frame, frame.pinch["index"])
+                    else:
+                        self._process_pinch(frame, frame.pinch)
                 elif self.mode is not Mode.NONE:
                     self.release()
                 return
@@ -150,6 +163,8 @@ class GestureEngine:
     def _reset_state(self) -> None:
         self.mode = Mode.NONE
         self.left_down = False
+        self._index_state = _IndexPinch.DISARMED
+        self._index_closed_at = 0.0
         self._pinch_armed = False
         self._pinch_owner: str | None = None
         self._pinch_candidate: str | None = None
@@ -180,6 +195,82 @@ class GestureEngine:
     def _inside(frame: HandFrame) -> bool:
         points = [frame.palm, *(f.surface for f in frame.fingers.values() if f.surface is not None)]
         return all(0 <= coordinate <= 1 for point in points for coordinate in point)
+
+    def _process_index_pinch(self, frame: HandFrame, distance: float) -> None:
+        cfg = self._pinch
+        if self._loss_expired(frame.t):
+            self.release()
+        self._last_reliable_t = frame.t
+        if sum(frame.fingers[name].curl for name in FINGERS) / len(FINGERS) >= cfg["fist_curl"]:
+            if self.left_down:
+                self._backend.button("left", False)
+                self.left_down = False
+            self._index_state = _IndexPinch.DISARMED
+            self._pinch_since = None
+            self._pointer.rebase()
+            self.mode = Mode.WAIT
+            return
+
+        self.mode = Mode.POINTER
+        if self._index_state is _IndexPinch.DISARMED:
+            if distance < cfg["open"]:
+                return
+            self._index_state = _IndexPinch.READY
+        if self._index_state is _IndexPinch.READY:
+            if distance > cfg["closed"]:
+                self._send_move(self._pointer.update(frame.palm, frame.hand_size, frame.t))
+                return
+            self._index_state = _IndexPinch.CLOSING
+            self._index_closed_at = frame.t
+            self._drag_origin = frame.palm
+            self._pointer.rebase()
+
+        debounce = cfg["debounce_ms"] / 1000
+        if self._index_state is _IndexPinch.CLOSING:
+            if distance >= cfg["open"]:
+                self._index_state = _IndexPinch.READY
+                self._pointer.rebase()
+                return
+            if frame.t < self._index_closed_at + debounce:
+                self._pointer.update(self._drag_origin, frame.hand_size, frame.t)
+                return
+            self._index_state = _IndexPinch.HELD
+
+        self._held_index_pinch(frame, distance)
+
+    def _held_index_pinch(self, frame: HandFrame, distance: float) -> None:
+        cfg = self._pinch
+        if distance >= cfg["open"] and self._pinch_since is None:
+            self._pinch_since = frame.t
+        elif distance <= cfg["closed"]:
+            self._pinch_since = None
+        if self._pinch_since is not None:
+            if frame.t >= self._pinch_since + cfg["debounce_ms"] / 1000:
+                if self.left_down:
+                    self._backend.button("left", False)
+                    self.left_down = False
+                elif self._index_state is _IndexPinch.HELD:
+                    self._backend.button("left", True)
+                    self._backend.button("left", False)
+                self._index_state = _IndexPinch.READY
+                self._pinch_since = None
+                self._pointer.rebase()
+            return
+
+        if self._index_state is _IndexPinch.CONSUMED:
+            return
+        if not self.left_down:
+            moved = self._image_distance(frame.palm, self._drag_origin)
+            if moved > cfg["drag_threshold"] * frame.hand_size:
+                self._backend.button("left", True)
+                self.left_down = True
+            elif frame.t >= self._index_closed_at + cfg["hold_ms"] / 1000:
+                self._backend.button("right", True)
+                self._backend.button("right", False)
+                self._index_state = _IndexPinch.CONSUMED
+                return
+        pos = frame.palm if self.left_down else self._drag_origin
+        self._send_move(self._pointer.update(pos, frame.hand_size, frame.t))
 
     def _process_pinch(self, frame: HandFrame, distances: dict[str, float]) -> None:
         cfg = self._pinch

@@ -775,3 +775,108 @@ def test_pinch_measurements_do_not_enable_pinch_in_default_config():
     for frame in source.frames():
         engine.process(frame)
     assert backend.events == []
+
+
+@pytest.fixture
+def index_pinch_rig():
+    cfg = load_control_config()
+    cfg["general"]["click_method"] = "index_pinch"
+    backend = DryBackend()
+    engine = GestureEngine(cfg, backend, SyntheticSource().info)
+
+    def feed(ms, distance=1, x=0.5, **kwargs):
+        backend.set_time(ms / 1000)
+        engine.process(make_frame(t=ms / 1000, palm=(x, 0.5),
+                                  pinch={"index": distance, "middle": 0}, **kwargs))
+
+    return engine, backend, feed
+
+
+def test_index_pinch_native_pairs_and_hysteresis(index_pinch_rig):
+    _, backend, feed = index_pinch_rig
+    feed(0)
+    feed(10, 0)
+    feed(20)  # Reject brief contact.
+    for start in (40, 180):
+        feed(start, 0.2)
+        feed(start + 35, 0.35, 0.51)
+        feed(start + 40)
+        feed(start + 50, 0.1)  # Release bounced closed.
+        feed(start + 70)
+        assert len(backend.events) == (0 if start == 40 else 2)
+        feed(start + 105, 0.35)
+    assert backend_events(backend) == [("button", "left", True), ("button", "left", False)] * 2
+
+
+def test_index_pinch_stationary_hold_consumes_until_release(index_pinch_rig):
+    _, backend, feed = index_pinch_rig
+    feed(0)
+    for ms in range(50, 2050, 50):
+        feed(ms, 0.1)
+    assert backend.events == []
+    feed(2050, 0.1)
+    feed(2100, 0.1, 0.7)
+    feed(2150)
+    feed(2200)
+    assert backend_events(backend) == [("button", "right", True), ("button", "right", False)]
+    feed(2250, 0)
+    feed(2300, 0)
+    feed(2350)
+    feed(2400)
+    assert backend_events(backend)[2:] == [("button", "left", True), ("button", "left", False)]
+
+
+@pytest.mark.parametrize("interrupt", ["release", "loss", "outside", "gap", "pause", "fist"])
+@pytest.mark.parametrize("dragging", [False, True])
+def test_index_pinch_drag_freeze_cancel_and_rearm(index_pinch_rig, dragging, interrupt):
+    engine, backend, feed = index_pinch_rig
+    feed(0)
+    feed(20, 0)
+    feed(60, 0.1, 0.53)  # 0.15 hand lengths
+    assert backend.events == []
+    if dragging:
+        feed(80, 0.1, 0.55)  # 0.25 hand lengths
+        assert backend.events[0].args == ("left", True)
+        assert backend.events[1].kind == "move"
+    if interrupt == "release":
+        feed(100)
+        feed(140)
+    elif interrupt == "pause":
+        engine.release()
+    elif interrupt == "loss":
+        feed(100, 0, present=False)
+    elif interrupt == "outside":
+        feed(100, 0, x=1.1)
+    elif interrupt == "gap":
+        feed(500, 0)
+    else:
+        feed(100, 0, 0.8, curls=dict.fromkeys(FINGERS, 1))
+        feed(140, 0, 0.9, curls=dict.fromkeys(FINGERS, 1))
+    assert not engine.left_down
+    buttons = [e.args for e in backend.events if e.kind == "button"]
+    expected = [("left", True), ("left", False)] if dragging or interrupt == "release" else []
+    assert buttons == expected
+    backend.events.clear()
+    if interrupt != "release":
+        feed(550 if interrupt == "gap" else 180, 0, 0.8)
+        feed(590 if interrupt == "gap" else 220, 0, 0.9)
+        assert backend.events == []
+    feed(640)
+    feed(680, 0)
+    feed(720, 0)
+    feed(760)
+    feed(800)
+    assert backend_events(backend) == [("button", "left", True), ("button", "left", False)]
+
+
+def test_index_pinch_fist_carry_and_middle_contact(index_pinch_rig):
+    engine, backend, feed = index_pinch_rig
+    feed(0)
+    feed(40, 0, 0.6, curls=dict.fromkeys(FINGERS, 1))
+    feed(80, 0, 0.8, curls=dict.fromkeys(FINGERS, 1))
+    assert engine.mode is Mode.WAIT
+    feed(120, 0, 0.85)
+    feed(160, 1, 0.9)
+    assert backend.events == []
+    feed(200, 1, 0.93)
+    assert [e.kind for e in backend.events] == ["move"]
