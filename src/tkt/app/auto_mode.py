@@ -12,6 +12,13 @@ Repo kökünden: python -m tkt.app.auto_mode   (macOS ve Windows)
   (macOS Quartz, Windows SendInput, diğerleri pynput).
 - HUD: kamera görüntüsü, iskelet, o anki hareket, son eylemler; A'da aktif alan
   (`[surface].file`) yeşil/kırmızı çizilir.
+- Mesafeyle yakınlaştırma (`[face_zoom]`, yalnız macOS ve C modu; `face_zoom` modülü): yüz
+  normal mesafeden uzaklaşınca ön plandaki uygulama büyütülür, yaklaşınca küçültülür.
+  Ctrl+M açar / kapatır, Ctrl+Shift+M şimdiki mesafeyi normal sayar.
+- El kapısı (`[hand_gate]`, yalnız C; `hand_gate` modülü): C'de el faresi kapalı başlar;
+  barış işareti (işaret + orta açık, yüzük + serçe kıvrık) tutulunca açılır, yeniden
+  yapılınca kapanır. Kapalıyken el jest motoruna verilmez, basılı tuşlar bırakılır.
+  İşaret `python -m tkt.app.sign_calib` ile öğretilir (`~/.tkt/hand-gate.json`).
 
 Platform farkları:
 - macOS (`auto_mode_mac`): HUD bir Cocoa penceresinde (kapatmak gizler); ekranın sol
@@ -21,6 +28,7 @@ Platform farkları:
 - Windows ve diğerleri: HUD bir OpenCV penceresi (mod ve durum onun içinde); hedef yardımı
   yok. Çıkış: Windows'ta her yerden Esc; HUD odaktayken Esc/q; HUD penceresini kapatmak.
 """
+import dataclasses
 import sys
 import threading
 import time
@@ -30,6 +38,8 @@ from pathlib import Path
 
 import cv2
 
+from tkt.app.face_zoom import FaceZoom
+from tkt.app.hand_gate import HandGate
 from tkt.app.hud import ActionTap
 from tkt.app.hud import draw as hud_draw
 from tkt.app.hud import status as hud_status
@@ -58,6 +68,11 @@ hud_img = [None, 0]         # [son HUD görüntüsü (BGR), sıra no] — iz thr
 history = deque(maxlen=HUD_HISTORY)   # (zaman, metin)
 backend = None              # gerçek girdi backend'i; main() kurar
 target_click = None         # macOS: (out, (x, y, w, h)) -> None, hedefin ortasına tıklar
+zoom = None                 # FaceZoom; yalnız seviyeyi uygulayabilen arayüz (macOS) kurar
+zoom_txt = [""]             # ekranda gösterilen yakınlaştırma durumu
+gate = None                 # HandGate; main() kurar (yoksa el faresi hep açık)
+GATE_OFF_TXT = "EL KAPALI (baris isareti ile ac)"
+GATE_ON_TXT = "el acik (baris isareti kapatir)"
 
 
 def log(msg):
@@ -75,6 +90,9 @@ FACE_MODEL = str(REPO / "models/blaze_face_short_range.tflite")
 FACE_SCORE = 0.7            # bu güvenin üstünde yüz = kamera kullanıcıya bakıyor
 FACE_EVERY_S = 1.0          # yüz kontrolü aralığı
 SWITCH_AFTER = 3            # art arda bu kadar aynı karar gelince mod değişir
+FACE_DETECT_W = 640         # yüz araması en çok bu genişlikte yapılır
+FACE_ROI_SCALE = 3.0        # yüz bulununca aranan çevre: yüz boyutunun bu katı kenarlı kare
+FACE_ROI_MIN_PX = 16        # bundan küçük çevre aranmaz
 
 
 def load_surface(vcfg_path):
@@ -125,15 +143,72 @@ def make_face_detector():
     det = mpv.FaceDetector.create_from_options(mpv.FaceDetectorOptions(
         base_options=mpt.BaseOptions(model_asset_path=FACE_MODEL), min_detection_confidence=0.3))
 
-    def face_score(img):
+    def detect(img):
+        """BGR / gri görüntüdeki yüzler: [(güven, x, y, genişlik, yükseklik)] piksel."""
         h, w = img.shape[:2]
-        small = cv2.resize(img, (640, int(640 * h / w))) if w > 640 else img
+        k = FACE_DETECT_W / w if w > FACE_DETECT_W else 1.0
+        small = cv2.resize(img, (FACE_DETECT_W, max(1, round(h * k)))) if k < 1.0 else img
         if small.ndim == 2:
             small = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
         r = det.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
                                 data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
-        return max((d.categories[0].score for d in r.detections), default=0.0)
-    return face_score
+        return [(d.categories[0].score, d.bounding_box.origin_x / k, d.bounding_box.origin_y / k,
+                 d.bounding_box.width / k, d.bounding_box.height / k) for d in r.detections]
+    return FaceFinder(detect)
+
+
+class FaceFinder:
+    """Yüzü önce son görüldüğü yerin çevresinde, bulamazsa bütün görüntüde arar.
+
+    Yüz bulucu (BlazeFace kısa menzil) görüntüyü 128 piksele küçültür; kullanıcı geriye
+    yaslanınca yüz birkaç piksele iner, güven 0,4–0,5'e düşer ve mod yanlışlıkla A'ya geçerdi
+    (canlı deneme, 2026-11-22). Yüzün çevresi (`FACE_ROI_SCALE` × yüz boyutu) kırpılıp
+    aranınca yüz modelin girdisinde büyük kalır: güven düşmez, kutu boyutu da daha hassas olur.
+    Çağrı `(en yüksek güven, yüz boyutu ya da None)` döner (`face_measure`).
+    """
+
+    def __init__(self, detect):
+        self._detect = detect       # görüntü -> [(güven, x, y, genişlik, yükseklik)]
+        self._roi = None            # (x0, y0, x1, y1) son yüzün çevresi
+        self.last = (0.0, None)     # son sonuç (kayıt için)
+
+    def __call__(self, img):
+        h, w = img.shape[:2]
+        faces = []
+        if self._roi is not None:
+            x0, y0, x1, y1 = self._roi
+            x1, y1 = min(x1, w), min(y1, h)
+            if x1 - x0 >= FACE_ROI_MIN_PX and y1 - y0 >= FACE_ROI_MIN_PX:
+                faces = [(s, x + x0, y + y0, fw, fh)
+                         for s, x, y, fw, fh in self._detect(img[y0:y1, x0:x1])
+                         if s >= FACE_SCORE]
+        if not faces:
+            faces = self._detect(img)
+        good = [f for f in faces if f[0] >= FACE_SCORE and f[3] > 0 and f[4] > 0]
+        if good:
+            _, x, y, fw, fh = max(good, key=lambda f: f[3] * f[4])
+            half = FACE_ROI_SCALE * max(fw, fh) / 2
+            cx, cy = x + fw / 2, y + fh / 2
+            self._roi = (max(0, int(cx - half)), max(0, int(cy - half)),
+                         int(cx + half), int(cy + half))
+        else:
+            self._roi = None
+        self.last = face_measure([(s, fw, fh) for s, _, _, fw, fh in faces], w, h)
+        return self.last
+
+
+def face_measure(faces, w, h, min_score=None):
+    """`faces`: [(güven, genişlik, yükseklik)] piksel. (en yüksek güven, yüz boyutu) döner.
+
+    Boyut, güveni `min_score`u (varsayılan `FACE_SCORE`) geçen en büyük yüzün alanının
+    görüntü alanına oranının kareköküdür (uzaklıkla ters orantılı); öyle yüz yoksa None.
+    En büyük yüz alınır ki arkadan geçen biri ölçümü bozmasın.
+    """
+    min_score = FACE_SCORE if min_score is None else min_score
+    best = max((s for s, _, _ in faces), default=0.0)
+    areas = [fw * fh for s, fw, fh in faces if s >= min_score and fw > 0 and fh > 0]
+    size = (max(areas) / (w * h)) ** 0.5 if areas else None
+    return best, size
 
 
 def track():
@@ -180,14 +255,34 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
     last_click = 0.0
     stat_t, ages = time.monotonic(), []
     face_t, votes = 0.0, []
+    zoom_t = 0.0
+    zoom_min = cfg.get("face_zoom", {}).get("face_score", FACE_SCORE)
+    face_last, face_ms = (0.0, None), 0.0
+    gated = gate is not None and gate.enabled and mode_name == "C"
+    mode_base = mode_txt[0]
     try:
         for f, hand, img in s.frames_raw():
             if stop.is_set():
                 return None
             now = time.monotonic()
-            if now - face_t >= FACE_EVERY_S:
+            vote_due = now - face_t >= FACE_EVERY_S
+            # Mesafe ölçümü yalnız C'de (kamera kullanıcıya bakarken) ve özellik açıkken sıklaşır.
+            zoom_due = (zoom is not None and mode_name == "C" and zoom.wants_samples
+                        and now - zoom_t >= zoom.period)
+            if vote_due or zoom_due:
+                got = face_score(cv2.rotate(img, cv2.ROTATE_180) if rotated else img)
+                sc, size = face_last = got if isinstance(got, tuple) else (got, None)
+                face_ms = max(face_ms, 1000 * (time.monotonic() - now))
+                if zoom_due:
+                    zoom_t = now
+                    msg = zoom.update(now, size if sc >= zoom_min else None)
+                    if msg:
+                        act(msg)
+            if zoom is not None:
+                zoom_txt[0] = zoom.text() if mode_name == "C" or not zoom.enabled else (
+                    f"YAKINLASTIRMA: seviye {zoom.level:+d} (A modunda olcum yok)")
+            if vote_due:
                 face_t = now
-                sc = face_score(cv2.rotate(img, cv2.ROTATE_180) if rotated else img)
                 want = "C" if sc >= FACE_SCORE else "A"
                 votes = (votes + [want])[-SWITCH_AFTER:]
                 if len(votes) == SWITCH_AFTER and all(v != mode_name for v in votes):
@@ -198,13 +293,36 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
                 log(f"olcum [{mode_name}]: isleme {s.process_fps():.1f} fps, "
                     f"takip {s.last_process_ms:.0f} ms, "
                     f"gecikme ort {1000*sum(ages)/len(ages):.0f} / maks {1000*max(ages):.0f} ms, "
-                    f"hedef arama maks {1000*ax_max[0]:.0f} ms")
-                stat_t, ages, ax_max[0] = now, [], 0.0
+                    f"hedef arama maks {1000*ax_max[0]:.0f} ms, "
+                    f"yuz guven {face_last[0]:.2f} boyut "
+                    + ("yok" if face_last[1] is None else f"{face_last[1]:.3f}")
+                    + f" arama maks {face_ms:.0f} ms"
+                    + ("" if zoom is None or zoom.ratio is None
+                       else f", uzaklik {zoom.ratio:.2f}x seviye {zoom.level:+d}")
+                    + ("" if not (gated and f.present and f.fingers) else
+                       ", kivrim " + " ".join(f"{n[0]}{f.fingers[n].curl:.2f}"
+                                              for n in ("index", "middle", "ring", "pinky"))
+                       + f" kapi {'acik' if gate.active else 'kapali'}"))
+                stat_t, ages, ax_max[0], face_ms = now, [], 0.0, 0.0
             dry.events.clear()
             dry.set_time(f.t)
-            eng.process(f)
-            present = f.present
+            if gated:
+                flip = gate.update(f)
+                if flip is True:
+                    eng = GestureEngine(cfg, dry, s.info)     # temiz durumla başla
+                    act("EL FARESI ACIK")
+                elif flip is False:
+                    release_engine(eng, dry)
+                    act("EL FARESI KAPALI")
+            active = not gated or gate.active
+            if active:
+                eng.process(f)
+            present = f.present and active
             update_state(eng, f)
+            if gated:       # kapı durumu sol üstte, mod yazısının yanında; imleç yanı boş kalır
+                mode_txt[0] = f"{mode_base} - {GATE_ON_TXT if active else GATE_OFF_TXT}"
+                if not active:
+                    state_txt[0] = ""
             if state_txt[0] != prev_state:
                 if prev_state == "KAYDIRMA":
                     act(f"KAYDIRMA bitti (dikey {scroll_sum[1]:+.0f}, yatay {scroll_sum[0]:+.0f})")
@@ -260,18 +378,26 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
             if now - hud_t >= HUD_EVERY_S:
                 hud_t = now
                 st = hud_status(f, eng, out, now, conf_min, False)
+                if not active:
+                    st = dataclasses.replace(st, label=GATE_OFF_TXT)
                 hud_img[0] = render_hud(img, hand, f, st, mode_name, surface)
                 hud_img[1] += 1
     finally:
-        eng.release()
-        for v in dry.events:
-            if v.kind == "button" and not v.args[1]:
-                backend.button(v.args[0], False)
-            elif v.kind == "system" and v.args[0] == "dictation_stop":
-                backend.system_action("dictation_stop")     # dikte açıkken mod değişti / çıkış
-                act("DIKTE KAPANDI")
-        backend.release_all()
+        release_engine(eng, dry)
     return None
+
+
+def release_engine(eng, dry):
+    """Motoru sıfırlar; bıraktığı tuşları ve açık dikteyi gerçek backend'e de uygular."""
+    eng.release()
+    for v in dry.events:
+        if v.kind == "button" and not v.args[1]:
+            backend.button(v.args[0], False)
+        elif v.kind == "system" and v.args[0] == "dictation_stop":
+            backend.system_action("dictation_stop")     # dikte açıkken kapandı / mod değişti
+            act("DIKTE KAPANDI")
+    backend.release_all()
+    dry.events.clear()
 
 
 def render_hud(img, hand, f, st, mode_name, surface):
@@ -291,6 +417,9 @@ def render_hud(img, hand, f, st, mode_name, surface):
         note = "alan: yesil ic / kirmizi dis" if surface else "alan yok (debug'da s)"
         cv2.putText(panel, note, (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1,
                     cv2.LINE_AA)
+    if zoom_txt[0]:
+        cv2.putText(panel, zoom_txt[0][:38].lower(), (12, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (60, 220, 240), 1, cv2.LINE_AA)
     cv2.putText(panel, "son eylemler", (12, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (150, 150, 150), 1, cv2.LINE_AA)
     now = time.monotonic()
@@ -324,6 +453,20 @@ def update_state(eng, f):
         txt = ""
     if txt != state_txt[0]:
         state_txt[0], state_since[0] = txt, f.t
+
+
+def zoom_config():
+    return tomllib.loads((REPO / "config/control.toml").read_text())["face_zoom"]
+
+
+def make_zoom():
+    """`[face_zoom]` ayarlarıyla FaceZoom (kalibrasyon ve açık / kapalı durumu dosyadan)."""
+    return FaceZoom(zoom_config())
+
+
+def make_gate():
+    cfg = tomllib.loads((REPO / "config/control.toml").read_text())
+    return HandGate(cfg["hand_gate"], cfg["general"]["confidence_min"])
 
 
 def make_backend(platform=None):
@@ -383,11 +526,16 @@ def run_cv_ui(show=None, poll_key=None, window_open=None, worker_target=None):
 
 
 def main():
-    global backend
+    global backend, gate
+    import faulthandler
+
     from tkt.app.main import _set_dpi_awareness
+
+    faulthandler.enable()                 # yerel çökme (abort / segfault) olursa yığın kayda düşsün
 
     _set_dpi_awareness()                  # Windows: ölçekli ekranda imleç kaymasın
     backend = make_backend()
+    gate = make_gate()
     log("hazir: otomatik mod (yuz var -> C, yok -> A), Esc ile cikis")
     if sys.platform == "darwin":
         from tkt.app import auto_mode_mac

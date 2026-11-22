@@ -128,6 +128,149 @@ def test_face_votes_switch_mode_and_release(core, monkeypatch):
     assert core.released >= 1
 
 
+class FakeZoom:
+    period = 0.0
+    wants_samples = True
+    enabled = True
+    level = 0
+
+    def __init__(self):
+        self.sizes = []
+
+    def update(self, t, size):
+        self.sizes.append(size)
+        return "YAKINLASTIRMA seviye +1" if len(self.sizes) == 2 else None
+
+    def text(self):
+        return "YAKINLASTIRMA: seviye +0"
+
+
+def test_zoom_gets_face_size_only_in_c(core, monkeypatch):
+    cfg = am.profile("C")[1]
+    cfg["face_zoom"]["face_score"] = 0.7
+    faces = iter([(0.9, 0.25), (0.9, 0.24), (0.5, None), (0.9, 0.26)])
+    z = FakeZoom()
+    monkeypatch.setattr(am, "zoom", z)
+    monkeypatch.setattr(am, "zoom_txt", [""])
+    am.history.clear()
+    assert am.run_mode(FakeSource(4), cfg, True, False, lambda img: next(faces), "C") is None
+    assert z.sizes == [0.25, 0.24, None, 0.26]
+    assert any("YAKINLASTIRMA seviye +1" in msg for _, msg in am.history)
+    assert am.zoom_txt[0] == "YAKINLASTIRMA: seviye +0"
+
+    z2 = FakeZoom()
+    monkeypatch.setattr(am, "zoom", z2)
+    monkeypatch.setattr(am, "FACE_EVERY_S", 99.0)
+    am.run_mode(FakeSource(4), am.profile("A")[1], False, False, lambda img: (0.1, None), "A")
+    assert z2.sizes == []                    # A'da kamera masaya bakar: mesafe ölçülmez
+    assert "A modunda" in am.zoom_txt[0]
+
+
+def test_face_measure_uses_largest_confident_face():
+    best, size = am.face_measure([(0.95, 64, 64), (0.8, 160, 90), (0.4, 600, 400)], 640, 360)
+    assert best == 0.95
+    assert size == pytest.approx((160 * 90 / (640 * 360)) ** 0.5)
+    assert am.face_measure([(0.4, 100, 100)], 640, 360) == (0.4, None)
+    assert am.face_measure([], 640, 360) == (0.0, None)
+
+
+def test_face_finder_keeps_far_face_by_searching_around_it():
+    """Uzak (küçük) yüz bütün görüntüde düşük güven alır, çevresi kırpılınca yüksek."""
+    face = [300, 100, 60, 60]                 # x, y, genişlik, yükseklik (640x360 görüntüde)
+    calls = []
+
+    def detect(img):
+        h, w = img.shape[:2]
+        calls.append((w, h))
+        x0, y0 = (0, 0) if w == 640 else roi_origin[0]
+        frac = face[2] / w                    # yüz, aranan görüntünün ne kadarı
+        return [(0.95 if frac >= 0.08 else 0.45, face[0] - x0, face[1] - y0, face[2], face[3])]
+
+    img = np.zeros((360, 640, 3), np.uint8)
+    roi_origin = [(0, 0)]
+    find = am.FaceFinder(detect)
+    sc, size = find(img)                      # yakın: bütün görüntüde bulunur
+    assert sc == 0.95 and size == pytest.approx((60 * 60 / (640 * 360)) ** 0.5)
+    face[:] = [310, 110, 40, 40]              # geriye yaslandı: 40/640 < 0.08
+    roi_origin[0] = (240, 40)                 # önceki yüzün çevresi: merkez (330,130) ± 90
+    calls.clear()
+    sc, size = find(img)
+    assert calls == [(180, 180)]              # yalnız çevrede arandı
+    assert sc == 0.95 and size == pytest.approx((40 * 40 / (640 * 360)) ** 0.5)
+    assert find.last == (sc, size)
+
+
+def test_face_finder_falls_back_to_full_image_and_forgets_lost_face():
+    seen = []
+
+    def detect(img):
+        seen.append(img.shape[1])
+        return [(0.9, 10, 10, 50, 50)] if len(seen) == 1 else []
+
+    img = np.zeros((360, 640, 3), np.uint8)
+    find = am.FaceFinder(detect)
+    assert find(img)[0] == 0.9
+    assert find(img) == (0.0, None)           # çevrede yok -> bütün görüntü -> yine yok
+    assert seen == [640, 110, 640]            # çevre (merkez 35 ± 75) kenarda kırpılır
+    find(img)
+    assert seen[-1] == 640 and len(seen) == 4  # yüz unutuldu: doğrudan bütün görüntü
+
+
+class FakeGate:
+    """3. karede açılır, 6. karede kapanır."""
+    enabled = True
+
+    def __init__(self):
+        self.active = False
+        self.n = 0
+
+    def update(self, f):
+        self.n += 1
+        if self.n in (3, 6):
+            self.active = not self.active
+            return self.active
+        return None
+
+
+def test_hand_gate_blocks_engine_until_opened_and_releases_on_close(core, monkeypatch):
+    cfg = am.profile("C")[1]
+    monkeypatch.setattr(am, "FACE_EVERY_S", 99.0)
+    monkeypatch.setattr(am, "GestureEngine", FakeEngine)
+    monkeypatch.setattr(am, "gate", FakeGate())
+    monkeypatch.setattr(am, "mode_txt", ["MOD C"])
+    # Motor her açılışta baştan kurulur: ilk karesinde tuşa basar, sonra imleci oynatır.
+    FakeEngine.script = [[("button", ("left", True))], [("move_rel", (5, 0))],
+                         [("move_rel", (5, 0))], [("move_rel", (5, 0))]]
+    am.history.clear()
+    am.run_mode(FakeSource(8), cfg, True, False, lambda img: 0.9, "C")
+    kinds = [(e.kind, e.args) for e in core.events]
+    # Kareler 1-2 kapalı (olay yok); 3-5 açık (bas, 2 hareket); 6'da kapanır: tuş bırakılır.
+    assert kinds == [("button", ("left", True)), ("move", (-5, 0)), ("move", (-5, 0)),
+                     ("button", ("left", False))]
+    msgs = [m for _, m in am.history]
+    assert msgs.index("EL FARESI ACIK") < msgs.index("EL FARESI KAPALI")
+    assert am.mode_txt[0] == f"MOD C - {am.GATE_OFF_TXT}"
+
+    core.events.clear()
+    monkeypatch.setattr(am, "gate", FakeGate())      # A'da kapı yok: el hep açık
+    FakeEngine.script = [[("move_rel", (1, 0))]] * 4
+    am.run_mode(FakeSource(2), am.profile("A")[1], False, False, lambda img: 0.1, "A")
+    assert [e.kind for e in core.events] == ["move", "move"]
+
+
+def test_make_gate_reads_config():
+    g = am.make_gate()
+    assert g.enabled and not g.active
+
+
+def test_make_zoom_reads_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(am, "zoom_config", lambda: {
+        **am.tomllib.loads((am.REPO / "config/control.toml").read_text())["face_zoom"],
+        "file": str(tmp_path / "z.json")})
+    z = am.make_zoom()
+    assert not z.enabled and z.period == pytest.approx(0.2)
+
+
 def test_face_score_flickers_do_not_switch(core, monkeypatch):
     monkeypatch.setattr(am, "FACE_EVERY_S", 0.0)
     scores = iter([0.95, 0.1, 0.95, 0.1, 0.95, 0.1, 0.95, 0.1])
