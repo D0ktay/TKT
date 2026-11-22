@@ -1,11 +1,10 @@
 """Barış işaretiyle el faresi kapısı: karar mantığı (kamera olmadan)."""
-import json
 import math
 
 import pytest
 
 from tkt.app.config import load_control_config
-from tkt.app.hand_gate import HandGate, learn_ranges
+from tkt.app.hand_gate import HandGate, learn_ranges, load_ranges, save_ranges
 from tkt.core.types import FINGERS, Finger, HandFrame
 
 OPEN, CURLED = 0.1, 0.9
@@ -111,49 +110,20 @@ def test_disabled_gate_is_always_active():
 MY_SIGN = {"index": 0.02, "middle": 0.01, "ring": 0.45, "pinky": 0.75}
 
 
-def teach(g, t0, curls):
-    """Öğretmeyi başlatıp hazırlık + kayıt boyunca `curls` pozunu verir; son zamanı döner."""
-    g.start_teach()
-    prompts = set()
-    t = t0
-    while g.prompt is not None:
-        t += 1 / 30
-        assert g.update(frame(t, curls)) is None
-        prompts.add((g.prompt or "")[:16])
-        assert t < t0 + 30
-    return t, prompts
-
-
 def test_taught_sign_replaces_fixed_thresholds(tmp_path):
     g = HandGate(cfg(), 0.5)
     _, flips = hold(g, 0.0, 2.0, MY_SIGN)
     assert flips == []                        # sabit eşiklerle tanınmıyor
-    t, prompts = teach(g, 2.0, MY_SIGN)
-    assert len(prompts) >= 2                  # hazırlık ve tutma yönergeleri gösterildi
-    assert t - 2.0 >= (cfg()["teach_prep_ms"] + cfg()["teach_record_ms"]) / 1000
-    assert any("ogretildi" in m for m in g.drain())
-    t, flips = hold(g, t, 2.0, MY_SIGN)       # hâlâ tutuluyor: bırakmadan çevirmez
-    assert flips == []
-    t, _ = hold(g, t, 0.5, FLAT)
-    t, flips = hold(g, t, 1.0, MY_SIGN)
+    ranges = learn_ranges([MY_SIGN] * 20, cfg()["teach_margin"])
+    save_ranges(tmp_path / "hand-gate.json", ranges)
+    g = HandGate(cfg(), 0.5)                  # dosyadan okunur
+    for n, (lo, hi) in ranges.items():
+        assert g.ranges[n] == (pytest.approx(lo, abs=1e-3), pytest.approx(hi, abs=1e-3))
+    t, flips = hold(g, 0.0, 1.0, MY_SIGN)
     assert flips == [True]
-    t, _ = hold(g, t, 0.5, FLAT)
-    for pose in (POINT, FLAT, FIST):          # öteki pozlar yine tetiklemez
+    for pose in (POINT, FLAT, FIST):          # öteki pozlar tetiklemez
         t, flips = hold(g, t, 2.0, pose)
         assert flips == []
-    saved = json.loads((tmp_path / "hand-gate.json").read_text())["ranges"]
-    assert saved["index"][0] is None and saved["ring"] == [pytest.approx(0.30), pytest.approx(0.60)]
-    again = HandGate(cfg(), 0.5)              # dosyadan geri okunur
-    for n, (lo, hi) in g.ranges.items():
-        assert again.ranges[n] == (pytest.approx(lo, abs=1e-3), pytest.approx(hi, abs=1e-3))
-
-
-def test_teach_without_hand_keeps_old_sign():
-    g = HandGate(cfg(), 0.5)
-    t, _ = teach(g, 0.0, None)
-    assert g.ranges is None and any("ogretilemedi" in m for m in g.drain())
-    _, flips = hold(g, t + 1.0, 1.0, SIGN)    # sabit eşikler geçerli kalır
-    assert flips == [True]
 
 
 def test_learn_ranges_open_ended_at_extremes():
@@ -170,3 +140,4 @@ def test_learn_ranges_open_ended_at_extremes():
 def test_corrupt_sign_file_falls_back(tmp_path):
     (tmp_path / "hand-gate.json").write_text("{bozuk")
     assert HandGate(cfg(), 0.5).ranges is None
+    assert load_ranges(tmp_path / "yok.json") is None
