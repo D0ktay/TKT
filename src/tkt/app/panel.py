@@ -91,8 +91,10 @@ def calibrations(repo, control_cfg, zoom=None):
     return out
 
 
-def status_line(mode, gate, zoom, tool_running=False):
+def status_line(mode, gate, zoom, tool_running=False, trusted=True):
     """Pencerenin üstündeki tek satırlık durum."""
+    if not trusted:
+        return "Erişilebilirlik izni yok: imleç oynamaz"
     if tool_running:
         return "Kalibrasyon penceresi açık"
     if mode == "A":

@@ -70,3 +70,4 @@ def test_status_line():
     zoom.enabled = False
     assert panel.status_line("C", gate, zoom) == "Kamera sana bakıyor · el faresi açık"
     assert panel.status_line("C", gate, zoom, tool_running=True) == "Kalibrasyon penceresi açık"
+    assert "Erişilebilirlik" in panel.status_line("C", gate, zoom, trusted=False)

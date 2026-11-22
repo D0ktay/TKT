@@ -80,6 +80,7 @@ CAMERA_RETRY_S = 3.0        # kamera açılamazsa yeniden deneme aralığı
 pending_tool = [None]       # arayüzün istediği kalibrasyon aracı (python -m … argümanları)
 tool_running = [False]      # araç penceresi açık (izleme durdu; Esc çıkışı sayılmaz)
 mode_now = [""]             # o anki mod adı ("A" / "C"), arayüz için
+ax_ok = [True]              # macOS: Erişilebilirlik izni var mı (yoksa imleç oynamaz)
 prefs = dict(panel_model.DEFAULT_PREFS)     # kalıcı tercihler (~/.tkt/app.json); main() okur
 
 

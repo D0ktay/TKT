@@ -14,6 +14,7 @@ from Foundation import NSObject
 from tkt.app import panel as model
 
 W = 420
+ACCESSIBILITY_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 PAD = 16
 ROW_H = 30
 
@@ -77,8 +78,14 @@ class Panel(NSObject):
         self.window.center()
         self.content = self.window.contentView()
         y = height - PAD - 22
-        self.status = _label("", ((PAD, y), (W - 2 * PAD, 22)), 14, bold=True)
+        self.status = _label("", ((PAD, y), (W - 2 * PAD - 96, 22)), 14, bold=True)
         self.content.addSubview_(self.status)
+        self.fix_button = K.NSButton.alloc().initWithFrame_(((W - PAD - 96, y - 4), (96, 28)))
+        self.fix_button.setBezelStyle_(K.NSBezelStyleRounded)
+        self.fix_button.setTitle_("İzin ver…")
+        self.fix_button.setTarget_(self)
+        self.fix_button.setAction_("openAccessibility:")
+        self.content.addSubview_(self.fix_button)
         y -= 12 + 26
         self.hand_box = self._checkbox("El faresi açık (barış işareti de açıp kapatır)", y,
                                        "handChanged:")
@@ -134,7 +141,8 @@ class Panel(NSObject):
         core = self.core
         tool = core.tool_running[0] or core.pending_tool[0] is not None
         self.status.setStringValue_(
-            model.status_line(core.mode_now[0], core.gate, core.zoom, tool))
+            model.status_line(core.mode_now[0], core.gate, core.zoom, tool, core.ax_ok[0]))
+        self.fix_button.setHidden_(core.ax_ok[0])
         gate = core.gate
         self.hand_box.setState_(1 if gate is None or gate.active else 0)
         self.hand_box.setEnabled_(gate is not None and gate.enabled and core.mode_now[0] == "C")
@@ -199,6 +207,10 @@ class Panel(NSObject):
             self.core.request_tool(c.tool)
             self.window.orderOut_(None)     # araç penceresinin önünde durmasın
         self.refresh()
+
+    def openAccessibility_(self, sender):
+        """Sistem Ayarları'nda Erişilebilirlik listesini açar (TKT oradan işaretlenir)."""
+        K.NSWorkspace.sharedWorkspace().openURL_(K.NSURL.URLWithString_(ACCESSIBILITY_URL))
 
     def quit_(self, sender):
         self.on_quit()

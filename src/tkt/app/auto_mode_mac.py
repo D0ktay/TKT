@@ -24,7 +24,10 @@
 Ortak durum (`stop`, `state_txt`, `hud_img`…) çekirdek modülde tutulur; `run(core)` o modülü
 alır (`python -m` ile çalışınca çekirdek `__main__` olur, yeniden import edilmez).
 """
+import contextlib
 import math
+import os
+import subprocess
 import threading
 import time
 
@@ -51,6 +54,9 @@ H = 0.0
 view = None
 hud_view = None
 panel = None                # kontrol penceresi (Panel)
+track_thread = None
+hotkey_refs = None          # kısayol musluğu / dinleyicileri (çöp toplanmasın)
+QUIT_JOIN_S = 3.0           # çıkışta iz thread'inin kamerayı bırakması için beklenen süre
 ticks = [0]
 shown_seq = [-1]            # pencereye en son konan HUD görüntüsünün sıra no'su
 zoom_cfg = {}               # [face_zoom]
@@ -328,7 +334,23 @@ def quit_app():
         zoom_restore()
     except Exception as e:
         core.log(f"yakinlastirma geri alinamadi: {e}")
-    K.NSApp.terminate_(None)
+    # İz thread'i kamerayı ve el izleyiciyi kapatsın. Kapanmadan çıkılırsa yerel kütüphaneler
+    # çıkışta abort ediyordu ("Fatal Python error: Aborted", canlı 2026-11-22).
+    if track_thread is not None:
+        track_thread.join(QUIT_JOIN_S)
+    core.log("cikis")
+    os._exit(0)
+
+
+def check_accessibility():
+    """Erişilebilirlik izni sonradan verildiyse kısayolları kurar; izin durumunu döner."""
+    global hotkey_refs
+    ok = bool(A.AXIsProcessTrusted())
+    if ok and not core.ax_ok[0]:
+        core.log("Erisilebilirlik izni verildi: kisayollar kuruluyor")
+        hotkey_refs = install_zoom_hotkeys()
+    core.ax_ok[0] = ok
+    return ok
 
 
 class Tick(NSObject):
@@ -339,8 +361,11 @@ class Tick(NSObject):
             quit_app()
             return
         ticks[0] += 1
-        if panel is not None and ticks[0] % PANEL_REFRESH_TICKS == 0 and panel.window.isVisible():
-            panel.refresh()
+        if ticks[0] % PANEL_REFRESH_TICKS == 0:
+            if not core.ax_ok[0]:
+                check_accessibility()
+            if panel is not None and panel.window.isVisible():
+                panel.refresh()
         view.setNeedsDisplay_(True)
         img, seq = core.hud_img
         if img is not None and seq != shown_seq[0]:
@@ -374,7 +399,7 @@ def make_hud_window():
 
 def run(core_module):
     """Cocoa uygulamasını kurar, iz ve hedef bulucu thread'lerini başlatır; Esc'ye kadar döner."""
-    global core, screen, H, view, zoom_cfg, panel
+    global core, screen, H, view, zoom_cfg, panel, track_thread, hotkey_refs
     core = core_module
     core.target_click = click_target
     core.zoom = core.make_zoom()
@@ -399,16 +424,27 @@ def run(core_module):
     panel.hud_window = hud_win
     panel.applyHud()
     panel.addStatusItem()
-    if not A.AXIsProcessTrustedWithOptions({A.kAXTrustedCheckOptionPrompt: True}):
+    # İzinler açılışta istenir (kamera izni, kamera ilk açılırken sorulur):
+    # - Erişilebilirlik: imleç, tık, kaydırma, kısayollar, hedef yardımı. macOS bunu yalnız
+    #   kullanıcının Sistem Ayarları'nda işaretlemesiyle verir; burada yalnız sorulur.
+    # - Otomasyon (System Events): dikteyi menüden açmak için. Zararsız bir sorgu izin
+    #   penceresini şimdi çıkarır; yoksa ilk dikte denemesinde sessizce başarısız olurdu.
+    core.ax_ok[0] = bool(A.AXIsProcessTrustedWithOptions({A.kAXTrustedCheckOptionPrompt: True}))
+    if not core.ax_ok[0]:
         core.log("Erisilebilirlik izni yok: imlec, kisayollar ve hedef yardimi calismaz")
-        core.mode_txt[0] = "ERISILEBILIRLIK IZNI YOK (Sistem Ayarlari > Gizlilik)"
+    with contextlib.suppress(OSError):
+        subprocess.Popen(
+            ["osascript", "-e", 'tell application "System Events" to count processes'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     tick = Tick.alloc().init()
     timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.06, tick, "update:", None, True)
-    monitors = install_zoom_hotkeys()
-    run.keep = (win, hud_win, tick, timer, monitors)   # pyobjc nesneleri çöp toplamaya gitmesin
+    # İzin yoksa kısayollar izin gelince kurulur (check_accessibility); yoksa hiç çalışmazlar.
+    hotkey_refs = install_zoom_hotkeys() if core.ax_ok[0] else None
+    run.keep = (win, hud_win, tick, timer)      # pyobjc nesneleri çöp toplamaya gitmesin
     threading.Thread(target=zoom_worker, daemon=True).start()
     panel.show()
-    threading.Thread(target=core.track, daemon=True).start()
+    track_thread = threading.Thread(target=core.track, daemon=True)
+    track_thread.start()
     threading.Thread(target=find_targets, daemon=True).start()
     app.run()
