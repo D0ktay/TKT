@@ -325,7 +325,7 @@ class Canvas(K.NSView):
             path.stroke()
 
 
-def quit_app():
+def quit_app(reason="dugme"):
     """Çıkış: basılı tuşlar bırakılır, yakınlaştırma geri alınır."""
     core.stop.set()
     core.backend.release_all()
@@ -337,7 +337,7 @@ def quit_app():
     # çıkışta abort ediyordu ("Fatal Python error: Aborted", canlı 2026-11-22).
     if track_thread is not None:
         track_thread.join(QUIT_JOIN_S)
-    core.log("cikis")
+    core.log(f"cikis ({reason})")
     os._exit(0)
 
 
@@ -407,7 +407,7 @@ class Tick(NSObject):
         # Kalibrasyon aracı açıkken Esc onun penceresini kapatır; uygulamayı kapatmaz.
         if not core.tool_running[0] and Quartz.CGEventSourceKeyState(
                 Quartz.kCGEventSourceStateCombinedSessionState, ESC_KEYCODE):
-            quit_app()
+            quit_app("Esc")
             return
         ticks[0] += 1
         if ticks[0] % PANEL_REFRESH_TICKS == 0:
