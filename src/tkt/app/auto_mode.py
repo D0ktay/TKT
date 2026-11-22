@@ -12,6 +12,9 @@ Repo kökünden: python -m tkt.app.auto_mode   (macOS ve Windows)
   (macOS Quartz, Windows SendInput, diğerleri pynput).
 - HUD: kamera görüntüsü, iskelet, o anki hareket, son eylemler; A'da aktif alan
   (`[surface].file`) yeşil/kırmızı çizilir.
+- Mesafeyle yakınlaştırma (`[face_zoom]`, yalnız macOS ve C modu; `face_zoom` modülü): yüz
+  normal mesafeden uzaklaşınca ön plandaki uygulama büyütülür, yaklaşınca küçültülür.
+  Ctrl+Alt+Z açar / kapatır, Ctrl+Alt+K şimdiki mesafeyi normal sayar.
 
 Platform farkları:
 - macOS (`auto_mode_mac`): HUD bir Cocoa penceresinde (kapatmak gizler); ekranın sol
@@ -30,6 +33,7 @@ from pathlib import Path
 
 import cv2
 
+from tkt.app.face_zoom import FaceZoom
 from tkt.app.hud import ActionTap
 from tkt.app.hud import draw as hud_draw
 from tkt.app.hud import status as hud_status
@@ -58,6 +62,8 @@ hud_img = [None, 0]         # [son HUD görüntüsü (BGR), sıra no] — iz thr
 history = deque(maxlen=HUD_HISTORY)   # (zaman, metin)
 backend = None              # gerçek girdi backend'i; main() kurar
 target_click = None         # macOS: (out, (x, y, w, h)) -> None, hedefin ortasına tıklar
+zoom = None                 # FaceZoom; yalnız seviyeyi uygulayabilen arayüz (macOS) kurar
+zoom_txt = [""]             # ekranda gösterilen yakınlaştırma durumu
 
 
 def log(msg):
@@ -126,14 +132,32 @@ def make_face_detector():
         base_options=mpt.BaseOptions(model_asset_path=FACE_MODEL), min_detection_confidence=0.3))
 
     def face_score(img):
+        """(en yüksek yüz güveni, o güvenle en büyük yüzün görüntüye oranı ya da None)."""
         h, w = img.shape[:2]
         small = cv2.resize(img, (640, int(640 * h / w))) if w > 640 else img
         if small.ndim == 2:
             small = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
         r = det.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
                                 data=cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
-        return max((d.categories[0].score for d in r.detections), default=0.0)
+        sh, sw = small.shape[:2]
+        return face_measure(
+            [(d.categories[0].score, d.bounding_box.width, d.bounding_box.height)
+             for d in r.detections], sw, sh)
     return face_score
+
+
+def face_measure(faces, w, h, min_score=None):
+    """`faces`: [(güven, genişlik, yükseklik)] piksel. (en yüksek güven, yüz boyutu) döner.
+
+    Boyut, güveni `min_score`u (varsayılan `FACE_SCORE`) geçen en büyük yüzün alanının
+    görüntü alanına oranının kareköküdür (uzaklıkla ters orantılı); öyle yüz yoksa None.
+    En büyük yüz alınır ki arkadan geçen biri ölçümü bozmasın.
+    """
+    min_score = FACE_SCORE if min_score is None else min_score
+    best = max((s for s, _, _ in faces), default=0.0)
+    areas = [fw * fh for s, fw, fh in faces if s >= min_score and fw > 0 and fh > 0]
+    size = (max(areas) / (w * h)) ** 0.5 if areas else None
+    return best, size
 
 
 def track():
@@ -180,14 +204,30 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotate
     last_click = 0.0
     stat_t, ages = time.monotonic(), []
     face_t, votes = 0.0, []
+    zoom_t = 0.0
+    zoom_min = cfg.get("face_zoom", {}).get("face_score", FACE_SCORE)
     try:
         for f, hand, img in s.frames_raw():
             if stop.is_set():
                 return None
             now = time.monotonic()
-            if now - face_t >= FACE_EVERY_S:
+            vote_due = now - face_t >= FACE_EVERY_S
+            # Mesafe ölçümü yalnız C'de (kamera kullanıcıya bakarken) ve özellik açıkken sıklaşır.
+            zoom_due = (zoom is not None and mode_name == "C" and zoom.wants_samples
+                        and now - zoom_t >= zoom.period)
+            if vote_due or zoom_due:
+                got = face_score(cv2.rotate(img, cv2.ROTATE_180) if rotated else img)
+                sc, size = got if isinstance(got, tuple) else (got, None)
+                if zoom_due:
+                    zoom_t = now
+                    msg = zoom.update(now, size if sc >= zoom_min else None)
+                    if msg:
+                        act(msg)
+            if zoom is not None:
+                zoom_txt[0] = zoom.text() if mode_name == "C" or not zoom.enabled else (
+                    f"YAKINLASTIRMA: seviye {zoom.level:+d} (A modunda olcum yok)")
+            if vote_due:
                 face_t = now
-                sc = face_score(cv2.rotate(img, cv2.ROTATE_180) if rotated else img)
                 want = "C" if sc >= FACE_SCORE else "A"
                 votes = (votes + [want])[-SWITCH_AFTER:]
                 if len(votes) == SWITCH_AFTER and all(v != mode_name for v in votes):
@@ -291,6 +331,9 @@ def render_hud(img, hand, f, st, mode_name, surface):
         note = "alan: yesil ic / kirmizi dis" if surface else "alan yok (debug'da s)"
         cv2.putText(panel, note, (12, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1,
                     cv2.LINE_AA)
+    if zoom_txt[0]:
+        cv2.putText(panel, zoom_txt[0][:38].lower(), (12, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (60, 220, 240), 1, cv2.LINE_AA)
     cv2.putText(panel, "son eylemler", (12, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (150, 150, 150), 1, cv2.LINE_AA)
     now = time.monotonic()
@@ -324,6 +367,15 @@ def update_state(eng, f):
         txt = ""
     if txt != state_txt[0]:
         state_txt[0], state_since[0] = txt, f.t
+
+
+def zoom_config():
+    return tomllib.loads((REPO / "config/control.toml").read_text())["face_zoom"]
+
+
+def make_zoom():
+    """`[face_zoom]` ayarlarıyla FaceZoom (kalibrasyon ve açık / kapalı durumu dosyadan)."""
+    return FaceZoom(zoom_config())
 
 
 def make_backend(platform=None):

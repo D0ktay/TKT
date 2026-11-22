@@ -128,6 +128,60 @@ def test_face_votes_switch_mode_and_release(core, monkeypatch):
     assert core.released >= 1
 
 
+class FakeZoom:
+    period = 0.0
+    wants_samples = True
+    enabled = True
+    level = 0
+
+    def __init__(self):
+        self.sizes = []
+
+    def update(self, t, size):
+        self.sizes.append(size)
+        return "YAKINLASTIRMA seviye +1" if len(self.sizes) == 2 else None
+
+    def text(self):
+        return "YAKINLASTIRMA: seviye +0"
+
+
+def test_zoom_gets_face_size_only_in_c(core, monkeypatch):
+    cfg = am.profile("C")[1]
+    cfg["face_zoom"]["face_score"] = 0.7
+    faces = iter([(0.9, 0.25), (0.9, 0.24), (0.5, None), (0.9, 0.26)])
+    z = FakeZoom()
+    monkeypatch.setattr(am, "zoom", z)
+    monkeypatch.setattr(am, "zoom_txt", [""])
+    am.history.clear()
+    assert am.run_mode(FakeSource(4), cfg, True, False, lambda img: next(faces), "C") is None
+    assert z.sizes == [0.25, 0.24, None, 0.26]
+    assert any("YAKINLASTIRMA seviye +1" in msg for _, msg in am.history)
+    assert am.zoom_txt[0] == "YAKINLASTIRMA: seviye +0"
+
+    z2 = FakeZoom()
+    monkeypatch.setattr(am, "zoom", z2)
+    monkeypatch.setattr(am, "FACE_EVERY_S", 99.0)
+    am.run_mode(FakeSource(4), am.profile("A")[1], False, False, lambda img: (0.1, None), "A")
+    assert z2.sizes == []                    # A'da kamera masaya bakar: mesafe ölçülmez
+    assert "A modunda" in am.zoom_txt[0]
+
+
+def test_face_measure_uses_largest_confident_face():
+    best, size = am.face_measure([(0.95, 64, 64), (0.8, 160, 90), (0.4, 600, 400)], 640, 360)
+    assert best == 0.95
+    assert size == pytest.approx((160 * 90 / (640 * 360)) ** 0.5)
+    assert am.face_measure([(0.4, 100, 100)], 640, 360) == (0.4, None)
+    assert am.face_measure([], 640, 360) == (0.0, None)
+
+
+def test_make_zoom_reads_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(am, "zoom_config", lambda: {
+        **am.tomllib.loads((am.REPO / "config/control.toml").read_text())["face_zoom"],
+        "file": str(tmp_path / "z.json")})
+    z = am.make_zoom()
+    assert not z.enabled and z.period == pytest.approx(0.2)
+
+
 def test_face_score_flickers_do_not_switch(core, monkeypatch):
     monkeypatch.setattr(am, "FACE_EVERY_S", 0.0)
     scores = iter([0.95, 0.1, 0.95, 0.1, 0.95, 0.1, 0.95, 0.1])

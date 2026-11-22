@@ -89,3 +89,21 @@ edge_margin = 0.03          # alan kenarından bu kadar dışarısı hâlâ içe
 absolute = false            # true: alan ekrana mutlak eşlenir (yalnız karşılaştırma için)
 screen_w = 1920             # mutlak mod ekran boyutu
 screen_h = 1080
+
+[face_zoom]                 # deney (macOS, C modu): yüz uzaklaşınca ön plandaki uygulamada Büyüt, yaklaşınca Küçült
+file = "~/.tkt/face-zoom.json"          # normal mesafe (kalibrasyon) ve açık / kapalı durumu
+toggle_hotkey = "<ctrl>+<alt>+z"        # özelliği aç / kapat
+calibrate_hotkey = "<ctrl>+<alt>+k"     # şimdiki mesafeyi normal say
+far = [1.20, 1.45]          # normal mesafenin bu katlarından uzakta: +1, +2 seviye (büyüt)
+near = [0.80]               # normal mesafenin bu katından yakında: -1 seviye (küçült)
+hysteresis = 0.08           # her sınırın çevresindeki ölü bant (toplam genişlik, oran)
+dwell_ms = 1000             # yeni aralıkta bu kadar kalınmadan seviye değişmez
+sample_ms = 200             # yüz ölçümü aralığı (özellik açıkken)
+window = 5                  # medyanı alınan ölçüm sayısı
+calibrate_ms = 2000         # kalibrasyon ölçüm süresi
+face_score = 0.7            # bu güvenin altındaki yüz ölçülmez
+presses_per_level = 1       # bir seviye için menü öğesine kaç kez basılır
+# Uygulama menüsünde aranan öğe adları (öncelik sırasıyla); ikisi de aynı menüde olmalı.
+skip_menus = ["Format", "Biçim"]        # bu üst menüler aranmaz: oradaki Büyüt belgedeki yazıyı değiştirir
+zoom_in_titles = ["Zoom In", "Bigger", "Make Text Bigger", "Increase Font Size", "Yakınlaştır", "Büyüt", "Daha Büyük"]
+zoom_out_titles = ["Zoom Out", "Smaller", "Make Text Smaller", "Decrease Font Size", "Uzaklaştır", "Küçült", "Daha Küçük"]

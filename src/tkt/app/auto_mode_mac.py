@@ -7,7 +7,16 @@
 - C için hedef yardımı: Erişilebilirlik API'si ile imlecin altındaki (yoksa `SNAP_PX`
   yakınındaki tek) düğme bulunur; `core.selected`'a yazılır, tık `core.target_click` ile
   düğmenin ortasına yapılır.
-- Esc (her yerden) çıkartır; basılı tuşlar bırakılır.
+- Mesafeyle yakınlaştırma (`core.zoom`, `[face_zoom]`): istenen seviye ön plandaki uygulamaya
+  kendi menüsündeki Büyüt / Küçült öğelerine basılarak uygulanır (`zoom_worker`). Tuş
+  gönderilmez: Türkçe klavyede uygulamalar bu kısayolu farklı tuşlara bağlıyor (Safari ⌘:,
+  Electron ⌘.), menü öğesi ise klavye düzeninden bağımsız. Her uygulamaya kaç seviye
+  uygulandığı tutulur; özellik kapanınca ya da uygulama öne gelince fark kapatılır. Menüsünde
+  böyle bir çift olmayan uygulamaya dokunulmaz; Biçim menüsü (`skip_menus`) aranmaz, çünkü
+  oradaki Büyüt belgedeki yazıyı değiştirir. Kısayollar (`toggle_hotkey`,
+  `calibrate_hotkey`) her yerden çalışır.
+- Esc (her yerden) çıkartır; basılı tuşlar bırakılır, öndeki uygulamanın yakınlaştırması
+  geri alınır.
 
 Ortak durum (`stop`, `state_txt`, `hud_img`…) çekirdek modülde tutulur; `run(core)` o modülü
 alır (`python -m` ile çalışınca çekirdek `__main__` olur, yeniden import edilmez).
@@ -22,7 +31,13 @@ import cv2
 import Quartz
 from Foundation import NSObject, NSTimer
 
+from tkt.app.face_zoom import parse_hotkey, pick_zoom_items, skip_menu
+
 SNAP_PX = 8                 # hedef yardımı: imlecin bu kadar yakınındaki tek düğme
+ZOOM_POLL_S = 0.3           # istenen seviye ile uygulananın karşılaştırılma aralığı
+ZOOM_MENU_DEPTH = 2         # menü araması kaç alt menü derine iner
+ZOOM_AX_TIMEOUT_S = 0.5
+ZOOM_RETRY_S = 3.0          # basılamayan (pasif / bayat) öğe için yeniden deneme aralığı
 ESC_KEYCODE = 53
 
 core = None                 # tkt.app.auto_mode (çalışan kopya); run() kurar
@@ -31,6 +46,11 @@ H = 0.0
 view = None
 hud_view = None
 shown_seq = [-1]            # pencereye en son konan HUD görüntüsünün sıra no'su
+zoom_cfg = {}               # [face_zoom]
+zoom_applied = {}           # pid -> o uygulamaya uygulanmış seviye
+zoom_items = {}             # pid -> (büyüt öğesi, küçült öğesi) ya da None (desteklenmiyor)
+zoom_retry = {}             # pid -> bu andan önce yeniden denenmez
+zoom_lock = threading.Lock()
 
 
 def cursor():
@@ -105,6 +125,125 @@ def find_targets():
         time.sleep(0.05)
 
 
+def menu_lists(menu, depth=0):
+    """Bir menüdeki ve alt menülerindeki öğeler: her menü için [(başlık, öğe)]."""
+    items, out = [], []
+    for item in attr(menu, "AXChildren") or []:
+        items.append((attr(item, "AXTitle"), item))
+        if depth < ZOOM_MENU_DEPTH:
+            for sub in attr(item, "AXChildren") or []:
+                out.extend(menu_lists(sub, depth + 1))
+    return [items] + out
+
+
+def find_zoom_items(pid):
+    """Uygulamanın menü çubuğundaki Büyüt / Küçült çifti ya da None."""
+    app = A.AXUIElementCreateApplication(pid)
+    A.AXUIElementSetMessagingTimeout(app, ZOOM_AX_TIMEOUT_S)
+    bar = attr(app, "AXMenuBar")
+    menus = []
+    for top in (attr(bar, "AXChildren") or []) if bar is not None else []:
+        if skip_menu(attr(top, "AXTitle"), zoom_cfg["skip_menus"]):
+            continue
+        for menu in attr(top, "AXChildren") or []:
+            menus.extend(menu_lists(menu))
+    return pick_zoom_items(menus, zoom_cfg["zoom_in_titles"], zoom_cfg["zoom_out_titles"])
+
+
+def zoom_sync(pid, name, want):
+    """`pid` uygulamasını `want` seviyesine getirir; menü basışı başarısızsa sonraki tura kalır."""
+    with zoom_lock:
+        have = zoom_applied.get(pid, 0)
+        if have == want or time.monotonic() < zoom_retry.get(pid, 0.0):
+            return
+        if pid not in zoom_items:
+            zoom_items[pid] = find_zoom_items(pid)
+            if zoom_items[pid] is None:
+                core.log(f"yakinlastirma: {name} menusunde buyut/kucult yok, dokunulmuyor")
+        pair = zoom_items[pid]
+        if pair is None:
+            return
+        step = 1 if want > have else -1
+        item = pair[0] if step > 0 else pair[1]
+        while have != want:
+            for _ in range(zoom_cfg["presses_per_level"]):
+                if not attr(item, "AXEnabled") or A.AXUIElementPerformAction(item, "AXPress"):
+                    # Öğe pasif (sınıra gelindi, pencere yok) ya da bayat: bu turu bırak,
+                    # menüyü biraz sonra yeniden ara.
+                    del zoom_items[pid]
+                    zoom_retry[pid] = time.monotonic() + ZOOM_RETRY_S
+                    zoom_applied[pid] = have
+                    return
+            have += step
+        zoom_applied[pid] = have
+        core.act(f"{name}: yakinlastirma {have:+d}")
+
+
+def front_app():
+    """Öndeki uygulama (pid, ad); kendimizse ya da yoksa None."""
+    front = K.NSWorkspace.sharedWorkspace().frontmostApplication()
+    me = K.NSRunningApplication.currentApplication().processIdentifier()
+    if front is None or front.processIdentifier() == me:
+        return None
+    return front.processIdentifier(), str(front.localizedName() or "uygulama")
+
+
+def zoom_worker():
+    while not core.stop.is_set():
+        front = front_app()
+        if front is not None:
+            try:
+                zoom_sync(*front, core.zoom.target)
+            except Exception as e:      # bir uygulamanın menüsü okunamadı: özellik çökmesin
+                core.log(f"yakinlastirma hatasi: {e}")
+        time.sleep(ZOOM_POLL_S)
+
+
+def zoom_restore():
+    """Çıkışta öndeki uygulamayı normal boyuta döndürür (diğerlerine erişilemez)."""
+    front = front_app()
+    if front is not None and zoom_applied.get(front[0], 0):
+        zoom_sync(*front, 0)
+    left = [pid for pid, lvl in zoom_applied.items() if lvl]
+    if left:
+        core.log(f"yakinlastirma: {len(left)} uygulama buyutulmus / kucultulmus kaldi")
+
+
+_MOD_FLAGS = {"ctrl": K.NSEventModifierFlagControl, "alt": K.NSEventModifierFlagOption,
+              "cmd": K.NSEventModifierFlagCommand, "shift": K.NSEventModifierFlagShift}
+
+
+def hotkey_matches(event, hotkey):
+    mods, key = hotkey
+    flags = event.modifierFlags()
+    held = {name for name, flag in _MOD_FLAGS.items() if flags & flag}
+    chars = event.charactersIgnoringModifiers() or ""
+    return held == set(mods) and chars.lower() == key and not event.isARepeat()
+
+
+def install_zoom_hotkeys():
+    """Aç / kapat ve kalibrasyon kısayolları (her uygulamada; Erişilebilirlik izni gerekir)."""
+    toggle = parse_hotkey(zoom_cfg["toggle_hotkey"])
+    calibrate = parse_hotkey(zoom_cfg["calibrate_hotkey"])
+
+    def on_key(event):
+        if hotkey_matches(event, toggle):
+            on = core.zoom.toggle()
+            core.act("YAKINLASTIRMA ACIK" if on else "YAKINLASTIRMA KAPALI")
+        elif hotkey_matches(event, calibrate):
+            core.zoom.calibrate()
+            core.act("YAKINLASTIRMA kalibrasyonu basladi")
+        core.zoom_txt[0] = core.zoom.text()
+
+    def on_local(event):
+        on_key(event)
+        return event
+
+    mask = K.NSEventMaskKeyDown
+    return (K.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(mask, on_key),
+            K.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(mask, on_local))
+
+
 class Canvas(K.NSView):
     def drawRect_(self, rect):
         K.NSColor.clearColor().set()
@@ -114,6 +253,11 @@ class Canvas(K.NSView):
                    K.NSForegroundColorAttributeName: K.NSColor.systemOrangeColor()}
             K.NSString.stringWithString_(core.mode_txt[0]).drawAtPoint_withAttributes_(
                 (20, screen.size.height - 60), big)
+        if core.zoom_txt[0]:
+            small = {K.NSFontAttributeName: K.NSFont.boldSystemFontOfSize_(14),
+                     K.NSForegroundColorAttributeName: K.NSColor.systemOrangeColor()}
+            K.NSString.stringWithString_(core.zoom_txt[0]).drawAtPoint_withAttributes_(
+                (20, screen.size.height - 84), small)
         if core.state_txt[0]:
             cx, cy = cursor()
             attrs = {K.NSFontAttributeName: K.NSFont.boldSystemFontOfSize_(16),
@@ -136,6 +280,10 @@ class Tick(NSObject):
                                         ESC_KEYCODE):
             core.stop.set()
             core.backend.release_all()
+            try:
+                zoom_restore()
+            except Exception as e:
+                core.log(f"yakinlastirma geri alinamadi: {e}")
             K.NSApp.terminate_(None)
             return
         view.setNeedsDisplay_(True)
@@ -171,9 +319,12 @@ def make_hud_window():
 
 def run(core_module):
     """Cocoa uygulamasını kurar, iz ve hedef bulucu thread'lerini başlatır; Esc'ye kadar döner."""
-    global core, screen, H, view
+    global core, screen, H, view, zoom_cfg
     core = core_module
     core.target_click = click_target
+    core.zoom = core.make_zoom()
+    core.zoom_txt[0] = core.zoom.text()
+    zoom_cfg = core.zoom_config()
     screen = K.NSScreen.mainScreen().frame()
     H = K.NSScreen.screens()[0].frame().size.height
     app = K.NSApplication.sharedApplication()
@@ -192,7 +343,9 @@ def run(core_module):
     tick = Tick.alloc().init()
     timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.06, tick, "update:", None, True)
-    run.keep = (win, hud_win, tick, timer)      # pyobjc nesneleri çöp toplamaya gitmesin
+    monitors = install_zoom_hotkeys()
+    run.keep = (win, hud_win, tick, timer, monitors)   # pyobjc nesneleri çöp toplamaya gitmesin
+    threading.Thread(target=zoom_worker, daemon=True).start()
     threading.Thread(target=core.track, daemon=True).start()
     threading.Thread(target=find_targets, daemon=True).start()
     app.run()
