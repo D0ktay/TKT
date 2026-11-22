@@ -9,10 +9,9 @@ setups, and an auto mode that switches between them:
 | **C — pinch** | Faces you (above or below the screen) | Hand in the air: palm moves the cursor, thumb–index pinch clicks and drags, thumb–middle pinch scrolls. |
 | **Auto (A/C)** | Either | Picks the version from what the camera sees: a face in view means C, no face means A. |
 
-Hand tracking runs locally with MediaPipe. macOS and Windows are both targets;
-the auto mode, its HUD and system dictation are macOS only for now. Finger
-tapping on the desk (J7–J8) and the active desk area are experimental and off by
-default.
+Hand tracking runs locally with MediaPipe. Everything runs on macOS and Windows,
+except target assist in C, which is macOS only for now. Finger tapping on the desk
+(J7–J8) and the active desk area are experimental and off by default.
 
 ## Setup
 
@@ -59,7 +58,7 @@ Use `--list` to find the camera, then set `index` (or `name`), `width` and
 
 ## Running
 
-### Auto mode (A and C, macOS)
+### Auto mode (A and C)
 
 ```bash
 uv run python -m tkt.app.auto_mode
@@ -69,19 +68,24 @@ uv run python -m tkt.app.auto_mode
   ≥ 0.7 in three checks in a row switches to C; three checks without one switch
   back to A. Each version uses its own settings: A uses `vision.toml` and the
   `[pointer]` values with thumb clicks; C uses `vision-front.toml`, `[pointer]`
-  overridden by `[pointer_front]`, index pinch and target assist.
+  overridden by `[pointer_front]` and index pinch (plus target assist on macOS).
 - On a switch, held buttons are released, dictation is stopped and the camera is
   reopened with the new settings, so expect a 1–2 s gap.
-- The current version is shown in the top-left corner of the screen and the
-  gesture state (SCROLL, PINCH, STOP, NO HAND…) next to the cursor.
+- The current version and the gesture state (SCROLL, PINCH, STOP, NO HAND…) are
+  shown in the HUD. On macOS they are also drawn on screen: the version in the
+  top-left corner, the state next to the cursor.
 - **HUD window ("TKT HUD")**: camera image, hand skeleton, current state, which
   fingers are open, and a list of the last 12 actions (clicks, drags, scroll
   amounts, system actions, version switches). In A it also draws the active desk
   area from `~/.tkt/surface.json`: green when the index fingertip is inside,
-  red when outside. Closing the window only hides it.
-- In C, target assist highlights a single nearby button with a green frame; a
-  pinch that starts and ends on the same button clicks its center.
-- **Esc** quits and releases all buttons.
+  red when outside. On macOS closing the window only hides it; on Windows the
+  HUD is an OpenCV window and closing it quits.
+- In C on macOS, target assist highlights a single nearby button with a green
+  frame; a pinch that starts and ends on the same button clicks its center.
+- **Esc** quits from anywhere and releases all buttons (also `q` while the HUD
+  has focus on Windows).
+- Input goes through Quartz on macOS and `SendInput` on Windows. Dictation uses
+  the Edit menu's "Start Dictation" on macOS and Win+H on Windows.
 
 ### Version A only (macOS and Windows)
 
@@ -209,9 +213,11 @@ Sample recordings are in [data/samples/](data/samples/).
   `--list` output.
 - **Auto mode switches by itself:** a face partly in view (or someone walking
   behind you) can trigger C. Watch the face confidence in the log.
-- **Dictation does not start:** turn on Dictation in System Settings, allow
+- **Dictation does not start (macOS):** turn on Dictation in System Settings, allow
   Automation for System Events, and make sure a text field has focus. The app
   in front must have an Edit menu with "Start Dictation".
+- **Dictation does not start (Windows):** check that Win+H opens voice typing
+  (Settings → Time & language → Speech) and that a text field has focus.
 - **Distorted movement on a scaled Windows display:** check the display scale and
   start through `tkt.app.main`, which enables DPI awareness.
 - **Tap does nothing:** set `[general].click_method` to `tap` or `both` and check
