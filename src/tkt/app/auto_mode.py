@@ -1,67 +1,63 @@
-"""Otomatik mod (yalnız macOS; repo kökünden python -m tkt.app.auto_mode).
+"""Otomatik mod: kamera kullanıcıya bakıyorsa (yüz görünüyor) C, masaya bakıyorsa A.
 
-Kamera kullanıcıya bakıyorsa (yüz görünüyor) C, masaya bakıyorsa A.
+Repo kökünden: python -m tkt.app.auto_mode   (macOS ve Windows)
 
+- Her saniye görüntüde yüz aranır; art arda 3 karar aynıysa mod değişir. Geçişte basılı
+  tuşlar bırakılır, dikte kapatılır, kamera yeni modun ayarıyla yeniden açılır.
+- A (masa): `config/vision.toml`, `[pointer]`, başparmakla tık (`click_method = "thumb"`).
+- C (pinch): `config/vision-front.toml`, `[pointer]` üzerine `[pointer_front]`, `index_pinch`,
+  yatay ayna. Kısa pinch = tık, pinch kapalı + el kayar = sürükleme, 2 sn sabit pinch = sağ
+  tık, yumruk = imleç durur, başparmak-orta parmak tutulurken el hareketi = kaydırma.
+- Jest motoru DryBackend'e yazar; olaylar her karede gerçek backend'e aktarılır
+  (macOS Quartz, Windows SendInput, diğerleri pynput).
+- HUD: kamera görüntüsü, iskelet, o anki hareket, son eylemler; A'da aktif alan
+  (`[surface].file`) yeşil/kırmızı çizilir.
 
-Tüm sistemde pinch ile gerçek imleç: hareket, tık (hedef yardımlı), sürükleme, sağ tık.
-
-- Jest motoru (index_pinch) DryBackend'e yazar; olaylar her karede gerçek MacBackend'e aktarılır.
-- Kısa pinch (aynı karede left down+up) = tık. Pinch kapanırken yeşil çerçeveli düğme seçiliyse
-  ve bırakırken hâlâ aynı düğme seçiliyse imleç düğmenin ortasına alınıp orada tıklanır.
-- Pinch kapalı + el kayar = sürükleme (motorun left down/up olayları olduğu gibi).
-- 2 sn sabit pinch = sağ tık. Yumruk = imleç durur.
-- Başparmak-orta parmak tutulurken el hareketi = kaydırma (doğal yön).
-- Esc: çıkış (basılı tuşlar bırakılır).
-
-HUD penceresi ("TKT HUD"): kamera görüntüsü, iskelet, o anki hareket ve son eylemler listesi.
-A modunda masadaki aktif alan (`[surface].file`, debug penceresinde `s` ile çizilir) da
-gösterilir; parmak ucu alanın içindeyse yeşil, dışındaysa kırmızı. Pencereyi kapatmak yalnızca
-gizler; çıkış Esc.
+Platform farkları:
+- macOS (`auto_mode_mac`): HUD bir Cocoa penceresinde (kapatmak gizler); ekranın sol
+  üstünde mod, imlecin yanında durum yazar; C'de hedef yardımı (Erişilebilirlik API'si):
+  pinch kapanırken yeşil çerçeveli düğme seçiliyse ve bırakırken hâlâ aynıysa düğmenin
+  ortasına tıklanır. Çıkış: her yerden Esc.
+- Windows ve diğerleri: HUD bir OpenCV penceresi (mod ve durum onun içinde); hedef yardımı
+  yok. Çıkış: Windows'ta her yerden Esc; HUD odaktayken Esc/q; HUD penceresini kapatmak.
 """
-import math
+import sys
 import threading
 import time
 import tomllib
 from collections import deque
 from pathlib import Path
 
-import AppKit as K
-import ApplicationServices as A
 import cv2
-import Quartz
-from Foundation import NSObject, NSTimer
 
 from tkt.app.hud import ActionTap
 from tkt.app.hud import draw as hud_draw
 from tkt.app.hud import status as hud_status
 from tkt.control.gestures import GestureEngine
 from tkt.control.os_input.dry_backend import DryBackend
-from tkt.control.os_input.macos import MacBackend
 from tkt.vision import calibration
 from tkt.vision.debug_view import draw_surface
 from tkt.vision.live_source import open_live_source
 
 CLICK_DEBOUNCE_S = 0.15     # bundan kısa arayla gelen ikinci tık pinch titremesidir
-SNAP_PX = 8                 # hedef yardımı: imlecin bu kadar yakınındaki tek düğme
+HUD_EVERY_S = 1 / 15        # HUD görüntüsünün yenilenme aralığı
+HUD_H = 400                 # HUD'daki kamera görüntüsünün yüksekliği (piksel)
+HUD_PANEL_W = 320           # sağdaki eylem listesi genişliği
+HUD_HISTORY = 12            # listede tutulan eylem sayısı
+HUD_WINDOW = "TKT HUD"
+VK_ESCAPE = 0x1B
 
-screen = K.NSScreen.mainScreen().frame()
-H = K.NSScreen.screens()[0].frame().size.height
 stop = threading.Event()
-selected = None             # ((x, y, w, h), AXUIElement) — ana thread günceller
-present = False
-state_txt = [""]
-mode_txt = [""]               # sol üstte gösterilen mod
-state_since = [0.0]           # imlecin yanında gösterilen motor durumu
-scrolled = [0.0]           # 2 sn içindeki toplam kaydırma (piksel)
-ax_max = [0.0]             # hedef aramanın 2 sn içindeki en uzun süresi
-mac = MacBackend()
-HUD_EVERY_S = 1 / 15       # HUD görüntüsünün yenilenme aralığı
-HUD_H = 400                # HUD'daki kamera görüntüsünün yüksekliği (piksel)
-HUD_PANEL_W = 320          # sağdaki eylem listesi genişliği
-HUD_HISTORY = 12           # listede tutulan eylem sayısı
-hud_img = [None, 0]        # [son HUD görüntüsü (BGR), sıra no] — iz thread'i yazar, Tick okur
+selected = None             # macOS: ((x, y, w, h), öğe) — hedef bulucu thread günceller
+present = False             # el görünüyor mu (hedef bulucu yalnız el varken arar)
+state_txt = [""]            # imlecin yanında / HUD'da gösterilen motor durumu
+mode_txt = [""]             # ekranda gösterilen mod
+state_since = [0.0]
+ax_max = [0.0]              # hedef aramanın 2 sn içindeki en uzun süresi
+hud_img = [None, 0]         # [son HUD görüntüsü (BGR), sıra no] — iz thread'i yazar, arayüz okur
 history = deque(maxlen=HUD_HISTORY)   # (zaman, metin)
-shown_seq = [-1]           # pencereye en son konan HUD görüntüsünün sıra no'su
+backend = None              # gerçek girdi backend'i; main() kurar
+target_click = None         # macOS: (out, (x, y, w, h)) -> None, hedefin ortasına tıklar
 
 
 def log(msg):
@@ -72,18 +68,6 @@ def act(msg):
     """Eylemi hem kayda yazar hem HUD'daki listeye ekler."""
     log(msg)
     history.append((time.monotonic(), msg))
-
-
-def cursor():
-    loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-    return loc.x, loc.y
-
-
-def click_at(out, cx, cy):
-    Quartz.CGWarpMouseCursorPosition((cx, cy))
-    Quartz.CGAssociateMouseAndMouseCursorPosition(True)
-    out.button("left", True)
-    out.button("left", False)
 
 
 REPO = Path(__file__).resolve().parents[3]
@@ -105,14 +89,23 @@ def load_surface(vcfg_path):
 
 
 def profile(name):
-    """(vision config yolu, control cfg, yatay ayna, hedef yardımı)."""
+    """(vision config yolu, control cfg, yatay ayna, hedef yardımı).
+
+    Hedef yardımı yalnız platform arayüzü hedef bulabiliyorsa (`target_click` kuruluysa) açıktır.
+    """
     cfg = tomllib.loads((REPO / "config/control.toml").read_text())
     if name == "A":
         cfg["general"]["click_method"] = "thumb"
         return str(REPO / "config/vision.toml"), cfg, False, False
     cfg["general"]["click_method"] = "index_pinch"
     cfg["pointer"] = {**cfg["pointer"], **cfg.get("pointer_front", {})}
-    return str(REPO / "config/vision-front.toml"), cfg, True, True
+    return str(REPO / "config/vision-front.toml"), cfg, True, target_click is not None
+
+
+def camera_rotated(vcfg_path):
+    """Görüntü 180° döndürülerek mi işleniyor (`[camera].rotate_180`, varsayılan açık)."""
+    cam = tomllib.loads(Path(vcfg_path).read_text()).get("camera", {})
+    return bool(cam.get("rotate_180", True))
 
 
 FACE_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/face_detector/"
@@ -156,22 +149,27 @@ def track():
         act(f"MOD {mode_name}: {Path(vcfg).name}"
             + ("" if mode_name == "C" else ", alan var" if surface else ", alan yok"))
         s = open_live_source(vcfg)
-        switch_to = run_mode(s, cfg, mirror, assist, face_score, mode_name, surface)
+        switch_to = run_mode(s, cfg, mirror, assist, face_score, mode_name, surface,
+                             rotated=camera_rotated(vcfg))
         s.close()
         if switch_to is None:
             break
         act(f"mod degisiyor: {mode_name} -> {switch_to}")
         mode_name = switch_to
-    mac.release_all()
+    backend.release_all()
 
 
-def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None):
-    """Bir modu çalıştırır; mod değişecekse yeni modun adını, çıkışta None döner."""
+def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None, rotated=False):
+    """Bir modu çalıştırır; mod değişecekse yeni modun adını, çıkışta None döner.
+
+    `s`: `frames_raw()` veren kaynak (canlı kamera; testte sahte). Yüz araması döndürülmüş
+    görüntüde (`rotated`) önce düz hale getirilir.
+    """
     global present
     sx = -1 if mirror else 1
     dry = DryBackend()
     eng = GestureEngine(cfg, dry, s.info)
-    out = ActionTap(mac, time.monotonic)      # gerçek imleç + HUD için son eylem
+    out = ActionTap(backend, time.monotonic)  # gerçek imleç + HUD için son eylem
     conf_min = cfg["general"]["confidence_min"]
     hud_t = 0.0
     scroll_sum = [0.0, 0.0]
@@ -182,7 +180,6 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None):
     last_click = 0.0
     stat_t, ages = time.monotonic(), []
     face_t, votes = 0.0, []
-    s_rotated = mode_name == "A"          # A profili görüntüyü 180° döndürüyor
     try:
         for f, hand, img in s.frames_raw():
             if stop.is_set():
@@ -190,7 +187,7 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None):
             now = time.monotonic()
             if now - face_t >= FACE_EVERY_S:
                 face_t = now
-                sc = face_score(cv2.rotate(img, cv2.ROTATE_180) if s_rotated else img)
+                sc = face_score(cv2.rotate(img, cv2.ROTATE_180) if rotated else img)
                 want = "C" if sc >= FACE_SCORE else "A"
                 votes = (votes + [want])[-SWITCH_AFTER:]
                 if len(votes) == SWITCH_AFTER and all(v != mode_name for v in votes):
@@ -236,8 +233,7 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None):
                         if t - last_click < CLICK_DEBOUNCE_S:
                             act("tik yok sayildi (titreme)")
                         elif locked is not None and selected == locked:
-                            (a, b, w, h), _el = locked
-                            click_at(out, a + w / 2, b + h / 2)
+                            target_click(out, locked[0])
                             act("SOL TIK (hedef)")
                         else:
                             out.button("left", True)
@@ -270,11 +266,11 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None):
         eng.release()
         for v in dry.events:
             if v.kind == "button" and not v.args[1]:
-                mac.button(v.args[0], False)
+                backend.button(v.args[0], False)
             elif v.kind == "system" and v.args[0] == "dictation_stop":
-                mac.system_action("dictation_stop")     # dikte açıkken mod değişti / çıkış
+                backend.system_action("dictation_stop")     # dikte açıkken mod değişti / çıkış
                 act("DIKTE KAPANDI")
-        mac.release_all()
+        backend.release_all()
     return None
 
 
@@ -330,149 +326,74 @@ def update_state(eng, f):
         state_txt[0], state_since[0] = txt, f.t
 
 
-def attr(el, k):
-    err, v = A.AXUIElementCopyAttributeValue(el, k, None)
-    return v if not err else None
+def make_backend(platform=None):
+    """Bu işletim sisteminin gerçek girdi backend'i."""
+    platform = platform or sys.platform
+    step_px = tomllib.loads((REPO / "config/control.toml").read_text())["scroll"]["step_px"]
+    if platform == "darwin":
+        from tkt.control.os_input.macos import MacBackend
+        return MacBackend()
+    if platform == "win32":
+        from tkt.control.os_input.windows import WindowsBackend
+        return WindowsBackend(step_px=step_px, smooth=True)
+    from tkt.control.os_input.pynput_backend import PynputBackend
+    b = PynputBackend()
+    b.step_px = step_px
+    return b
 
 
-def target(app, px, py):
-    err, el = A.AXUIElementCopyElementAtPosition(app, px, py, None)
-    if err:
-        return None
-    for _ in range(6):
-        role = attr(el, "AXRole")
-        if role in ("AXTextField", "AXTextArea", "AXComboBox"):
-            return "text"
-        if role in ("AXButton", "AXMenuButton", "AXPopUpButton", "AXCheckBox", "AXRadioButton"):
-            if not attr(el, "AXEnabled"):
-                return None
-            p, s = attr(el, "AXPosition"), attr(el, "AXSize")
-            if p is None or s is None:
-                return None
-            ok, p = A.AXValueGetValue(p, A.kAXValueCGPointType, None)
-            if not ok:
-                return None
-            ok, s = A.AXValueGetValue(s, A.kAXValueCGSizeType, None)
-            return ((p.x, p.y, s.width, s.height), el) if ok else None
-        el = attr(el, "AXParent")
-        if el is None:
-            return None
-    return None
+def esc_down():
+    """Windows: Esc şu an basılı mı (hangi pencere odakta olursa olsun). Diğerlerinde False."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    return bool(ctypes.windll.user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
 
 
-class Canvas(K.NSView):
-    def drawRect_(self, rect):
-        K.NSColor.clearColor().set()
-        K.NSRectFillUsingOperation(rect, K.NSCompositingOperationCopy)
-        if mode_txt[0]:
-            big = {K.NSFontAttributeName: K.NSFont.boldSystemFontOfSize_(20),
-                   K.NSForegroundColorAttributeName: K.NSColor.systemOrangeColor()}
-            K.NSString.stringWithString_(mode_txt[0]).drawAtPoint_withAttributes_(
-                (20, screen.size.height - 60), big)
-        if state_txt[0]:
-            cx, cy = cursor()
-            attrs = {K.NSFontAttributeName: K.NSFont.boldSystemFontOfSize_(16),
-                     K.NSForegroundColorAttributeName: K.NSColor.systemOrangeColor()}
-            K.NSString.stringWithString_(state_txt[0]).drawAtPoint_withAttributes_(
-                (cx - screen.origin.x + 18, H - cy - screen.origin.y - 34), attrs)
-        if selected:
-            a, b, w, h = selected[0]
-            K.NSColor.systemGreenColor().set()
-            origin = (a - screen.origin.x, H - b - h - screen.origin.y)
-            path = K.NSBezierPath.bezierPathWithRect_((origin, (w, h)))
-            path.setLineWidth_(3)
-            path.stroke()
+def run_cv_ui(show=None, poll_key=None, window_open=None, worker_target=None):
+    """macOS dışı arayüz: iz ayrı thread'de, HUD ana thread'de bir OpenCV penceresinde.
 
-
-def find_targets():
-    global selected
-    me = K.NSRunningApplication.currentApplication().processIdentifier()
-    while not stop.is_set():
-        t0 = time.monotonic()
-        sel = None
-        front = K.NSWorkspace.sharedWorkspace().frontmostApplication()
-        if front and front.processIdentifier() != me and present:
-            app = A.AXUIElementCreateApplication(front.processIdentifier())
-            A.AXUIElementSetMessagingTimeout(app, 0.05)
-            px, py = cursor()
-            c = target(app, px, py)
-            if isinstance(c, tuple):
-                sel = c
-            elif c is None:
-                cands = []
-                for k in range(8):
-                    ang = k * math.pi / 4
-                    r = target(app, px + SNAP_PX * math.cos(ang), py + SNAP_PX * math.sin(ang))
-                    if isinstance(r, tuple) and r not in cands:
-                        cands.append(r)
-                if len(cands) == 1:
-                    sel = cands[0]
-        selected = sel
-        ax_max[0] = max(ax_max[0], time.monotonic() - t0)
-        time.sleep(0.05)
-
-
-class Tick(NSObject):
-    def update_(self, timer):
-        if Quartz.CGEventSourceKeyState(Quartz.kCGEventSourceStateCombinedSessionState, 53):
-            stop.set()
-            mac.release_all()
-            K.NSApp.terminate_(None)
-            return
-        view.setNeedsDisplay_(True)
-        img, seq = hud_img
-        if img is not None and seq != shown_seq[0]:
-            shown_seq[0] = seq
-            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok:
-                data = K.NSData.dataWithBytes_length_(buf.tobytes(), len(buf))
-                hud_view.setImage_(K.NSImage.alloc().initWithData_(data))
-
-
-def make_hud_window():
-    """Sağ üstte, taşınabilir ve boyutlanabilir "TKT HUD" penceresi; kapatınca gizlenir."""
-    global hud_view
-    w, h = 533 + HUD_PANEL_W, HUD_H
-    frame = ((screen.origin.x + screen.size.width - w - 20,
-              screen.origin.y + screen.size.height - h - 60), (w, h))
-    style = (K.NSWindowStyleMaskTitled | K.NSWindowStyleMaskClosable
-             | K.NSWindowStyleMaskMiniaturizable | K.NSWindowStyleMaskResizable)
-    win = K.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-        frame, style, K.NSBackingStoreBuffered, False)
-    win.setTitle_("TKT HUD")
-    win.setReleasedWhenClosed_(False)
-    win.setLevel_(K.NSFloatingWindowLevel)
-    hud_view = K.NSImageView.alloc().initWithFrame_(((0, 0), (w, h)))
-    hud_view.setImageScaling_(K.NSImageScaleProportionallyUpOrDown)
-    hud_view.setAutoresizingMask_(K.NSViewWidthSizable | K.NSViewHeightSizable)
-    win.setContentView_(hud_view)
-    win.orderFrontRegardless()
-    return win
+    Esc (Windows'ta her yerden), HUD odaktayken q veya HUD penceresini kapatmak çıkartır.
+    `show` / `poll_key` / `window_open` / `worker_target` testte sahte pencere ve iz için.
+    """
+    own_window = show is None
+    show = show or cv2.imshow
+    poll_key = poll_key or (lambda: cv2.waitKey(30) & 0xFF)
+    window_open = window_open or (
+        lambda: cv2.getWindowProperty(HUD_WINDOW, cv2.WND_PROP_VISIBLE) >= 1)
+    worker = threading.Thread(target=worker_target or track, daemon=True)
+    worker.start()
+    shown, opened = -1, False
+    try:
+        while not stop.is_set() and worker.is_alive():
+            img, seq = hud_img
+            if img is not None and seq != shown:
+                show(HUD_WINDOW, img)
+                shown, opened = seq, True
+            key = poll_key()
+            if key in (27, ord("q")) or esc_down() or (opened and not window_open()):
+                log("cikis")
+                break
+    finally:
+        stop.set()
+        worker.join(timeout=3.0)
+        backend.release_all()
+        if own_window:
+            cv2.destroyAllWindows()
 
 
 def main():
-    global view
-    app = K.NSApplication.sharedApplication()
-    app.setActivationPolicy_(K.NSApplicationActivationPolicyAccessory)
-    win = K.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-        screen, K.NSWindowStyleMaskBorderless, K.NSBackingStoreBuffered, False)
-    win.setOpaque_(False)
-    win.setBackgroundColor_(K.NSColor.clearColor())
-    win.setIgnoresMouseEvents_(True)
-    win.setHasShadow_(False)
-    win.setLevel_(K.NSFloatingWindowLevel)
-    view = Canvas.alloc().initWithFrame_(((0, 0), screen.size))
-    win.setContentView_(view)
-    win.orderFrontRegardless()
-    hud_win = make_hud_window()
-    tick = Tick.alloc().init()
-    timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-        0.06, tick, "update:", None, True)
-    main.keep = (win, hud_win, tick, timer)      # pyobjc nesneleri çöp toplamaya gitmesin
-    threading.Thread(target=track, daemon=True).start()
-    threading.Thread(target=find_targets, daemon=True).start()
+    global backend
+    from tkt.app.main import _set_dpi_awareness
+
+    _set_dpi_awareness()                  # Windows: ölçekli ekranda imleç kaymasın
+    backend = make_backend()
     log("hazir: otomatik mod (yuz var -> C, yok -> A), Esc ile cikis")
-    app.run()
+    if sys.platform == "darwin":
+        from tkt.app import auto_mode_mac
+        auto_mode_mac.run(sys.modules[__name__])
+    else:
+        run_cv_ui()
 
 
 if __name__ == "__main__":
