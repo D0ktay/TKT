@@ -319,3 +319,114 @@ def test_build_frame_lift_off_drops_confidence():
     # Eşik yoksa veya masa modeli yoksa değişmez.
     assert build_frame(lifted, 0.0, 0, calib, INFO).confidence > 0.5
     assert build_frame(lifted, 0.0, 0, DEFAULT, INFO, lift_off=0.25).confidence > 0.5
+
+
+# --------------------------------------------------------------------------- pinch
+
+
+def _touching(finger: str | None, gap: float = 0.004, hand: RawHand | None = None) -> RawHand:
+    """`make_hand` ama başparmak ucu (4) `finger` ucunun `gap` metre yanında (None: değişmez).
+
+    Görüntü noktası dünya noktasıyla aynı izdüşümle taşınır (scale 2.0).
+    """
+    hand = hand or make_hand()
+    if finger is None:
+        return hand
+    w = np.array(hand.world_pts, dtype=float)
+    img = np.array(hand.image_pts, dtype=float)
+    tip = features.FINGER_JOINTS[finger][3]
+    w[4] = w[tip] + (gap, 0.0, 0.0)
+    img[4] = img[tip] + (gap * 2.0, 0.0)
+    return RawHand(image_pts=img, world_pts=w, score=hand.score)
+
+
+def _pinch_ref(touch=0.05, open_=1.0):
+    keys = {"img_touch": touch, "img_open": open_, "world_touch": touch, "world_open": open_}
+    return {f: dict(keys) for f in FINGERS}
+
+
+def test_pinch_none_without_pinch_calibration():
+    # Sürüm A/B: pinch kalibrasyonu yoksa frame.pinch None, kayıt satırında pinch yok.
+    from tkt.core.io import frame_to_dict
+
+    f = build_frame(_touching("index"), 0.0, 0, DEFAULT, INFO)
+    assert DEFAULT.pinch_ref is None and f.pinch is None
+    assert "pinch" not in frame_to_dict(f)
+
+
+def test_pinch_raw_image_and_world_channels():
+    hand = _touching("middle", gap=0.009)
+    r = features.pinch_raw(hand, "middle")
+    # El boyu 0,09 (dünya) ve 0,18 (görüntü, scale 2): iki kanal da 0,1.
+    assert r["img"] == pytest.approx(0.1, rel=1e-6)
+    assert r["world"] == pytest.approx(0.1, rel=1e-6)
+    # aspect yalnızca görüntü kanalının x eksenini ölçekler.
+    r2 = features.pinch_raw(hand, "middle", aspect=2.0)
+    assert r2["world"] == pytest.approx(r["world"])
+    assert r2["img"] > r["img"]
+    with pytest.raises(ValueError):
+        features.pinch_raw(hand, "thumb")
+
+
+def test_pinch_normalized_touch_zero_open_one():
+    calib = replace(DEFAULT, pinch_ref=_pinch_ref(touch=0.1, open_=1.0))
+    # Değme referansından yakın (INFO'nun aspect'iyle de): 0.
+    touch = build_frame(_touching("index", gap=0.005), 0.0, 0, calib, INFO)
+    assert set(touch.pinch) == set(FINGERS)
+    assert touch.pinch["index"] == 0.0
+    assert all(0.0 <= v <= 1.0 for v in touch.pinch.values())
+    # Uzak başparmak: 1'de kırpılır.
+    far = build_frame(make_hand(thumb_dist=0.2), 0.0, 0, calib, INFO)
+    assert all(v == 1.0 for v in far.pinch.values())
+
+
+def test_pinch_is_conservative_max_of_channels():
+    hand = _touching("index", gap=0.009)
+    ref = _pinch_ref(touch=0.1, open_=1.0)
+    # Görüntü "değiyor" der, dünya kanalının değme referansı daha küçük: dünya kanalı
+    # yüksek kalır ve sonuç onu izler.
+    ref["index"]["world_touch"] = 0.0
+    ref["index"]["world_open"] = 0.2
+    v = features.pinch_values(hand, ref)["index"]
+    assert v == pytest.approx(0.5, abs=1e-6)
+    assert features.pinch_norm(0.1, 0.1, 1.0) == 0.0
+
+
+@pytest.mark.parametrize("bad", ["world_nan", "world_zero", "img_nan", "short"])
+def test_pinch_invalid_measurement_is_open(bad):
+    hand = _touching("index", gap=0.0)
+    w = np.array(hand.world_pts, dtype=float)
+    img = np.array(hand.image_pts, dtype=float)
+    if bad == "world_nan":
+        w[4] = np.nan
+    elif bad == "world_zero":
+        w[:] = 0.0
+    elif bad == "img_nan":
+        img[0] = np.nan
+    else:
+        w = w[:5]
+    hand = RawHand(image_pts=img, world_pts=w, score=0.9)
+    calib = replace(DEFAULT, pinch_ref=_pinch_ref(touch=0.05, open_=1.0))
+    # Bir kanal ölçülemezse o kanal "açık": temkinli en büyük 1.0 olur (fail-safe).
+    assert features.pinch_values(hand, calib.pinch_ref)["index"] == 1.0
+    if bad != "img_nan":
+        assert build_frame(hand, 0.0, 0, calib, INFO).pinch["index"] == 1.0
+
+
+def test_pinch_bad_reference_is_open():
+    ref = _pinch_ref()
+    ref["index"]["img_open"] = ref["index"]["img_touch"]   # açıklık yok
+    ref["middle"]["world_open"] = math.nan
+    del ref["ring"]
+    v = features.pinch_values(_touching("index", gap=0.0), ref)
+    assert v["index"] == 1.0 and v["middle"] == 1.0 and v["ring"] == 1.0
+    assert set(v) == set(FINGERS)
+
+
+def test_pinch_none_when_no_hand_and_roundtrips_through_core():
+    from tkt.core.io import frame_from_dict, frame_to_dict
+
+    calib = replace(DEFAULT, pinch_ref=_pinch_ref(touch=0.1, open_=1.0))
+    assert build_frame(None, 0.0, 0, calib, INFO).pinch is None
+    f = build_frame(_touching("ring", gap=0.02), 0.0, 3, calib, INFO)
+    assert frame_from_dict(frame_to_dict(f)).pinch == pytest.approx(f.pinch)

@@ -1,6 +1,6 @@
 [general]
 panic_hotkey = "<ctrl>+<alt>+p"
-click_method = "thumb"      # thumb | tap | both | pinch
+click_method = "thumb"      # thumb | tap | both | pinch | index_pinch
 confidence_min = 0.5
 lost_release_ms = 300
 
@@ -19,10 +19,10 @@ still_ms = 150              # sağ tık için elin durgun olması gereken süre
 freeze_rate = 4.0           # 1/sn; thumb_out bundan hızlı değişirse imleç donar (tık kayması)
 
 [pointer]
-min_cutoff = 1.0
+min_cutoff = 0.3
 beta = 0.02
-gain_min = 500              # ekran pikseli / el boyu
-gain_max = 2500
+gain_min = 300              # ekran pikseli / el boyu
+gain_max = 1200
 speed_lo = 0.3              # el boyu / sn
 speed_hi = 3.0
 rollback_ms = 100
@@ -56,3 +56,18 @@ debounce_ms = 30
 margin = 0.15
 drag_threshold = 0.03       # avuç hareketi, el boyu biriminde
 fist_curl = 0.6             # dört parmağın ortalama curl değeri
+
+[index_pinch]
+closed = 0.25
+open = 0.45
+debounce_ms = 30
+drag_threshold = 0.20       # avuç hareketi, el boyu biriminde
+hold_ms = 2000              # sabit tutuşta sağ tık
+fist_curl = 0.6
+
+[pointer_front]
+# Sürüm C (kamera kullanıcıya bakıyor, avuç izleniyor): [pointer] üzerine yazılan değerler.
+# Hedef yardımı denemeleri (data/samples/airC) bu değerlerle yapıldı.
+min_cutoff = 1.0
+gain_min = 500
+gain_max = 2500

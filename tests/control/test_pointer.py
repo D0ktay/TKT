@@ -16,7 +16,9 @@ INFO = SourceInfo(SCHEMA_VERSION, 1280, 720, 60.0, "right")
 def pointer_cfg():
     path = Path(__file__).resolve().parents[2] / "config" / "control.toml"
     with path.open("rb") as file:
-        return tomllib.load(file)["pointer"]
+        cfg = tomllib.load(file)["pointer"]
+    # Testler sabit referans kazançlarla yazıldı; config'teki canlı ayar onları bozmasın.
+    return dict(cfg, min_cutoff=1.0, gain_min=500, gain_max=2500)
 
 
 @pytest.fixture

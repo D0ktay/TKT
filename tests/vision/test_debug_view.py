@@ -1,5 +1,6 @@
 import math
 import sys
+from dataclasses import replace as dataclasses_replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -809,3 +810,159 @@ def test_draw_table_area_marks_visited_cells():
     dv.draw_table_area(out, [(0.1, 0.1), (0.15, 0.12), (0.12, 0.2)], grid=4)
     assert out[5:15, 5:15].any()          # ziyaret edilen sol üst hücre boyandı
     assert not out[60:80, 60:80].any()    # sağ alt hücreye dokunulmadı
+
+
+# ---------------------------------------------------------------- pinch
+
+
+def touch_hand(finger, gap=0.004):
+    """Açık el (hand_for_step("open")) ama başparmak ucu `finger` ucunun yanında."""
+    base = hand_for_step("open")
+    w = np.array(base.world_pts, dtype=float)
+    img = np.array(base.image_pts, dtype=float)
+    tip = FINGER_JOINTS[finger][3]
+    w[4] = w[tip] + (gap, 0.0, 0.0)
+    img[4] = img[tip] + (gap * 2.0, 0.0)
+    return RawHand(image_pts=img, world_pts=w, score=base.score)
+
+
+def _step_hand(step):
+    if step in hand_calib.PINCH_STEP_FINGER:
+        return touch_hand(hand_calib.PINCH_STEP_FINGER[step])
+    return hand_for_step(step)
+
+
+def _pinch_items(dt=0.25, extra=8, first_key=dv.KEY_PINCH, steps=None, hand_fn=_step_hand):
+    """'p' ile başlayan el + pinch kalibrasyonu akışı: (kareler, tuşlar)."""
+    steps = steps or STEPS + hand_calib.PINCH_STEPS
+    img = np.zeros((512, 640, 3), np.uint8)
+    items, keys = [], []
+
+    def add(step, key=-1):
+        i = len(items)
+        items.append((make_frame(t=50.0 + i * dt, frame_id=i), hand_fn(step), img))
+        keys.append(key)
+
+    add(steps[0], first_key)
+    per_step = int((dv.GUIDED_COUNTDOWN_SECONDS + dv.GUIDED_RECORD_SECONDS) / dt) + 1
+    for step in steps:
+        add(step, ord(" "))
+        for _ in range(per_step):
+            add(step)
+    for _ in range(extra):
+        add(steps[-1])
+    return items, keys
+
+
+def _pinch_frame(pinch):
+    f = make_frame()
+    return HandFrame(f.t, f.frame_id, True, f.fingers, f.thumb_out, f.palm, f.hand_size,
+                     f.confidence, pinch=pinch)
+
+
+def test_overlay_draws_four_pinch_bars():
+    img = np.zeros((512, 640, 3), np.uint8)
+    none = draw_overlay(img, _pinch_frame(None), None, STATS)
+    full = draw_overlay(img, _pinch_frame(dict.fromkeys(FINGERS, 1.0)), None, STATS)
+    diff = np.any(none != full, axis=2)
+    # dört çubuk: farklı pikseller dört ayrı satır bandında
+    rows = np.flatnonzero(diff.any(axis=1))
+    bands = 1 + int(np.sum(np.diff(rows) > 1))
+    assert bands == len(FINGERS)
+    # pinch çubuğu curl ve lift sütunlarının sağında
+    cols = np.flatnonzero(diff.any(axis=0))
+    assert cols.min() > 640 // 4
+    # bozuk değerler çökmez; present=False ise pinch gösterilmez
+    draw_overlay(img, _pinch_frame({"index": float("nan"), "middle": 3.0}), None, STATS)
+    a = draw_overlay(img, make_frame(present=False), None, STATS)
+    assert a.shape == img.shape
+
+
+def test_guided_pinch_session_steps_and_result():
+    g = dv.GuidedCalibration(countdown_s=0.0, record_s=1.0, pinch=True)
+    assert g.steps == STEPS + hand_calib.PINCH_STEPS
+    assert dv.GuidedCalibration().steps == STEPS   # varsayılan: eski üç adım
+    t = 0.0
+    for step in g.steps:
+        g.start()
+        for _ in range(6):
+            g.add(_step_hand(step), t)
+            t += 0.25
+    assert g.done
+    calib = g.result(aspect=640 / 512)
+    assert calib.pinch_ref is not None and set(calib.pinch_ref) == set(FINGERS)
+    assert calib.fist_ref["index"] > calib.open_ref["index"]
+
+
+def test_run_pinch_calibration_one_session_saves_and_keeps_others(rec, tmp_path):
+    old = hand_calib.HandCalibration(
+        open_ref={f: 0.1 for f in FINGERS}, fist_ref={f: 2.0 for f in FINGERS},
+        thumb_closed=0.3, thumb_open=0.9,
+        tap_ref={f: 0.5 for f in FINGERS}, angle_sign=-1.0,
+        table={"length": [0.0] * 6, "width": [0.0] * 6})
+    path = tmp_path / "c.json"
+    hand_calib.save(old, path)
+    items, keys = _pinch_items()
+    rec(keys)
+    src = FakeSource(items)
+    dv.run(src, path)
+    (new,) = src.calibrations
+    assert new.pinch_ref is not None
+    assert new.tap_ref == old.tap_ref and new.angle_sign == -1.0 and new.table == old.table
+    assert hand_calib.load(path) == new
+
+
+def test_run_pinch_progress_shows_all_steps(rec, tmp_path, monkeypatch):
+    seen = []
+    real = dv.draw_overlay
+
+    def spy(image, frame, hand, stats, calib_state=None):
+        seen.append(calib_state)
+        return real(image, frame, hand, stats, calib_state)
+
+    monkeypatch.setattr(dv, "draw_overlay", spy)
+    items, keys = _pinch_items()
+    rec(keys)
+    dv.run(FakeSource(items), tmp_path / "c.json")
+    steps = [cs.step for cs in seen if cs is not None and cs.step is not None]
+    assert [s for i, s in enumerate(steps) if i == 0 or steps[i - 1] != s] == \
+        list(STEPS + hand_calib.PINCH_STEPS)
+    assert all(cs.steps == STEPS + hand_calib.PINCH_STEPS
+               for cs in seen if cs is not None and cs.step is not None)
+
+
+def test_run_c_keeps_existing_pinch_ref(rec, tmp_path):
+    ref = {f: {"img_open": 1.0, "img_touch": 0.1, "world_open": 1.0, "world_touch": 0.1}
+           for f in FINGERS}
+    old = dataclasses_replace(hand_calib.DEFAULT, pinch_ref=ref)
+    path = tmp_path / "c.json"
+    hand_calib.save(old, path)
+    items, keys = _calib_items()
+    rec(keys)
+    src = FakeSource(items)
+    dv.run(src, path)
+    (new,) = src.calibrations
+    assert new.pinch_ref == ref and new.open_ref != old.open_ref
+
+
+def test_run_pinch_failure_writes_nothing(rec, tmp_path, monkeypatch):
+    # Değme adımlarında başparmak hep açık: fit_pinch başarısız, eski dosya korunur.
+    seen = []
+    real = dv.draw_overlay
+
+    def spy(image, frame, hand, stats, calib_state=None):
+        seen.append(calib_state)
+        return real(image, frame, hand, stats, calib_state)
+
+    monkeypatch.setattr(dv, "draw_overlay", spy)
+    path = tmp_path / "c.json"
+    hand_calib.save(hand_calib.DEFAULT, path)
+    before = path.read_text()
+    items, keys = _pinch_items(
+        hand_fn=lambda s: hand_for_step("open") if s in hand_calib.PINCH_STEPS
+        else hand_for_step(s))
+    rec(keys)
+    src = FakeSource(items)
+    dv.run(src, path)
+    assert src.calibrations == [] and path.read_text() == before
+    assert any("basarisiz" in cs.message for cs in seen if cs is not None and cs.message)
