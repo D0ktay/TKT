@@ -271,6 +271,9 @@ def run_mode(s, cfg, mirror, assist, face_score, mode_name, surface=None):
         for v in dry.events:
             if v.kind == "button" and not v.args[1]:
                 mac.button(v.args[0], False)
+            elif v.kind == "system" and v.args[0] == "dictation_stop":
+                mac.system_action("dictation_stop")     # dikte açıkken mod değişti / çıkış
+                act("DIKTE KAPANDI")
         mac.release_all()
     return None
 
